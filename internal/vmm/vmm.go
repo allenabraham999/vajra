@@ -94,11 +94,9 @@ func (m *VMManager) WithWorkDir(dir string) *VMManager {
 // ready) the child is killed and socket files are removed, so callers
 // don't have to clean up partial state.
 func (m *VMManager) SpawnVM(ctx context.Context, vmID string, cfg VmConfig) (string, error) {
-	// --console/--serial off keeps CH from grabbing a tty before vm.create
-	// runs. They are safe here because we are NOT passing --restore, which
-	// is the case the CLI parser rejects them in.
-	extra := []string{"--console", "off", "--serial", "off"}
-	socketPath, proc, err := m.startProcess(ctx, vmID, extra)
+	// Fresh boot: startProcess adds --console/--serial off so CH doesn't
+	// grab a tty before vm.create runs.
+	socketPath, proc, err := m.startProcess(ctx, vmID, nil, false)
 	if err != nil {
 		return "", err
 	}
@@ -148,7 +146,7 @@ func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (s
 	extra := []string{"--restore", "source_url=" + sourceURL}
 
 	t0 := time.Now()
-	socketPath, proc, err := m.startProcess(ctx, vmID, extra)
+	socketPath, proc, err := m.startProcess(ctx, vmID, extra, true)
 	if err != nil {
 		return "", err
 	}
@@ -250,7 +248,13 @@ func (m *VMManager) DestroyVM(ctx context.Context, socketPath string) error {
 // startProcess spawns cloud-hypervisor with --api-socket plus extra args.
 // It does not wait for readiness — callers should follow up with the
 // crash-aware pollSocketReadyOrExit using proc.done.
-func (m *VMManager) startProcess(ctx context.Context, vmID string, extraArgs []string) (string, *managedProc, error) {
+//
+// When bareArgs is true, only --api-socket is added before extraArgs. The
+// CH v43 CLI parser rejects --restore alongside --console/--serial (or any
+// fresh-boot flags) with "required arguments not provided", so RestoreVM
+// must use the bare form. When bareArgs is false, --console/--serial off
+// are added so a fresh-boot VM doesn't grab a tty before vm.create runs.
+func (m *VMManager) startProcess(ctx context.Context, vmID string, extraArgs []string, bareArgs bool) (string, *managedProc, error) {
 	if err := os.MkdirAll(m.socketDir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create socket dir: %w", err)
 	}
@@ -258,10 +262,9 @@ func (m *VMManager) startProcess(ctx context.Context, vmID string, extraArgs []s
 	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", nil, fmt.Errorf("remove stale socket: %w", err)
 	}
-	args := []string{
-		"--api-socket", "path=" + socketPath,
-		"--console", "off",
-		"--serial", "off",
+	args := []string{"--api-socket", "path=" + socketPath}
+	if !bareArgs {
+		args = append(args, "--console", "off", "--serial", "off")
 	}
 	args = append(args, extraArgs...)
 
