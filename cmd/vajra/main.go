@@ -13,7 +13,7 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("vajra — AI sandbox cloud platform")
 		fmt.Println("usage: vajra <command> [args]")
-		os.Exit(0)
+		oss.Exit(0)
 	}
 
 	switch os.Args[1] {
