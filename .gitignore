@@ -1,0 +1,56 @@
+# Go build output
+bin/
+/vajra
+/vajra-agent
+/vajra-master
+/vajra-proxy
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local Claude / project context (do not commit)
+CLAUDE.md
+bible.md
+.claude/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Frontend
+node_modules/
+web/dist/
+web/.vite/
+
+# VM artifacts
+*.raw
+*.img
+vmlinux
+snapshots/
+
+# Logs / runtime
+*.log
+/tmp/
+/var/
+
+# SDK build artifacts
+sdk/python/dist/
+sdk/python/build/
+sdk/python/*.egg-info/
+sdk/typescript/dist/
+sdk/typescript/node_modules/
