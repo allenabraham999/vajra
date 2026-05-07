@@ -2,6 +2,7 @@ package vmm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,9 @@ const (
 	// is fast enough that polling rather than sleeping is the dominant
 	// reason restore drops from 312ms (shell prototype) to ~160ms.
 	SocketPollInterval = 5 * time.Millisecond
+	// VMStatePollInterval is the cadence used by PollVMState. 10ms keeps
+	// the post-restore wait tight without flooding the CH API server.
+	VMStatePollInterval = 10 * time.Millisecond
 	// DefaultPollTimeout bounds how long we wait for the API socket on
 	// spawn/restore before giving up.
 	DefaultPollTimeout = 5 * time.Second
@@ -135,14 +139,22 @@ func (m *VMManager) SpawnVM(ctx context.Context, vmID string, cfg VmConfig) (str
 // against the child process CWD, which is why VMManager.workDir must
 // match the directory where the original VM was launched.
 func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (string, error) {
-	sourceURL := snapshotPath
-	if !strings.HasPrefix(sourceURL, "file://") {
-		abs, err := filepath.Abs(snapshotPath)
-		if err != nil {
-			return "", fmt.Errorf("resolve snapshot path: %w", err)
-		}
-		sourceURL = "file://" + abs
+	snapshotDir := strings.TrimPrefix(snapshotPath, "file://")
+	abs, err := filepath.Abs(snapshotDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve snapshot path: %w", err)
 	}
+	snapshotDir = abs
+	sourceURL := "file://" + abs
+
+	// CH binds() the vsock socket on restore; if a stale file from a prior
+	// restore (or the original snapshotting VM) still lives at that path,
+	// the bind fails and the VMM exits before the API server comes up. The
+	// vsock path is fixed inside the snapshot's config.json, so we read it
+	// out and unlink it before spawning. Best-effort: any error here is
+	// logged and ignored — CH will surface a real failure if it matters.
+	m.removeStaleVsockSocket(snapshotDir)
+
 	extra := []string{"--restore", "source_url=" + sourceURL}
 
 	t0 := time.Now()
@@ -153,6 +165,14 @@ func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (s
 	if err := pollSocketReadyOrExit(ctx, socketPath, DefaultPollTimeout, proc.done); err != nil {
 		m.killProcess(socketPath)
 		return "", fmt.Errorf("wait for VMM socket after restore: %w", err)
+	}
+	// The API socket can accept connections before CH has finished
+	// rehydrating the snapshot. Wait until vm.info reports "Paused" — only
+	// then is Resume legal. Issuing Resume earlier returns
+	// InvalidStateTransition because the VM is still in "Created".
+	if err := PollVMState(ctx, socketPath, "Paused", DefaultPollTimeout); err != nil {
+		m.killProcess(socketPath)
+		return "", fmt.Errorf("wait for restored vm to reach Paused: %w", err)
 	}
 	client := NewClient(socketPath)
 	if err := client.Resume(ctx); err != nil {
@@ -289,6 +309,37 @@ func (m *VMManager) startProcess(ctx context.Context, vmID string, extraArgs []s
 	return socketPath, proc, nil
 }
 
+// removeStaleVsockSocket reads <snapshotDir>/config.json, parses it as a
+// VmConfig, and unlinks the vsock socket path baked into the snapshot.
+// This is required because the vsock path is captured at snapshot time
+// and reused verbatim on every restore — a leftover socket file from a
+// prior run causes CH's bind() to fail. Best-effort: missing/unparseable
+// config.json or absent vsock entry are logged and skipped.
+func (m *VMManager) removeStaleVsockSocket(snapshotDir string) {
+	configPath := filepath.Join(snapshotDir, "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		m.logger.Debug("snapshot config.json not readable; skipping vsock cleanup",
+			"snapshot", snapshotDir, "err", err)
+		return
+	}
+	var cfg VmConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		m.logger.Debug("snapshot config.json not parseable as VmConfig; skipping vsock cleanup",
+			"snapshot", snapshotDir, "err", err)
+		return
+	}
+	if cfg.Vsock == nil || cfg.Vsock.Socket == "" {
+		return
+	}
+	if err := os.Remove(cfg.Vsock.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.logger.Warn("failed to remove stale vsock socket; restore may fail",
+			"socket", cfg.Vsock.Socket, "err", err)
+		return
+	}
+	m.logger.Debug("removed stale vsock socket", "socket", cfg.Vsock.Socket)
+}
+
 // killProcess force-kills the child for socketPath (if tracked) and
 // removes its socket files. Used as the unwind path on spawn failures.
 func (m *VMManager) killProcess(socketPath string) {
@@ -375,6 +426,53 @@ func cleanupSocketFiles(socketPath string) error {
 // first wins. Safe to call against a path that does not yet exist.
 func PollSocketReady(ctx context.Context, socketPath string, timeout time.Duration) error {
 	return pollSocketReadyOrExit(ctx, socketPath, timeout, nil)
+}
+
+// PollVMState polls GET /api/v1/vm.info every VMStatePollInterval until the
+// VM's state field matches targetState or timeout elapses. Restore needs
+// this because the API socket becomes dialable while CH is still rebuilding
+// the VM: at that moment vm.info reports "Created", and a Resume issued
+// before the state transitions to "Paused" fails with
+// InvalidStateTransition. Honours ctx cancellation.
+func PollVMState(ctx context.Context, socketPath, targetState string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	pollCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	client := NewClient(socketPath)
+	var lastState string
+	var lastErr error
+	for {
+		info, err := client.Info(pollCtx)
+		if err == nil {
+			lastState = info.State
+			if info.State == targetState {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		if pollCtx.Err() != nil {
+			return pollVMStateErr(targetState, timeout, lastState, lastErr)
+		}
+		timer := time.NewTimer(VMStatePollInterval)
+		select {
+		case <-pollCtx.Done():
+			timer.Stop()
+			return pollVMStateErr(targetState, timeout, lastState, lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func pollVMStateErr(target string, timeout time.Duration, lastState string, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("vm did not reach state %q within %s; last error: %w",
+			target, timeout, lastErr)
+	}
+	return fmt.Errorf("vm did not reach state %q within %s; last observed state %q",
+		target, timeout, lastState)
 }
 
 // pollSocketReadyOrExit is PollSocketReady plus an extra "exited" channel
