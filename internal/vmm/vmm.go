@@ -38,6 +38,7 @@ const (
 type VMManager struct {
 	binaryPath string
 	socketDir  string
+	workDir    string
 	logger     *slog.Logger
 
 	// procs maps socket path -> *managedProc. We need it so DestroyVM
@@ -47,14 +48,19 @@ type VMManager struct {
 }
 
 // NewVMManager returns a VMManager using DefaultBinaryPath and
-// DefaultSocketDir. Pass nil for logger to use slog.Default.
+// DefaultSocketDir. The working directory for spawned VMM processes
+// defaults to the current user's home directory so snapshot config.json
+// files with relative paths (e.g. "vmlinux") resolve correctly. Pass nil
+// for logger to use slog.Default.
 func NewVMManager(logger *slog.Logger) *VMManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	home, _ := os.UserHomeDir()
 	return &VMManager{
 		binaryPath: DefaultBinaryPath,
 		socketDir:  DefaultSocketDir,
+		workDir:    home,
 		logger:     logger,
 	}
 }
@@ -72,13 +78,27 @@ func (m *VMManager) WithSocketDir(dir string) *VMManager {
 	return m
 }
 
+// WithWorkDir overrides the working directory for spawned cloud-hypervisor
+// processes. This matters during restore: CH resolves the disk and kernel
+// paths inside the snapshot's config.json relative to the process CWD, so
+// it must match wherever the original VM was launched. An empty string
+// means "inherit the parent's CWD".
+func (m *VMManager) WithWorkDir(dir string) *VMManager {
+	m.workDir = dir
+	return m
+}
+
 // SpawnVM starts a fresh cloud-hypervisor process for vmID, waits for the
 // API socket to accept connections, then issues vm.create + vm.boot. On
 // any failure (including the child process exiting before the socket is
 // ready) the child is killed and socket files are removed, so callers
 // don't have to clean up partial state.
 func (m *VMManager) SpawnVM(ctx context.Context, vmID string, cfg VmConfig) (string, error) {
-	socketPath, proc, err := m.startProcess(ctx, vmID, nil)
+	// --console/--serial off keeps CH from grabbing a tty before vm.create
+	// runs. They are safe here because we are NOT passing --restore, which
+	// is the case the CLI parser rejects them in.
+	extra := []string{"--console", "off", "--serial", "off"}
+	socketPath, proc, err := m.startProcess(ctx, vmID, extra)
 	if err != nil {
 		return "", err
 	}
@@ -103,11 +123,19 @@ func (m *VMManager) SpawnVM(ctx context.Context, vmID string, cfg VmConfig) (str
 // waits for the API socket, then resumes the restored (paused) VM.
 // snapshotPath may be a filesystem path or a "file://..." URL.
 //
-// We deliberately do NOT pass --kernel here. The snapshot directory's
-// config.json already carries the full VM config including the kernel path;
-// passing --kernel makes CH boot a fresh VM instead of restoring, leaving the
-// guest in Running state and causing Resume to fail with
-// InvalidStateTransition(Running, Running).
+// The argv passed here is intentionally minimal: only --api-socket and
+// --restore. CH v43's CLI parser rejects --restore when it appears
+// alongside --console/--serial/--kernel/etc with "required arguments not
+// provided", because those flags are interpreted as a fresh-boot config
+// that conflicts with restore. The snapshot's config.json already
+// contains the kernel path, console mode, and every other setting CH
+// needs to rebuild the VM. Adding any of those flags also defeats
+// restore — CH would boot a fresh VM in Running state, after which
+// Resume fails with InvalidStateTransition(Running, Running).
+//
+// CH resolves relative paths in config.json (e.g. "vmlinux", "rootfs.raw")
+// against the child process CWD, which is why VMManager.workDir must
+// match the directory where the original VM was launched.
 func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (string, error) {
 	sourceURL := snapshotPath
 	if !strings.HasPrefix(sourceURL, "file://") {
