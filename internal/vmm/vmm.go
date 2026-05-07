@@ -31,6 +31,10 @@ const (
 	// the VMM to exit cleanly (vmm.shutdown + process exit combined)
 	// before SIGKILL.
 	DefaultShutdownGrace = 3 * time.Second
+	// DefaultKernelPath is passed via --kernel on every spawn including
+	// --restore, because CH's CLI parser requires one of --kernel/--firmware
+	// even though the snapshot state overrides it on restore.
+	DefaultKernelPath = "vmlinux"
 )
 
 // VMManager owns cloud-hypervisor child processes and their API sockets. A
@@ -38,6 +42,7 @@ const (
 type VMManager struct {
 	binaryPath string
 	socketDir  string
+	kernelPath string
 	logger     *slog.Logger
 
 	// procs maps socket path -> *managedProc. We need it so DestroyVM
@@ -55,6 +60,7 @@ func NewVMManager(logger *slog.Logger) *VMManager {
 	return &VMManager{
 		binaryPath: DefaultBinaryPath,
 		socketDir:  DefaultSocketDir,
+		kernelPath: DefaultKernelPath,
 		logger:     logger,
 	}
 }
@@ -69,6 +75,12 @@ func (m *VMManager) WithBinary(path string) *VMManager {
 // WithSocketDir overrides the directory where API sockets are placed.
 func (m *VMManager) WithSocketDir(dir string) *VMManager {
 	m.socketDir = dir
+	return m
+}
+
+// WithKernel overrides the kernel image path passed via --kernel.
+func (m *VMManager) WithKernel(path string) *VMManager {
+	m.kernelPath = path
 	return m
 }
 
@@ -111,7 +123,12 @@ func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (s
 		}
 		sourceURL = "file://" + abs
 	}
-	extra := []string{"--restore", "source_url=" + sourceURL}
+	// --kernel is required by CH's CLI parser even with --restore; the
+	// snapshot state overrides whatever path we pass here.
+	extra := []string{
+		"--kernel", m.kernelPath,
+		"--restore", "source_url=" + sourceURL,
+	}
 
 	t0 := time.Now()
 	socketPath, proc, err := m.startProcess(ctx, vmID, extra)

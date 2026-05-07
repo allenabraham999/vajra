@@ -27,6 +27,7 @@ func main() {
 		snapshotPath = flag.String("snapshot", "/tmp/ch-snapshot", "path to snapshot directory")
 		iterations   = flag.Int("n", 10, "number of restore/destroy iterations")
 		binary       = flag.String("bin", vmm.DefaultBinaryPath, "cloud-hypervisor binary path")
+		kernel       = flag.String("kernel", vmm.DefaultKernelPath, "kernel path (required by CH CLI even on --restore)")
 		socketDir    = flag.String("socket-dir", vmm.DefaultSocketDir, "directory for VMM API sockets")
 		quiet        = flag.Bool("quiet", true, "silence vmm logger info messages during runs")
 	)
@@ -50,7 +51,7 @@ func main() {
 		level = slog.LevelWarn
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	mgr := vmm.NewVMManager(logger).WithBinary(*binary).WithSocketDir(*socketDir)
+	mgr := vmm.NewVMManager(logger).WithBinary(*binary).WithSocketDir(*socketDir).WithKernel(*kernel)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
