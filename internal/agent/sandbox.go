@@ -1,0 +1,548 @@
+package agent
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// DefaultSandboxRoot is the per-host directory holding sandbox-specific
+// state (rootfs overlays, saved snapshots).
+const DefaultSandboxRoot = "/var/lib/vajra/sandboxes"
+
+// FirstUserCID is the first vsock CID we hand out. Linux reserves 0-2
+// (HYPERVISOR, LOCAL, HOST), so we start at 3.
+const FirstUserCID uint32 = 3
+
+// GuestExecPort is the vsock port the guest agent listens on for the
+// JSON-line exec protocol. Kept fixed across all sandboxes so the host
+// doesn't need to negotiate.
+const GuestExecPort uint32 = 5252
+
+// SandboxState mirrors the agent's local view of a microVM. It is a
+// strict subset of models.SandboxState — the agent does not model
+// PENDING/CREATING/etc, since those exist only at the master layer.
+type SandboxState string
+
+const (
+	SandboxStateRunning   SandboxState = "RUNNING"
+	SandboxStatePaused    SandboxState = "PAUSED"
+	SandboxStateStopped   SandboxState = "STOPPED"
+	SandboxStateDestroyed SandboxState = "DESTROYED"
+	SandboxStateError     SandboxState = "ERROR"
+)
+
+// SandboxConfig is the resource shape requested for a sandbox.
+type SandboxConfig struct {
+	VCPUs    int   `json:"vcpus"`
+	MemoryMB int   `json:"memory_mb"`
+	DiskGB   int   `json:"disk_gb"`
+}
+
+// Sandbox is the agent's record for a single microVM. Mutable fields are
+// guarded by SandboxManager.mu; callers receive a deep copy via
+// SandboxManager.Get/List.
+type Sandbox struct {
+	ID           string        `json:"id"`
+	State        SandboxState  `json:"state"`
+	TemplateHash string        `json:"template_hash"`
+	VsockCID     uint32        `json:"vsock_cid"`
+	APISocket    string        `json:"api_socket"`
+	VsockSocket  string        `json:"vsock_socket"`
+	RootfsPath   string        `json:"rootfs_path"`
+	StateDir     string        `json:"state_dir"`
+	Config       SandboxConfig `json:"config"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
+	Healthy      bool          `json:"healthy"`
+	LastHealthAt time.Time     `json:"last_health_at"`
+	FromPool     bool          `json:"from_pool"`
+}
+
+// CreateRequest captures what callers (master, pool) supply to
+// SandboxManager.CreateSandbox. ID is optional; if empty the manager
+// generates a random one.
+type CreateRequest struct {
+	ID           string
+	TemplateHash string
+	Config       SandboxConfig
+}
+
+// ExecResult is the outcome of a guest-side command invocation.
+type ExecResult struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// VsockDialer abstracts the host→guest vsock connection so tests can swap
+// in a Unix-socket fake. The default implementation talks to Cloud
+// Hypervisor's hybrid vsock socket via the textual CONNECT protocol.
+type VsockDialer interface {
+	Dial(ctx context.Context, hostSocket string, port uint32) (io.ReadWriteCloser, error)
+}
+
+// VMM is the subset of vmm.VMManager used by SandboxManager. Pulling it
+// behind an interface lets unit tests stub out cloud-hypervisor entirely.
+type VMM interface {
+	RestoreVM(ctx context.Context, vmID, snapshotPath string) (string, error)
+	SnapshotVM(ctx context.Context, socketPath, destDir string, resume bool) error
+	DestroyVM(ctx context.Context, socketPath string) error
+}
+
+// SandboxManager owns the lifecycle of every sandbox running on this host.
+// It is safe for concurrent use; the lock is held only during map
+// mutations and quick state transitions, never across VMM RPCs.
+type SandboxManager struct {
+	root     string
+	cache    *ImageCache
+	vmm      VMM
+	dialer   VsockDialer
+	logger   *slog.Logger
+	socketDir string
+
+	nextCID atomic.Uint32
+
+	mu        sync.RWMutex
+	sandboxes map[string]*Sandbox
+}
+
+// NewSandboxManager constructs a manager. root is the per-host directory
+// for sandbox state (overlays, saved snapshots); socketDir mirrors what
+// the underlying VMManager uses so vsock paths resolve consistently.
+// Pass nil for logger to use slog.Default and nil for dialer to use the
+// hybrid-vsock CONNECT dialer.
+func NewSandboxManager(
+	root, socketDir string,
+	cache *ImageCache,
+	vm VMM,
+	dialer VsockDialer,
+	logger *slog.Logger,
+) *SandboxManager {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if dialer == nil {
+		dialer = &hybridVsockDialer{}
+	}
+	m := &SandboxManager{
+		root:      root,
+		cache:     cache,
+		vmm:       vm,
+		dialer:    dialer,
+		logger:    logger,
+		socketDir: socketDir,
+		sandboxes: map[string]*Sandbox{},
+	}
+	m.nextCID.Store(FirstUserCID)
+	return m
+}
+
+// AllocateCID hands out the next vsock CID. Exposed so the pool can
+// pre-assign CIDs before the underlying VM is restored.
+func (m *SandboxManager) AllocateCID() uint32 {
+	return m.nextCID.Add(1) - 1
+}
+
+// CreateSandbox materializes a fresh sandbox from a cached template:
+// CoW-copy the rootfs, restore from the template snapshot, and register
+// the running VM. Returns the populated Sandbox or an error; on failure
+// any partially-created files are cleaned up.
+func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (*Sandbox, error) {
+	if req.TemplateHash == "" {
+		return nil, errors.New("sandbox: template hash required")
+	}
+	if !m.cache.HasTemplate(req.TemplateHash) {
+		return nil, fmt.Errorf("sandbox: template %s not in cache", req.TemplateHash)
+	}
+	id := req.ID
+	if id == "" {
+		id = newSandboxID()
+	}
+
+	layout := m.cache.Layout(req.TemplateHash)
+	dir := filepath.Join(m.root, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("sandbox: make dir: %w", err)
+	}
+	overlay := filepath.Join(dir, "rootfs.raw")
+	if err := reflinkOrCopy(layout.RootfsPath, overlay); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("sandbox: copy rootfs: %w", err)
+	}
+
+	cid := m.AllocateCID()
+	sb := &Sandbox{
+		ID:           id,
+		State:        SandboxStateRunning,
+		TemplateHash: req.TemplateHash,
+		VsockCID:     cid,
+		RootfsPath:   overlay,
+		Config:       req.Config,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+		Healthy:      true,
+		LastHealthAt: time.Now().UTC(),
+	}
+	socketPath, err := m.vmm.RestoreVM(ctx, id, layout.SnapshotDir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("sandbox: restore: %w", err)
+	}
+	sb.APISocket = socketPath
+	sb.VsockSocket = vsockSocketFor(socketPath)
+
+	m.mu.Lock()
+	m.sandboxes[id] = sb
+	m.mu.Unlock()
+
+	m.cache.Touch(req.TemplateHash)
+	m.logger.Info("sandbox created",
+		"id", id,
+		"template", req.TemplateHash,
+		"cid", cid,
+	)
+	return cloneSandbox(sb), nil
+}
+
+// AdoptSandbox registers a Sandbox that some other component (typically
+// the pool) materialized. The manager assumes ownership of the lifecycle
+// and the caller must not touch the value after handing it off.
+func (m *SandboxManager) AdoptSandbox(sb *Sandbox) {
+	sb.UpdatedAt = time.Now().UTC()
+	m.mu.Lock()
+	m.sandboxes[sb.ID] = sb
+	m.mu.Unlock()
+}
+
+// StopSandbox pauses the VM and snapshots its state to disk so a later
+// StartSandbox can resume it. The VMM process is then torn down — only
+// the saved state survives until Start.
+func (m *SandboxManager) StopSandbox(ctx context.Context, id string) error {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return err
+	}
+	if sb.State == SandboxStateStopped {
+		return nil
+	}
+	if sb.State != SandboxStateRunning && sb.State != SandboxStatePaused {
+		return fmt.Errorf("sandbox: cannot stop in state %s", sb.State)
+	}
+	stateDir := filepath.Join(m.root, id, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("sandbox: state dir: %w", err)
+	}
+	if err := m.vmm.SnapshotVM(ctx, sb.APISocket, stateDir, false); err != nil {
+		m.markError(id)
+		return fmt.Errorf("sandbox: snapshot: %w", err)
+	}
+	if err := m.vmm.DestroyVM(ctx, sb.APISocket); err != nil {
+		m.logger.Warn("destroy after snapshot failed; continuing", "id", id, "err", err)
+	}
+	m.mu.Lock()
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.State = SandboxStateStopped
+		cur.StateDir = stateDir
+		cur.APISocket = ""
+		cur.UpdatedAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+	m.logger.Info("sandbox stopped", "id", id)
+	return nil
+}
+
+// StartSandbox brings a stopped sandbox back to RUNNING by restoring from
+// its saved state and resuming. Errors leave the sandbox in ERROR.
+func (m *SandboxManager) StartSandbox(ctx context.Context, id string) error {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return err
+	}
+	if sb.State == SandboxStateRunning {
+		return nil
+	}
+	if sb.State != SandboxStateStopped {
+		return fmt.Errorf("sandbox: cannot start in state %s", sb.State)
+	}
+	if sb.StateDir == "" {
+		return fmt.Errorf("sandbox: no saved state for %s", id)
+	}
+	socketPath, err := m.vmm.RestoreVM(ctx, id, sb.StateDir)
+	if err != nil {
+		m.markError(id)
+		return fmt.Errorf("sandbox: restore: %w", err)
+	}
+	m.mu.Lock()
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.State = SandboxStateRunning
+		cur.APISocket = socketPath
+		cur.VsockSocket = vsockSocketFor(socketPath)
+		cur.UpdatedAt = time.Now().UTC()
+		cur.Healthy = true
+		cur.LastHealthAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+	m.logger.Info("sandbox started", "id", id)
+	return nil
+}
+
+// DestroySandbox terminates the VMM (if any), deletes the sandbox's
+// on-disk state, and removes it from the registry. Idempotent: a missing
+// sandbox is treated as already destroyed.
+func (m *SandboxManager) DestroySandbox(ctx context.Context, id string) error {
+	m.mu.Lock()
+	sb, ok := m.sandboxes[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	delete(m.sandboxes, id)
+	m.mu.Unlock()
+
+	if sb.APISocket != "" {
+		if err := m.vmm.DestroyVM(ctx, sb.APISocket); err != nil {
+			m.logger.Warn("destroy vm failed; cleaning files anyway", "id", id, "err", err)
+		}
+	}
+	dir := filepath.Join(m.root, id)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("sandbox: remove dir: %w", err)
+	}
+	m.logger.Info("sandbox destroyed", "id", id)
+	return nil
+}
+
+// ExecCommand sends command to the guest agent over vsock and returns
+// stdout, stderr, and the guest exit code. timeout bounds both the
+// connection and the response.
+func (m *SandboxManager) ExecCommand(ctx context.Context, id, command string, timeout time.Duration) (*ExecResult, error) {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return nil, err
+	}
+	if sb.State != SandboxStateRunning {
+		return nil, fmt.Errorf("sandbox: not running (state %s)", sb.State)
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestExecPort)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: dial vsock: %w", err)
+	}
+	defer conn.Close()
+
+	req := struct {
+		Command   string `json:"command"`
+		TimeoutMS int64  `json:"timeout_ms"`
+	}{Command: command, TimeoutMS: timeout.Milliseconds()}
+	if err := writeJSONLine(conn, req); err != nil {
+		return nil, fmt.Errorf("sandbox: send exec: %w", err)
+	}
+	var res ExecResult
+	if err := readJSONLine(conn, &res); err != nil {
+		return nil, fmt.Errorf("sandbox: read exec: %w", err)
+	}
+	return &res, nil
+}
+
+// HealthCheck pings the guest agent on the vsock health port. A nil error
+// means the guest responded; the manager's own health bookkeeping is
+// updated as a side effect so HealthChecker can call this without
+// duplicating state.
+func (m *SandboxManager) HealthCheck(ctx context.Context, id string) error {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return err
+	}
+	if sb.State != SandboxStateRunning {
+		return fmt.Errorf("sandbox: not running")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestExecPort)
+	healthy := err == nil
+	if conn != nil {
+		_ = conn.Close()
+	}
+	m.mu.Lock()
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.Healthy = healthy
+		cur.LastHealthAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+	if !healthy {
+		return fmt.Errorf("sandbox: health probe failed: %w", err)
+	}
+	return nil
+}
+
+// Get returns a deep copy of the sandbox record, or an error if no such
+// sandbox is registered.
+func (m *SandboxManager) Get(id string) (*Sandbox, error) {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return nil, err
+	}
+	return cloneSandbox(sb), nil
+}
+
+// List returns deep copies of every registered sandbox.
+func (m *SandboxManager) List() []*Sandbox {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Sandbox, 0, len(m.sandboxes))
+	for _, sb := range m.sandboxes {
+		out = append(out, cloneSandbox(sb))
+	}
+	return out
+}
+
+func (m *SandboxManager) lookup(id string) (*Sandbox, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sb, ok := m.sandboxes[id]
+	if !ok {
+		return nil, fmt.Errorf("sandbox: %s not found", id)
+	}
+	return sb, nil
+}
+
+func (m *SandboxManager) markError(id string) {
+	m.mu.Lock()
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.State = SandboxStateError
+		cur.UpdatedAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+}
+
+func cloneSandbox(s *Sandbox) *Sandbox {
+	c := *s
+	return &c
+}
+
+func newSandboxID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "sb-" + hex.EncodeToString(b[:])
+}
+
+// vsockSocketFor mirrors vmm.cleanupSocketFiles' naming: the vsock
+// companion lives next to the API socket as `<base>-vsock.sock`.
+func vsockSocketFor(apiSocket string) string {
+	ext := filepath.Ext(apiSocket)
+	base := apiSocket[:len(apiSocket)-len(ext)]
+	return base + "-vsock.sock"
+}
+
+// reflinkOrCopy first tries `cp --reflink=auto` (so on btrfs/xfs/apfs the
+// copy is O(1) via shared extents) and falls back to a byte copy when the
+// reflink flag is not understood by the local cp. We accept the cost of
+// shelling out because the Go stdlib has no reflink primitive.
+func reflinkOrCopy(src, dst string) error {
+	cmd := exec.Command("cp", "--reflink=auto", src, dst)
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+	return plainCopy(src, dst)
+}
+
+func plainCopy(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open src: %w", err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create dst: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy: %w", err)
+	}
+	return out.Close()
+}
+
+// hybridVsockDialer speaks Cloud Hypervisor's textual hybrid-vsock
+// protocol over the host-side Unix socket: the host writes
+// "CONNECT <port>\n", reads "OK <hostport>\n", and from then on the
+// connection is a plain bidirectional byte stream wired through to the
+// guest's listener on that port.
+type hybridVsockDialer struct{}
+
+// Dial implements VsockDialer.
+func (hybridVsockDialer) Dial(ctx context.Context, hostSocket string, port uint32) (io.ReadWriteCloser, error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "unix", hostSocket)
+	if err != nil {
+		return nil, fmt.Errorf("dial unix %s: %w", hostSocket, err)
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("send CONNECT: %w", err)
+	}
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read CONNECT reply: %w", err)
+	}
+	if len(line) < 2 || line[:2] != "OK" {
+		_ = conn.Close()
+		return nil, fmt.Errorf("vsock CONNECT rejected: %q", line)
+	}
+	return &bufferedConn{Conn: conn, r: br}, nil
+}
+
+// bufferedConn keeps the bufio.Reader used to parse the CONNECT handshake
+// in front of the wire — without it, any bytes that arrived alongside the
+// "OK ..." line would be lost.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+// Read pulls bytes through the buffered reader.
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func writeJSONLine(w io.Writer, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	_, err = w.Write(b)
+	return err
+}
+
+func readJSONLine(r io.Reader, v any) error {
+	br := bufio.NewReader(r)
+	line, err := br.ReadBytes('\n')
+	if err != nil && (err != io.EOF || len(line) == 0) {
+		return err
+	}
+	return json.Unmarshal(line, v)
+}
