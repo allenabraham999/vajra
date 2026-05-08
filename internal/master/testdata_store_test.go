@@ -65,6 +65,7 @@ func (f *fakeStore) Sandboxes() store.SandboxStore    { return f.sandboxes }
 func (f *fakeStore) Snapshots() store.SnapshotStore   { return nil }
 func (f *fakeStore) Templates() store.TemplateStore   { return nil }
 func (f *fakeStore) Operations() store.OperationStore { return nil }
+func (f *fakeStore) ShareLinks() store.ShareLinkStore { return nil }
 func (f *fakeStore) Ping(context.Context) error       { return nil }
 func (f *fakeStore) WithTx(context.Context, func(store.Store) error) error {
 	return errUnimplemented
@@ -153,6 +154,12 @@ type sandboxStateUpdate struct {
 func (f *fakeSandboxStore) Create(context.Context, *models.Sandbox) error { return errUnimplemented }
 func (f *fakeSandboxStore) GetByID(_ context.Context, accountID, id string) (*models.Sandbox, error) {
 	if sb, ok := f.byID[id]; ok && sb.AccountID == accountID {
+		return sb, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (f *fakeSandboxStore) GetByIDUnscoped(_ context.Context, id string) (*models.Sandbox, error) {
+	if sb, ok := f.byID[id]; ok {
 		return sb, nil
 	}
 	return nil, store.ErrNotFound

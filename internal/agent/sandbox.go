@@ -326,43 +326,6 @@ func (m *SandboxManager) DestroySandbox(ctx context.Context, id string) error {
 	return nil
 }
 
-// ExecCommand sends command to the guest agent over vsock and returns
-// stdout, stderr, and the guest exit code. timeout bounds both the
-// connection and the response.
-func (m *SandboxManager) ExecCommand(ctx context.Context, id, command string, timeout time.Duration) (*ExecResult, error) {
-	sb, err := m.lookup(id)
-	if err != nil {
-		return nil, err
-	}
-	if sb.State != SandboxStateRunning {
-		return nil, fmt.Errorf("sandbox: not running (state %s)", sb.State)
-	}
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestExecPort)
-	if err != nil {
-		return nil, fmt.Errorf("sandbox: dial vsock: %w", err)
-	}
-	defer conn.Close()
-
-	req := struct {
-		Command   string `json:"command"`
-		TimeoutMS int64  `json:"timeout_ms"`
-	}{Command: command, TimeoutMS: timeout.Milliseconds()}
-	if err := writeJSONLine(conn, req); err != nil {
-		return nil, fmt.Errorf("sandbox: send exec: %w", err)
-	}
-	var res ExecResult
-	if err := readJSONLine(conn, &res); err != nil {
-		return nil, fmt.Errorf("sandbox: read exec: %w", err)
-	}
-	return &res, nil
-}
-
 // HealthCheck pings the guest agent on the vsock health port. A nil error
 // means the guest responded; the manager's own health bookkeeping is
 // updated as a side effect so HealthChecker can call this without

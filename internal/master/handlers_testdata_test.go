@@ -20,16 +20,18 @@ import (
 type handlerStore struct {
 	mu sync.Mutex
 
-	accounts   map[string]*models.Account
-	emailIdx   map[string]string // email → accountID
-	apiKeys    map[string]*models.APIKey
-	keyHashIdx map[string]string // keyHash → keyID
-	clusters   map[string]*models.Cluster
-	nodes      map[string]*models.Node
-	sandboxes  map[string]*models.Sandbox
-	snapshots  map[string]*models.Snapshot
-	templates  map[string]*models.Template
-	operations map[string]*models.Operation
+	accounts    map[string]*models.Account
+	emailIdx    map[string]string // email → accountID
+	apiKeys     map[string]*models.APIKey
+	keyHashIdx  map[string]string // keyHash → keyID
+	clusters    map[string]*models.Cluster
+	nodes       map[string]*models.Node
+	sandboxes   map[string]*models.Sandbox
+	snapshots   map[string]*models.Snapshot
+	templates   map[string]*models.Template
+	operations  map[string]*models.Operation
+	shareLinks  map[string]*models.ShareLink
+	tokenIdx    map[string]string // token_hash → share id
 
 	pingErr error
 }
@@ -47,6 +49,8 @@ func newHandlerStore() *handlerStore {
 		snapshots:  map[string]*models.Snapshot{},
 		templates:  map[string]*models.Template{},
 		operations: map[string]*models.Operation{},
+		shareLinks: map[string]*models.ShareLink{},
+		tokenIdx:   map[string]string{},
 	}
 }
 
@@ -58,6 +62,7 @@ func (h *handlerStore) Sandboxes() store.SandboxStore    { return &hsSandbox{h: 
 func (h *handlerStore) Snapshots() store.SnapshotStore   { return &hsSnapshot{h: h} }
 func (h *handlerStore) Templates() store.TemplateStore   { return &hsTemplate{h: h} }
 func (h *handlerStore) Operations() store.OperationStore { return &hsOperation{h: h} }
+func (h *handlerStore) ShareLinks() store.ShareLinkStore { return &hsShareLink{h: h} }
 func (h *handlerStore) Ping(context.Context) error       { return h.pingErr }
 func (h *handlerStore) Close() error                     { return nil }
 
@@ -302,6 +307,15 @@ func (s *hsSandbox) GetByID(_ context.Context, accountID, id string) (*models.Sa
 	}
 	return nil, store.ErrNotFound
 }
+func (s *hsSandbox) GetByIDUnscoped(_ context.Context, id string) (*models.Sandbox, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sb, ok := s.h.sandboxes[id]; ok {
+		cp := *sb
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
 func (s *hsSandbox) ListByAccount(_ context.Context, accountID string, _ store.ListOpts) ([]*models.Sandbox, error) {
 	s.h.mu.Lock()
 	defer s.h.mu.Unlock()
@@ -490,6 +504,61 @@ func (s *hsOperation) UpdateStatus(_ context.Context, id string, status models.O
 		op.Status = status
 		op.Error = errMsg
 		op.CompletedAt = completedAt
+		return nil
+	}
+	return store.ErrNotFound
+}
+
+type hsShareLink struct{ h *handlerStore }
+
+func (s *hsShareLink) Create(_ context.Context, sl *models.ShareLink) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if _, exists := s.h.tokenIdx[sl.TokenHash]; exists {
+		return store.ErrConflict
+	}
+	cp := *sl
+	s.h.shareLinks[sl.ID] = &cp
+	s.h.tokenIdx[sl.TokenHash] = sl.ID
+	return nil
+}
+func (s *hsShareLink) GetByID(_ context.Context, accountID, id string) (*models.ShareLink, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sl, ok := s.h.shareLinks[id]; ok && sl.AccountID == accountID {
+		cp := *sl
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (s *hsShareLink) GetByHash(_ context.Context, tokenHash string) (*models.ShareLink, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	id, ok := s.h.tokenIdx[tokenHash]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	cp := *s.h.shareLinks[id]
+	return &cp, nil
+}
+func (s *hsShareLink) ListBySandbox(_ context.Context, accountID, sandboxID string, _ store.ListOpts) ([]*models.ShareLink, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.ShareLink{}
+	for _, sl := range s.h.shareLinks {
+		if sl.AccountID == accountID && sl.SandboxID == sandboxID {
+			cp := *sl
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+func (s *hsShareLink) Revoke(_ context.Context, accountID, id string, at time.Time) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sl, ok := s.h.shareLinks[id]; ok && sl.AccountID == accountID {
+		t := at
+		sl.RevokedAt = &t
 		return nil
 	}
 	return store.ErrNotFound

@@ -85,11 +85,18 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandbox/create", s.handleCreate)
+	mux.HandleFunc("GET /sandbox/list", s.handleSandboxList)
 	mux.HandleFunc("GET /sandbox/{id}", s.handleGet)
 	mux.HandleFunc("POST /sandbox/{id}/exec", s.handleExec)
 	mux.HandleFunc("POST /sandbox/{id}/stop", s.handleStop)
 	mux.HandleFunc("POST /sandbox/{id}/start", s.handleStart)
 	mux.HandleFunc("DELETE /sandbox/{id}", s.handleDestroy)
+	mux.HandleFunc("POST /sandbox/{id}/snapshot", s.handleSandboxSnapshot)
+	mux.HandleFunc("POST /sandbox/{id}/files/upload", s.handleFileUpload)
+	mux.HandleFunc("GET /sandbox/{id}/files/download", s.handleFileDownload)
+	mux.HandleFunc("GET /sandbox/{id}/files/list", s.handleFileList)
+	mux.HandleFunc("POST /sandbox/{id}/forward/{port}", s.handleForward)
+	mux.HandleFunc("GET /sandbox/{id}/terminal", s.handleTerminal)
 	mux.HandleFunc("GET /pool/stats", s.handlePoolStats)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)

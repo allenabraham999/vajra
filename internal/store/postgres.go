@@ -92,6 +92,7 @@ func (p *Postgres) Sandboxes() SandboxStore    { return &pgSandboxStore{ext: p.e
 func (p *Postgres) Snapshots() SnapshotStore   { return &pgSnapshotStore{ext: p.ext} }
 func (p *Postgres) Templates() TemplateStore   { return &pgTemplateStore{ext: p.ext} }
 func (p *Postgres) Operations() OperationStore { return &pgOperationStore{ext: p.ext} }
+func (p *Postgres) ShareLinks() ShareLinkStore { return &pgShareLinkStore{ext: p.ext} }
 
 // Ping verifies a working database connection. Errors on a tx-bound store.
 func (p *Postgres) Ping(ctx context.Context) error {

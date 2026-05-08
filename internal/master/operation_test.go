@@ -28,6 +28,9 @@ func (s *opTestStore) Nodes() store.NodeStore         { panic("opTestStore: Node
 func (s *opTestStore) Sandboxes() store.SandboxStore  { panic("opTestStore: Sandboxes not implemented") }
 func (s *opTestStore) Snapshots() store.SnapshotStore { panic("opTestStore: Snapshots not implemented") }
 func (s *opTestStore) Templates() store.TemplateStore { panic("opTestStore: Templates not implemented") }
+func (s *opTestStore) ShareLinks() store.ShareLinkStore {
+	panic("opTestStore: ShareLinks not implemented")
+}
 func (s *opTestStore) Operations() store.OperationStore {
 	return s.ops
 }

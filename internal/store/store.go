@@ -43,6 +43,7 @@ type Store interface {
 	Snapshots() SnapshotStore
 	Templates() TemplateStore
 	Operations() OperationStore
+	ShareLinks() ShareLinkStore
 
 	// Ping verifies a working database connection.
 	Ping(ctx context.Context) error
@@ -114,6 +115,10 @@ type NodeStore interface {
 type SandboxStore interface {
 	Create(ctx context.Context, s *models.Sandbox) error
 	GetByID(ctx context.Context, accountID, id string) (*models.Sandbox, error)
+	// GetByIDUnscoped looks up a sandbox without account scoping.
+	// Reserved for system callers (proxy-route, reconciler); never
+	// reachable from a user request.
+	GetByIDUnscoped(ctx context.Context, id string) (*models.Sandbox, error)
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Sandbox, error)
 	ListByNode(ctx context.Context, nodeID string, opts ListOpts) ([]*models.Sandbox, error)
 	ListByState(ctx context.Context, state models.SandboxState, opts ListOpts) ([]*models.Sandbox, error)
@@ -142,6 +147,18 @@ type TemplateStore interface {
 	GetByHash(ctx context.Context, hash string) (*models.Template, error)
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Template, error)
 	Delete(ctx context.Context, accountID, id string) error
+}
+
+// ShareLinkStore manages shareable URLs. GetByHash is the proxy hot
+// path — implementations should index token_hash for constant-time
+// lookup. ListBySandbox is account-scoped to keep the store layer from
+// leaking other accounts' shares.
+type ShareLinkStore interface {
+	Create(ctx context.Context, s *models.ShareLink) error
+	GetByID(ctx context.Context, accountID, id string) (*models.ShareLink, error)
+	GetByHash(ctx context.Context, tokenHash string) (*models.ShareLink, error)
+	ListBySandbox(ctx context.Context, accountID, sandboxID string, opts ListOpts) ([]*models.ShareLink, error)
+	Revoke(ctx context.Context, accountID, id string, at time.Time) error
 }
 
 // OperationStore tracks async operations. UpdateStatus is unscoped because

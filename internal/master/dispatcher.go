@@ -240,12 +240,9 @@ func (c *AgentClient) SnapshotSandbox(ctx context.Context, id, name, destPath st
 }
 
 // ListSandboxes issues GET /sandbox/list and returns all sandboxes the
-// agent currently tracks. The reconciler uses this to detect drift between
-// master's database and the agent's in-memory state.
-//
-// NOTE: agent endpoint pending. The agent does not currently expose
-// /sandbox/list; the agent team will add it. TODO: once available, remove
-// this comment.
+// agent currently tracks. The reconciler uses this to detect drift
+// between master's database and the agent's in-memory state. The agent
+// shipped this endpoint as part of the networking-and-access milestone.
 func (c *AgentClient) ListSandboxes(ctx context.Context) ([]AgentSandboxView, error) {
 	var out []AgentSandboxView
 	if err := c.do(ctx, http.MethodGet, "/sandbox/list", nil, &out); err != nil {

@@ -31,6 +31,19 @@ func (s *pgSandboxStore) GetByID(ctx context.Context, accountID, id string) (*mo
 	return &sb, nil
 }
 
+// GetByIDUnscoped is the system-internal lookup used by proxy-route /
+// reconciler. The caller has already proved authorization out-of-band;
+// here we just return the row regardless of account.
+func (s *pgSandboxStore) GetByIDUnscoped(ctx context.Context, id string) (*models.Sandbox, error) {
+	var sb models.Sandbox
+	err := sqlx.GetContext(ctx, s.ext, &sb,
+		`SELECT `+sandboxColumns+` FROM sandboxes WHERE id = $1`, id)
+	if err != nil {
+		return nil, translate(err)
+	}
+	return &sb, nil
+}
+
 func (s *pgSandboxStore) ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Sandbox, error) {
 	limit, offset := applyListDefaults(opts)
 	out := []*models.Sandbox{}

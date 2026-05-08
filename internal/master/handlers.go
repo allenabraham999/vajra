@@ -48,6 +48,17 @@ type Handlers struct {
 	// /v1/clusters, /v1/nodes, and /v1/nodes/*/drain surface.
 	AdminAccountID string
 
+	// AgentSharedSecret is the Bearer token vajra-proxy and the agents
+	// expect on internal calls. Master returns it to the proxy as part
+	// of the route response so the proxy can authorize against the
+	// agent's CONNECT endpoints.
+	AgentSharedSecret string
+
+	// PublicBaseDomain is the apex domain the proxy is reachable on
+	// (e.g. "vajra.dev"). Used to suggest user-friendly share URLs;
+	// empty means the master will return a token but not a URL.
+	PublicBaseDomain string
+
 	// Now is overridable in tests so JWT expiry and operation timestamps
 	// are deterministic. Production wires this to time.Now.
 	Now func() time.Time

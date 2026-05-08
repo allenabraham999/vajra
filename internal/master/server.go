@@ -108,6 +108,16 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"POST /v1/sandboxes/{id}/snapshot":      h.snapshotSandbox,
 		"GET /v1/sandboxes/{id}/snapshots":      h.listSandboxSnapshots,
 
+		// Files (proxy through agent)
+		"POST /v1/sandboxes/{id}/files/upload":   h.uploadFile,
+		"GET /v1/sandboxes/{id}/files/download":  h.downloadFile,
+		"GET /v1/sandboxes/{id}/files/list":      h.listFiles,
+
+		// Shares
+		"POST /v1/sandboxes/{id}/share":                  h.createShare,
+		"GET /v1/sandboxes/{id}/shares":                  h.listShares,
+		"DELETE /v1/sandboxes/{id}/share/{token_id}":     h.revokeShare,
+
 		// Snapshots
 		"POST /v1/snapshots/{id}/restore": h.restoreSnapshot,
 		"POST /v1/snapshots/{id}/clone":   h.cloneSnapshot,
@@ -136,6 +146,8 @@ func (s *Server) internalRoutes() map[string]http.HandlerFunc {
 		"POST /internal/nodes/{id}/heartbeat":    h.nodeHeartbeat,
 		"POST /internal/nodes/{id}/event":        h.nodeEvent,
 		"POST /internal/sandboxes/{id}/unhealthy": h.sandboxUnhealthyAlias,
+		"GET /internal/proxy/route":               h.proxyRoute,
+		"GET /internal/proxy/validate-share":      h.validateShare,
 	}
 }
 

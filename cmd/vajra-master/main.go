@@ -32,6 +32,7 @@ type config struct {
 	MigrationsDir     string
 	ReconcileInterval time.Duration
 	AdminAccountID    string
+	PublicBaseDomain  string
 	Version           master.VersionInfo
 }
 
@@ -46,6 +47,7 @@ func loadConfig() (*config, error) {
 		ListenAddr:        getenvDefault("LISTEN_ADDR", ":8080"),
 		MigrationsDir:     getenvDefault("MIGRATIONS_DIR", "./migrations"),
 		AdminAccountID:    os.Getenv("ADMIN_ACCOUNT_ID"),
+		PublicBaseDomain:  os.Getenv("PUBLIC_BASE_DOMAIN"),
 		Version: master.VersionInfo{
 			Version: getenvDefault("VAJRA_VERSION", "dev"),
 			Commit:  getenvDefault("VAJRA_COMMIT", "unknown"),
@@ -111,6 +113,8 @@ func main() {
 	handlers := master.NewHandlers(st, signer, scheduler, pool, tracker)
 	handlers.Logger = logger
 	handlers.Version = cfg.Version
+	handlers.AgentSharedSecret = cfg.AgentSharedSecret
+	handlers.PublicBaseDomain = cfg.PublicBaseDomain
 
 	reconciler := master.NewReconciler(st, pool.AsAgentLister(), logger, cfg.ReconcileInterval)
 	go reconciler.Run(ctx)
