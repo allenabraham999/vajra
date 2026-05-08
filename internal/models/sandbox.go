@@ -83,16 +83,27 @@ type Sandbox struct {
 	UpdatedAt  time.Time     `db:"updated_at" json:"updated_at"`
 }
 
-// validSandboxTransitions defines the allowed forward transitions per
-// CLAUDE.md. Transitions to ERROR are handled separately in CanTransition.
+// validSandboxTransitions defines the allowed forward transitions. The
+// canonical chain in CLAUDE.md (PENDING → CREATING → RUNNING → PAUSING →
+// PAUSED → STOPPING → STOPPED → ARCHIVING → ARCHIVED → DESTROYING →
+// DESTROYED) is preserved, but a few realistic shortcuts are added so the
+// API can serve the lifecycle users actually invoke without forcing them
+// through every intermediate state:
+//
+//   - RUNNING → STOPPING:   stop without pausing first
+//   - RUNNING → DESTROYING: delete a running sandbox
+//   - STOPPED → RUNNING:    start a stopped sandbox (re-restore on agent)
+//   - STOPPED → DESTROYING: delete a stopped sandbox without archival
+//
+// Transitions to ERROR are handled separately in CanTransition.
 var validSandboxTransitions = map[SandboxState][]SandboxState{
 	SandboxStatePending:    {SandboxStateCreating},
 	SandboxStateCreating:   {SandboxStateRunning},
-	SandboxStateRunning:    {SandboxStatePausing},
+	SandboxStateRunning:    {SandboxStatePausing, SandboxStateStopping, SandboxStateDestroying},
 	SandboxStatePausing:    {SandboxStatePaused},
 	SandboxStatePaused:     {SandboxStateStopping},
 	SandboxStateStopping:   {SandboxStateStopped},
-	SandboxStateStopped:    {SandboxStateArchiving},
+	SandboxStateStopped:    {SandboxStateArchiving, SandboxStateRunning, SandboxStateDestroying},
 	SandboxStateArchiving:  {SandboxStateArchived},
 	SandboxStateArchived:   {SandboxStateDestroying},
 	SandboxStateDestroying: {SandboxStateDestroyed},

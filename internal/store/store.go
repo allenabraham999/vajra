@@ -98,6 +98,12 @@ type NodeStore interface {
 	UpdateState(ctx context.Context, id string, state models.NodeState) error
 	UpdateUsage(ctx context.Context, id string, usage models.NodeUsage) error
 	UpdateHeartbeat(ctx context.Context, id string, ts time.Time) error
+	// UpdateConfig refreshes the mutable identity fields written at
+	// register-time: hostname, IP, capacity, and lifecycle state. Used by
+	// the agent re-registration path so a node coming back on a new IP
+	// or with a different capacity profile updates in place rather than
+	// orphaning sandboxes via delete+recreate.
+	UpdateConfig(ctx context.Context, id, hostname, ip string, capacity models.NodeCapacity, state models.NodeState) error
 	Delete(ctx context.Context, id string) error
 }
 

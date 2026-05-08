@@ -1,0 +1,241 @@
+// Package master — server.go is the HTTP entry point. It wires the
+// Handlers struct into a mux of method+path patterns and applies a
+// short middleware chain (request ID → logging → recovery → auth) to
+// every route.
+package master
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+)
+
+// shutdownTimeout is the drain budget after Run() observes a context
+// cancellation. 30s is the conventional graceful-shutdown window for
+// HTTP services and matches the brief.
+const shutdownTimeout = 30 * time.Second
+
+// ServerConfig is the bind + secrets bundle for NewServer.
+type ServerConfig struct {
+	Addr           string
+	Logger         *slog.Logger
+	InternalSecret string
+	AdminAccountID string
+}
+
+// Server bundles a configured *Handlers with the http.Server it serves
+// from. It is constructed once by main.go and never mutated.
+type Server struct {
+	cfg      ServerConfig
+	handlers *Handlers
+	http     *http.Server
+}
+
+// NewServer returns a configured Server. The handlers' AdminAccountID
+// is overwritten with cfg.AdminAccountID so callers don't have to set
+// it twice.
+func NewServer(cfg ServerConfig, h *Handlers) *Server {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.Addr == "" {
+		cfg.Addr = ":8080"
+	}
+	h.AdminAccountID = cfg.AdminAccountID
+	if h.Logger == nil {
+		h.Logger = cfg.Logger
+	}
+	return &Server{cfg: cfg, handlers: h}
+}
+
+// ctxKeyRequestID is the context key for the per-request ID injected by
+// requestIDMiddleware. Unexported so callers outside the package can't
+// guess it.
+const ctxKeyRequestID ctxKey = 2
+
+// Routes builds the http.Handler the server will serve. Exported so
+// tests can hit it via httptest without spinning a real listener.
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+	h := s.handlers
+
+	// Public routes — no auth.
+	mux.HandleFunc("GET /health", h.getHealth)
+	mux.HandleFunc("GET /version", h.getVersion)
+	mux.HandleFunc("POST /v1/auth/register", h.register)
+	mux.HandleFunc("POST /v1/auth/login", h.login)
+
+	// Authed routes — wrap each with AuthMiddleware so per-route
+	// composition stays flat. There's no "auth subtree" with
+	// http.ServeMux, so we register the wrapped HandlerFunc directly.
+	auth := AuthMiddleware(h.Signer, s.handlers.Store.APIKeys())
+	for pattern, hf := range s.authedRoutes() {
+		mux.Handle(pattern, auth(http.HandlerFunc(hf)))
+	}
+
+	// Internal routes — pre-shared secret only.
+	internal := InternalAuthMiddleware(s.cfg.InternalSecret)
+	for pattern, hf := range s.internalRoutes() {
+		mux.Handle(pattern, internal(http.HandlerFunc(hf)))
+	}
+
+	return s.middleware(mux)
+}
+
+// authedRoutes returns the (pattern → handler) map for everything
+// behind AuthMiddleware. Returning a map keeps registration tidy and
+// makes the route surface easy to enumerate in tests.
+func (s *Server) authedRoutes() map[string]http.HandlerFunc {
+	h := s.handlers
+	return map[string]http.HandlerFunc{
+		// API keys
+		"POST /v1/api-keys":        h.createAPIKey,
+		"GET /v1/api-keys":         h.listAPIKeys,
+		"DELETE /v1/api-keys/{id}": h.deleteAPIKey,
+
+		// Sandboxes
+		"POST /v1/sandboxes":                    h.createSandbox,
+		"GET /v1/sandboxes":                     h.listSandboxes,
+		"GET /v1/sandboxes/{id}":                h.getSandbox,
+		"POST /v1/sandboxes/{id}/exec":          h.execSandbox,
+		"POST /v1/sandboxes/{id}/stop":          h.stopSandbox,
+		"POST /v1/sandboxes/{id}/start":         h.startSandbox,
+		"DELETE /v1/sandboxes/{id}":             h.destroySandbox,
+		"POST /v1/sandboxes/{id}/snapshot":      h.snapshotSandbox,
+		"GET /v1/sandboxes/{id}/snapshots":      h.listSandboxSnapshots,
+
+		// Snapshots
+		"POST /v1/snapshots/{id}/restore": h.restoreSnapshot,
+		"POST /v1/snapshots/{id}/clone":   h.cloneSnapshot,
+		"POST /v1/snapshots/{id}/promote": h.promoteSnapshot,
+
+		// Templates
+		"GET /v1/templates":  h.listTemplates,
+		"POST /v1/templates": h.createTemplate,
+
+		// Admin
+		"GET /v1/clusters":           h.listClusters,
+		"GET /v1/nodes":              h.listNodes,
+		"POST /v1/nodes/{id}/drain":  h.drainNode,
+
+		// Usage
+		"GET /v1/usage": h.getUsage,
+	}
+}
+
+// internalRoutes returns the (pattern → handler) map for endpoints
+// guarded by the agent's pre-shared secret.
+func (s *Server) internalRoutes() map[string]http.HandlerFunc {
+	h := s.handlers
+	return map[string]http.HandlerFunc{
+		"POST /internal/nodes/register":          h.registerNode,
+		"POST /internal/nodes/{id}/heartbeat":    h.nodeHeartbeat,
+		"POST /internal/nodes/{id}/event":        h.nodeEvent,
+		"POST /internal/sandboxes/{id}/unhealthy": h.sandboxUnhealthyAlias,
+	}
+}
+
+// ListenAndServe binds the configured address and serves until ctx is
+// cancelled. On cancellation we drain for shutdownTimeout before
+// forcing a close; if the listener fails for any other reason the
+// error is returned.
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	s.http = &http.Server{
+		Addr:              s.cfg.Addr,
+		Handler:           s.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		s.cfg.Logger.Info("vajra-master listening", "addr", s.cfg.Addr)
+		if err := s.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = s.http.Shutdown(shutdownCtx)
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+// middleware wraps the mux with request-ID, logging, and recovery
+// layers. CORS is intentionally noop here — the dashboard talks to
+// master via a same-origin proxy in production.
+func (s *Server) middleware(next http.Handler) http.Handler {
+	logger := s.cfg.Logger
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			var buf [4]byte
+			_, _ = rand.Read(buf[:])
+			reqID = hex.EncodeToString(buf[:])
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyRequestID, reqID)
+		w.Header().Set("X-Request-ID", reqID)
+
+		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+
+		// Recovery: a panic inside a handler must not crash the
+		// process. Log + 500.
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("panic recovered",
+					"request_id", reqID,
+					"path", r.URL.Path,
+					"panic", rec,
+				)
+				if !rw.written {
+					http.Error(rw, "internal error", http.StatusInternalServerError)
+				}
+			}
+			accountID := AccountIDFromContext(ctx)
+			logger.Info("http",
+				"request_id", reqID,
+				"account_id", accountID,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rw.status,
+				"latency_ms", time.Since(start).Milliseconds(),
+			)
+		}()
+
+		next.ServeHTTP(rw, r.WithContext(ctx))
+	})
+}
+
+// statusRecorder captures the response code so the logging middleware
+// can record it. WriteHeader is the only point at which the code
+// reaches the wire, so we observe it there.
+type statusRecorder struct {
+	http.ResponseWriter
+	status  int
+	written bool
+}
+
+// WriteHeader records the status before delegating.
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.written = true
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// Write marks the response as written so a defer-recovered panic does
+// not double-write.
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	r.written = true
+	return r.ResponseWriter.Write(b)
+}

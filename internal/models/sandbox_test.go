@@ -24,19 +24,30 @@ var allSandboxStates = []SandboxState{
 	SandboxStateError,
 }
 
-// validForward is the canonical chain from CLAUDE.md, expressed as
-// from→to pairs. Transitions to ERROR are tested separately.
-var validForward = map[SandboxState]SandboxState{
-	SandboxStatePending:    SandboxStateCreating,
-	SandboxStateCreating:   SandboxStateRunning,
-	SandboxStateRunning:    SandboxStatePausing,
-	SandboxStatePausing:    SandboxStatePaused,
-	SandboxStatePaused:     SandboxStateStopping,
-	SandboxStateStopping:   SandboxStateStopped,
-	SandboxStateStopped:    SandboxStateArchiving,
-	SandboxStateArchiving:  SandboxStateArchived,
-	SandboxStateArchived:   SandboxStateDestroying,
-	SandboxStateDestroying: SandboxStateDestroyed,
+// validForward mirrors the FSM in sandbox.go: the canonical chain from
+// CLAUDE.md plus the realistic shortcuts (RUNNING → STOPPING/DESTROYING,
+// STOPPED → RUNNING/DESTROYING). Transitions to ERROR are tested
+// separately.
+var validForward = map[SandboxState][]SandboxState{
+	SandboxStatePending:    {SandboxStateCreating},
+	SandboxStateCreating:   {SandboxStateRunning},
+	SandboxStateRunning:    {SandboxStatePausing, SandboxStateStopping, SandboxStateDestroying},
+	SandboxStatePausing:    {SandboxStatePaused},
+	SandboxStatePaused:     {SandboxStateStopping},
+	SandboxStateStopping:   {SandboxStateStopped},
+	SandboxStateStopped:    {SandboxStateArchiving, SandboxStateRunning, SandboxStateDestroying},
+	SandboxStateArchiving:  {SandboxStateArchived},
+	SandboxStateArchived:   {SandboxStateDestroying},
+	SandboxStateDestroying: {SandboxStateDestroyed},
+}
+
+func validForwardContains(from, to SandboxState) bool {
+	for _, t := range validForward[from] {
+		if t == to {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSandboxTransition_AllPairs(t *testing.T) {
@@ -49,11 +60,13 @@ func TestSandboxTransition_AllPairs(t *testing.T) {
 	var cases []tc
 
 	// 1. Every valid forward transition succeeds.
-	for from, to := range validForward {
-		cases = append(cases, tc{
-			name: string(from) + "_to_" + string(to) + "_valid",
-			from: from, to: to, wantErr: false,
-		})
+	for from, tos := range validForward {
+		for _, to := range tos {
+			cases = append(cases, tc{
+				name: string(from) + "_to_" + string(to) + "_valid",
+				from: from, to: to, wantErr: false,
+			})
+		}
 	}
 
 	// 2. Every non-ERROR state can transition to ERROR.
@@ -74,7 +87,7 @@ func TestSandboxTransition_AllPairs(t *testing.T) {
 			if to == SandboxStateError && from != SandboxStateError {
 				continue // covered above
 			}
-			if v, ok := validForward[from]; ok && v == to {
+			if validForwardContains(from, to) {
 				continue // covered above
 			}
 			cases = append(cases, tc{

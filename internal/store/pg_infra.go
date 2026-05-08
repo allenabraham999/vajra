@@ -116,6 +116,13 @@ func (s *pgNodeStore) UpdateHeartbeat(ctx context.Context, id string, ts time.Ti
 	return expectAffected(res, err)
 }
 
+func (s *pgNodeStore) UpdateConfig(ctx context.Context, id, hostname, ip string, capacity models.NodeCapacity, state models.NodeState) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE nodes SET hostname = $1, ip = $2, capacity = $3, state = $4 WHERE id = $5`,
+		hostname, ip, capacity, string(state), id)
+	return expectAffected(res, err)
+}
+
 func (s *pgNodeStore) Delete(ctx context.Context, id string) error {
 	res, err := s.ext.ExecContext(ctx, `DELETE FROM nodes WHERE id = $1`, id)
 	return expectAffected(res, err)
