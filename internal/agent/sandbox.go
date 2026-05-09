@@ -158,9 +158,18 @@ func (m *SandboxManager) AllocateCID() uint32 {
 }
 
 // CreateSandbox materializes a fresh sandbox from a cached template:
-// CoW-copy the rootfs, restore from the template snapshot, and register
-// the running VM. Returns the populated Sandbox or an error; on failure
-// any partially-created files are cleaned up.
+// CoW-copy the rootfs, materialize a per-sandbox snapshot directory with
+// rewritten paths, restore from it, and register the running VM. Returns
+// the populated Sandbox or an error; on failure any partially-created
+// files are cleaned up.
+//
+// The snapshot must be per-sandbox because the original template's
+// config.json carries paths captured at snapshot time — relative disk
+// paths that resolve against CH's CWD and a hardcoded vsock socket. Two
+// concurrent sandboxes cannot share either: they would race on the same
+// rootfs and bind() the same vsock socket. The fix is to copy the
+// snapshot dir, rewrite config.json with absolute per-sandbox paths, and
+// hand CH the rewritten copy.
 func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (*Sandbox, error) {
 	if req.TemplateHash == "" {
 		return nil, errors.New("sandbox: template hash required")
@@ -183,6 +192,11 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("sandbox: copy rootfs: %w", err)
 	}
+	snapshotDir, err := prepareSandboxSnapshot(layout, dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("sandbox: prepare snapshot: %w", err)
+	}
 
 	cid := m.AllocateCID()
 	sb := &Sandbox{
@@ -197,7 +211,7 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 		Healthy:      true,
 		LastHealthAt: time.Now().UTC(),
 	}
-	socketPath, err := m.vmm.RestoreVM(ctx, id, layout.SnapshotDir)
+	socketPath, err := m.vmm.RestoreVM(ctx, id, snapshotDir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("sandbox: restore: %w", err)
@@ -414,6 +428,105 @@ func vsockSocketFor(apiSocket string) string {
 	ext := filepath.Ext(apiSocket)
 	base := apiSocket[:len(apiSocket)-len(ext)]
 	return base + "-vsock.sock"
+}
+
+// prepareSandboxSnapshot stages a per-sandbox copy of the template's
+// snapshot directory under sandboxDir/snapshot and rewrites config.json
+// so every path resolves on this host without ambiguity:
+//
+//   - disk paths → the per-sandbox CoW rootfs (sandboxDir/rootfs.raw)
+//   - vsock socket → sandboxDir/vsock.sock (avoids cross-sandbox bind() races)
+//   - kernel/initramfs/firmware → absolute paths inside the template cache
+//
+// CH writes config.json relative to wherever the original VM ran, so a
+// fresh restore on a different host (or a second sandbox on the same host)
+// fails with NotFound on the disk or EADDRINUSE on the vsock unless we
+// rewrite first. Returns the per-sandbox snapshot directory.
+func prepareSandboxSnapshot(layout TemplateLayout, sandboxDir string) (string, error) {
+	dst := filepath.Join(sandboxDir, "snapshot")
+	if err := copyDirReflink(layout.SnapshotDir, dst); err != nil {
+		return "", fmt.Errorf("copy snapshot dir: %w", err)
+	}
+	if err := rewriteSnapshotConfig(filepath.Join(dst, "config.json"), sandboxDir, layout); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// rewriteSnapshotConfig parses the snapshot's config.json as a generic
+// map (so unknown CH fields survive the round trip), patches the few
+// path-bearing fields, and writes the result back to the same file.
+func rewriteSnapshotConfig(configPath, sandboxDir string, layout TemplateLayout) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config.json: %w", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse config.json: %w", err)
+	}
+	rootfs := filepath.Join(sandboxDir, "rootfs.raw")
+	if disks, ok := cfg["disks"].([]any); ok {
+		for _, d := range disks {
+			disk, ok := d.(map[string]any)
+			if !ok {
+				continue
+			}
+			disk["path"] = rootfs
+		}
+	}
+	if vsock, ok := cfg["vsock"].(map[string]any); ok {
+		vsock["socket"] = filepath.Join(sandboxDir, "vsock.sock")
+	}
+	if payload, ok := cfg["payload"].(map[string]any); ok {
+		for _, key := range []string{"kernel", "initramfs", "firmware"} {
+			v, ok := payload[key].(string)
+			if !ok || v == "" || filepath.IsAbs(v) {
+				continue
+			}
+			payload[key] = filepath.Join(layout.Dir, v)
+		}
+	}
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config.json: %w", err)
+	}
+	if err := os.WriteFile(configPath, out, 0o644); err != nil {
+		return fmt.Errorf("write config.json: %w", err)
+	}
+	return nil
+}
+
+// copyDirReflink mirrors src into dst, using reflinkOrCopy on every
+// regular file so the (often hundreds-of-MB) memory image inside a CH
+// snapshot is shared via copy-on-write where the filesystem supports it.
+// Symlinks and special files are skipped — CH snapshots only contain
+// regular files.
+func copyDirReflink(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", src, err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dst, err)
+	}
+	for _, e := range entries {
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			if err := copyDirReflink(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if !e.Type().IsRegular() {
+			continue
+		}
+		if err := reflinkOrCopy(srcPath, dstPath); err != nil {
+			return fmt.Errorf("copy %s: %w", srcPath, err)
+		}
+	}
+	return nil
 }
 
 // reflinkOrCopy first tries `cp --reflink=auto` (so on btrfs/xfs/apfs the

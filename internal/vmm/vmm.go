@@ -1,6 +1,7 @@
 package vmm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -293,7 +294,13 @@ func (m *VMManager) startProcess(ctx context.Context, vmID string, extraArgs []s
 	// DestroyVM/killProcess so we control cleanup ordering.
 	cmd := exec.Command(m.binaryPath, args...)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Funnel CH's stderr into slog at WARN. Without this, when CH crashes
+	// during restore (bad config.json paths, EADDRINUSE on vsock, etc.) the
+	// error bubbles up only as "vm did not reach state Paused" — the actual
+	// reason ends up on whatever fd was attached, which during in-process
+	// agent operation is /dev/null. Each line is logged with vm_id so
+	// concurrent sandboxes' streams can be told apart.
+	cmd.Stderr = &stderrLineLogger{logger: m.logger.With("vm_id", vmID)}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return "", nil, fmt.Errorf("start cloud-hypervisor: %w", err)
@@ -464,6 +471,39 @@ func PollVMState(ctx context.Context, socketPath, targetState string, timeout ti
 		case <-timer.C:
 		}
 	}
+}
+
+// stderrLineLogger is the io.Writer plugged into cloud-hypervisor's
+// stderr. Process pipes deliver bytes in arbitrary chunks (sometimes
+// multiple lines, sometimes a partial line), so we buffer until each '\n'
+// and emit one slog.Warn record per complete line. The trailing partial
+// line — if any — is flushed when the pipe closes; in our setup that
+// happens implicitly when the *exec.Cmd is reaped, so we don't bother
+// surfacing a Close method.
+type stderrLineLogger struct {
+	logger *slog.Logger
+
+	mu  sync.Mutex
+	buf []byte
+}
+
+// Write implements io.Writer.
+func (s *stderrLineLogger) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = append(s.buf, p...)
+	for {
+		i := bytes.IndexByte(s.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimRight(string(s.buf[:i]), "\r")
+		s.buf = s.buf[i+1:]
+		if line != "" {
+			s.logger.Warn("cloud-hypervisor stderr", "line", line)
+		}
+	}
+	return len(p), nil
 }
 
 func pollVMStateErr(target string, timeout time.Duration, lastState string, lastErr error) error {

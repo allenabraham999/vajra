@@ -73,8 +73,10 @@ func (e errFake) Error() string { return string(e) }
 // ===== test helpers =====
 
 // seedTemplate creates a fake template directory under cacheDir keyed by a
-// SHA256 of bodyBytes (the rootfs payload). The template directory is
-// minimally populated with rootfs.raw so HasTemplate returns true.
+// SHA256 of bodyBytes (the rootfs payload). The template is populated with
+// rootfs.raw plus a snapshot/config.json mimicking what cloud-hypervisor
+// emits — relative disk and kernel paths, and a hardcoded vsock socket —
+// so tests exercise the path-rewrite logic the same way real templates do.
 func seedTemplate(t *testing.T, cacheDir string, body []byte) string {
 	t.Helper()
 	sum := sha256.Sum256(body)
@@ -85,6 +87,29 @@ func seedTemplate(t *testing.T, cacheDir string, body []byte) string {
 	}
 	if err := os.WriteFile(filepath.Join(dir, "rootfs.raw"), body, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	cfg := map[string]any{
+		"disks": []any{
+			map[string]any{"path": "noble-server-cloudimg-amd64.raw", "readonly": false},
+		},
+		"vsock": map[string]any{
+			"cid":    3,
+			"socket": "/tmp/ch-vsock.sock",
+		},
+		"payload": map[string]any{
+			"kernel":  "vmlinux",
+			"cmdline": "console=hvc0 root=/dev/vda1",
+		},
+		// An unmodelled field that must survive the round trip — proves the
+		// rewriter doesn't truncate config.json down to known keys.
+		"console": map[string]any{"mode": "Off"},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal cfg: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "snapshot", "config.json"), data, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
 	return hash
 }
@@ -180,6 +205,89 @@ func TestSandboxCreateRejectsUnknownTemplate(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected error for missing template")
+	}
+}
+
+func TestSandboxCreateRewritesSnapshotConfig(t *testing.T) {
+	mgr, _, cacheDir := newTestManager(t)
+	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
+
+	sb, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sandboxDir := filepath.Join(mgr.root, sb.ID)
+	rewritten, err := os.ReadFile(filepath.Join(sandboxDir, "snapshot", "config.json"))
+	if err != nil {
+		t.Fatalf("read rewritten config: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rewritten, &got); err != nil {
+		t.Fatalf("parse rewritten config: %v", err)
+	}
+
+	disks, ok := got["disks"].([]any)
+	if !ok || len(disks) == 0 {
+		t.Fatalf("disks missing from rewritten config: %v", got)
+	}
+	disk0 := disks[0].(map[string]any)
+	wantDisk := filepath.Join(sandboxDir, "rootfs.raw")
+	if disk0["path"] != wantDisk {
+		t.Errorf("disk path: got %q, want %q", disk0["path"], wantDisk)
+	}
+	if !filepath.IsAbs(disk0["path"].(string)) {
+		t.Errorf("disk path not absolute: %q", disk0["path"])
+	}
+	// Unmodelled fields on the disk must survive the round trip.
+	if disk0["readonly"] != false {
+		t.Errorf("disk readonly key lost: %v", disk0)
+	}
+
+	vsock := got["vsock"].(map[string]any)
+	wantVsock := filepath.Join(sandboxDir, "vsock.sock")
+	if vsock["socket"] != wantVsock {
+		t.Errorf("vsock socket: got %q, want %q", vsock["socket"], wantVsock)
+	}
+	// CID is unrelated to paths and must be preserved.
+	if vsock["cid"] == nil {
+		t.Errorf("vsock cid lost: %v", vsock)
+	}
+
+	payload := got["payload"].(map[string]any)
+	wantKernel := filepath.Join(cacheDir, hash, "vmlinux")
+	if payload["kernel"] != wantKernel {
+		t.Errorf("kernel path: got %q, want %q", payload["kernel"], wantKernel)
+	}
+	if !filepath.IsAbs(payload["kernel"].(string)) {
+		t.Errorf("kernel path not absolute: %q", payload["kernel"])
+	}
+	// cmdline is unrelated to paths and must round-trip.
+	if payload["cmdline"] != "console=hvc0 root=/dev/vda1" {
+		t.Errorf("cmdline mutated: %q", payload["cmdline"])
+	}
+	// Unmodelled top-level field must survive.
+	if got["console"] == nil {
+		t.Errorf("unmodelled console field dropped: %v", got)
+	}
+
+	// The per-sandbox rootfs the disk path points at must actually exist.
+	if _, err := os.Stat(disk0["path"].(string)); err != nil {
+		t.Errorf("rewritten disk path does not exist: %v", err)
+	}
+
+	// The original template snapshot must NOT have been mutated — multiple
+	// sandboxes sharing one template must each get a fresh copy.
+	originalRaw, err := os.ReadFile(filepath.Join(cacheDir, hash, "snapshot", "config.json"))
+	if err != nil {
+		t.Fatalf("read original config: %v", err)
+	}
+	var original map[string]any
+	if err := json.Unmarshal(originalRaw, &original); err != nil {
+		t.Fatalf("parse original: %v", err)
+	}
+	origDiskPath := original["disks"].([]any)[0].(map[string]any)["path"]
+	if origDiskPath != "noble-server-cloudimg-amd64.raw" {
+		t.Errorf("template snapshot mutated; disk path is now %q", origDiskPath)
 	}
 }
 
