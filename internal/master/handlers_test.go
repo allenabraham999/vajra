@@ -27,6 +27,11 @@ type testHarness struct {
 	agentCalls int
 	agentBody []byte
 	jwtSecret []byte
+
+	// agentHandler, if non-nil, replaces the default agent stand-in for
+	// a given test. Tests that need custom agent behaviour (e.g. dispatch
+	// timeout while GET still works) install it before issuing requests.
+	agentHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 // newTestHarness builds a fully wired control plane for a single test.
@@ -45,6 +50,10 @@ func newTestHarness(t *testing.T) *testHarness {
 		h.agentCalls++
 		body, _ := io.ReadAll(r.Body)
 		h.agentBody = body
+		if h.agentHandler != nil {
+			h.agentHandler(w, r)
+			return
+		}
 		switch {
 		case r.URL.Path == "/sandbox/create":
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -341,6 +350,64 @@ func TestCreateSandboxNoNode(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("want 503, got %d", resp.StatusCode)
+	}
+}
+
+// TestCreateSandboxReconcilesAfterDispatchFailure pins the second half
+// of the regression: the agent finished CreateSandbox successfully but
+// master's HTTP call timed out / 5xx'd. Master used to mark ERROR even
+// though the agent reported RUNNING; now it must probe GetSandbox and
+// adopt the agent's truth so the DB stays consistent with what's
+// actually running on the host.
+func TestCreateSandboxReconcilesAfterDispatchFailure(t *testing.T) {
+	h := newTestHarness(t)
+	accountID, key := h.register(t, "alice@example.com", "supersecret")
+	c := h.seedCluster(t)
+	h.seedNode(t, c.ID)
+	h.seedTemplate(t, accountID)
+
+	// Custom agent: POST /sandbox/create always 500s (dispatch fails
+	// after retries), but GET /sandbox/{id} reports RUNNING — the
+	// scenario where the agent succeeded, the response just didn't make
+	// it back to master.
+	h.agentHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/create":
+			http.Error(w, "simulated upstream timeout", http.StatusInternalServerError)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sandbox/"):
+			id := strings.TrimPrefix(r.URL.Path, "/sandbox/")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    id,
+				"state": "RUNNING",
+			})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+
+	resp, body := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+		"name": "demo", "source": "image", "template_id": "tmpl-1",
+		"vcpus": 2, "memory_mb": 1024, "disk_gb": 10,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("want 201 after reconcile, got %d body %s", resp.StatusCode, body)
+	}
+	var got sandboxWithOp
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Sandbox == nil || got.Sandbox.State != models.SandboxStateRunning {
+		t.Fatalf("expected RUNNING in DB after reconcile, got %+v", got.Sandbox)
+	}
+
+	// And the persisted row must agree — confirms the UpdateState on
+	// the reconcile branch actually fired.
+	stored, err := h.store.Sandboxes().GetByID(context.Background(), accountID, got.Sandbox.ID)
+	if err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+	if stored.State != models.SandboxStateRunning {
+		t.Fatalf("DB state = %s, want RUNNING", stored.State)
 	}
 }
 

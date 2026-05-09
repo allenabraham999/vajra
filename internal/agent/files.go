@@ -198,7 +198,7 @@ func (m *SandboxManager) dialFiles(ctx context.Context, sandboxID string, timeou
 		timeout = DefaultFileTimeout
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestFilesPort)
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocketPath, GuestFilesPort)
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("sandbox: dial vsock: %w", err)

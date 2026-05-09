@@ -47,7 +47,7 @@ func (m *SandboxManager) DialForward(ctx context.Context, sandboxID string, port
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, DialForwardTimeout)
 	defer cancel()
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestForwardPort)
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocketPath, GuestForwardPort)
 	if err != nil {
 		return nil, fmt.Errorf("forward: dial vsock: %w", err)
 	}
@@ -84,7 +84,7 @@ func (m *SandboxManager) DialTerminal(ctx context.Context, sandboxID string, opt
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, DialForwardTimeout)
 	defer cancel()
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestTerminalPort)
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocketPath, GuestTerminalPort)
 	if err != nil {
 		return nil, fmt.Errorf("terminal: dial vsock: %w", err)
 	}

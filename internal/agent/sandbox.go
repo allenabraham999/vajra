@@ -55,21 +55,28 @@ type SandboxConfig struct {
 // Sandbox is the agent's record for a single microVM. Mutable fields are
 // guarded by SandboxManager.mu; callers receive a deep copy via
 // SandboxManager.Get/List.
+//
+// VsockSocketPath is the absolute path of the host-side vsock socket that
+// CH bind()s for this sandbox — the same path written into the rewritten
+// snapshot config.json by prepareSandboxSnapshot. It must be set from the
+// rewritten path, never derived from the API socket: under the per-sandbox
+// snapshot scheme the two are unrelated, and re-deriving would point health
+// probes at a path that no process is listening on.
 type Sandbox struct {
-	ID           string        `json:"id"`
-	State        SandboxState  `json:"state"`
-	TemplateHash string        `json:"template_hash"`
-	VsockCID     uint32        `json:"vsock_cid"`
-	APISocket    string        `json:"api_socket"`
-	VsockSocket  string        `json:"vsock_socket"`
-	RootfsPath   string        `json:"rootfs_path"`
-	StateDir     string        `json:"state_dir"`
-	Config       SandboxConfig `json:"config"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
-	Healthy      bool          `json:"healthy"`
-	LastHealthAt time.Time     `json:"last_health_at"`
-	FromPool     bool          `json:"from_pool"`
+	ID              string        `json:"id"`
+	State           SandboxState  `json:"state"`
+	TemplateHash    string        `json:"template_hash"`
+	VsockCID        uint32        `json:"vsock_cid"`
+	APISocket       string        `json:"api_socket"`
+	VsockSocketPath string        `json:"vsock_socket"`
+	RootfsPath      string        `json:"rootfs_path"`
+	StateDir        string        `json:"state_dir"`
+	Config          SandboxConfig `json:"config"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	Healthy         bool          `json:"healthy"`
+	LastHealthAt    time.Time     `json:"last_health_at"`
+	FromPool        bool          `json:"from_pool"`
 }
 
 // CreateRequest captures what callers (master, pool) supply to
@@ -192,7 +199,7 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("sandbox: copy rootfs: %w", err)
 	}
-	snapshotDir, err := prepareSandboxSnapshot(layout, dir)
+	snapshotDir, vsockSocketPath, err := prepareSandboxSnapshot(layout, dir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("sandbox: prepare snapshot: %w", err)
@@ -200,16 +207,17 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 
 	cid := m.AllocateCID()
 	sb := &Sandbox{
-		ID:           id,
-		State:        SandboxStateRunning,
-		TemplateHash: req.TemplateHash,
-		VsockCID:     cid,
-		RootfsPath:   overlay,
-		Config:       req.Config,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
-		Healthy:      true,
-		LastHealthAt: time.Now().UTC(),
+		ID:              id,
+		State:           SandboxStateRunning,
+		TemplateHash:    req.TemplateHash,
+		VsockCID:        cid,
+		RootfsPath:      overlay,
+		VsockSocketPath: vsockSocketPath,
+		Config:          req.Config,
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
+		Healthy:         true,
+		LastHealthAt:    time.Now().UTC(),
 	}
 	socketPath, err := m.vmm.RestoreVM(ctx, id, snapshotDir)
 	if err != nil {
@@ -217,7 +225,6 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 		return nil, fmt.Errorf("sandbox: restore: %w", err)
 	}
 	sb.APISocket = socketPath
-	sb.VsockSocket = vsockSocketFor(socketPath)
 
 	m.mu.Lock()
 	m.sandboxes[id] = sb
@@ -304,7 +311,9 @@ func (m *SandboxManager) StartSandbox(ctx context.Context, id string) error {
 	if cur, ok := m.sandboxes[id]; ok {
 		cur.State = SandboxStateRunning
 		cur.APISocket = socketPath
-		cur.VsockSocket = vsockSocketFor(socketPath)
+		// VsockSocketPath is stable across restart: the saved snapshot
+		// references the same per-sandbox vsock.sock the original create
+		// rewrote into config.json, so CH bind()s the same path again.
 		cur.UpdatedAt = time.Now().UTC()
 		cur.Healthy = true
 		cur.LastHealthAt = time.Now().UTC()
@@ -354,7 +363,7 @@ func (m *SandboxManager) HealthCheck(ctx context.Context, id string) error {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestExecPort)
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocketPath, GuestExecPort)
 	healthy := err == nil
 	if conn != nil {
 		_ = conn.Close()
@@ -422,14 +431,6 @@ func newSandboxID() string {
 	return "sb-" + hex.EncodeToString(b[:])
 }
 
-// vsockSocketFor mirrors vmm.cleanupSocketFiles' naming: the vsock
-// companion lives next to the API socket as `<base>-vsock.sock`.
-func vsockSocketFor(apiSocket string) string {
-	ext := filepath.Ext(apiSocket)
-	base := apiSocket[:len(apiSocket)-len(ext)]
-	return base + "-vsock.sock"
-}
-
 // prepareSandboxSnapshot stages a per-sandbox copy of the template's
 // snapshot directory under sandboxDir/snapshot and rewrites config.json
 // so every path resolves on this host without ambiguity:
@@ -441,16 +442,20 @@ func vsockSocketFor(apiSocket string) string {
 // CH writes config.json relative to wherever the original VM ran, so a
 // fresh restore on a different host (or a second sandbox on the same host)
 // fails with NotFound on the disk or EADDRINUSE on the vsock unless we
-// rewrite first. Returns the per-sandbox snapshot directory.
-func prepareSandboxSnapshot(layout TemplateLayout, sandboxDir string) (string, error) {
+// rewrite first. Returns the per-sandbox snapshot directory and the
+// absolute path of the rewritten vsock socket — callers must store the
+// latter on the Sandbox so health probes, exec, file I/O, and forwards
+// dial the path CH actually bound, not a stale derived one.
+func prepareSandboxSnapshot(layout TemplateLayout, sandboxDir string) (string, string, error) {
 	dst := filepath.Join(sandboxDir, "snapshot")
 	if err := copyDirReflink(layout.SnapshotDir, dst); err != nil {
-		return "", fmt.Errorf("copy snapshot dir: %w", err)
+		return "", "", fmt.Errorf("copy snapshot dir: %w", err)
 	}
+	vsockSocketPath := filepath.Join(sandboxDir, "vsock.sock")
 	if err := rewriteSnapshotConfig(filepath.Join(dst, "config.json"), sandboxDir, layout); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return dst, nil
+	return dst, vsockSocketPath, nil
 }
 
 // rewriteSnapshotConfig parses the snapshot's config.json as a generic

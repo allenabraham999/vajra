@@ -362,9 +362,113 @@ func TestExecCommandRoundTrip(t *testing.T) {
 }
 
 // fixedDialer always returns the supplied conn, so a test can wire host
-// and guest ends of a net.Pipe into the manager.
-type fixedDialer struct{ conn net.Conn }
+// and guest ends of a net.Pipe into the manager. The hostSocket the
+// caller passed in is recorded so tests can assert the dialer was
+// pointed at the per-sandbox vsock path, not a stale derived one.
+type fixedDialer struct {
+	conn       net.Conn
+	mu         sync.Mutex
+	lastSocket string
+}
 
-func (f *fixedDialer) Dial(_ context.Context, _ string, _ uint32) (io.ReadWriteCloser, error) {
+func (f *fixedDialer) Dial(_ context.Context, hostSocket string, _ uint32) (io.ReadWriteCloser, error) {
+	f.mu.Lock()
+	f.lastSocket = hostSocket
+	f.mu.Unlock()
 	return f.conn, nil
+}
+
+// TestSandboxVsockSocketPathMatchesRewrittenConfig pins the regression
+// from the agent log: health/exec/files/forward dialed an old derived
+// path while CH actually bound a per-sandbox path inside the snapshot.
+// The Sandbox struct must carry the rewritten path so all callers dial
+// the path that exists.
+func TestSandboxVsockSocketPathMatchesRewrittenConfig(t *testing.T) {
+	mgr, _, cacheDir := newTestManager(t)
+	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
+
+	sb, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sandboxDir := filepath.Join(mgr.root, sb.ID)
+	wantVsock := filepath.Join(sandboxDir, "vsock.sock")
+	if sb.VsockSocketPath != wantVsock {
+		t.Fatalf("VsockSocketPath = %q, want %q", sb.VsockSocketPath, wantVsock)
+	}
+
+	// And the value must match what the rewritten config.json points at —
+	// otherwise CH and the host would still disagree on where to bind.
+	rewritten, err := os.ReadFile(filepath.Join(sandboxDir, "snapshot", "config.json"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(rewritten, &cfg); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	configVsock := cfg["vsock"].(map[string]any)["socket"]
+	if configVsock != sb.VsockSocketPath {
+		t.Fatalf("config.json vsock socket %q != sb.VsockSocketPath %q", configVsock, sb.VsockSocketPath)
+	}
+
+	// VsockSocketPath must NOT be derived from the API socket — that's
+	// exactly the bug the agent log surfaced.
+	apiDerived := sb.APISocket
+	if apiDerived != "" && sb.VsockSocketPath == apiDerived[:len(apiDerived)-len(filepath.Ext(apiDerived))]+"-vsock.sock" {
+		t.Fatalf("VsockSocketPath looks derived from APISocket: %q", sb.VsockSocketPath)
+	}
+}
+
+// TestSandboxStartPreservesVsockSocketPath guards against StartSandbox
+// stomping the per-sandbox path with a re-derived one when the VM is
+// restored after a Stop. The path is invariant across restart.
+func TestSandboxStartPreservesVsockSocketPath(t *testing.T) {
+	mgr, _, cacheDir := newTestManager(t)
+	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
+
+	sb, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	original := sb.VsockSocketPath
+
+	if err := mgr.StopSandbox(context.Background(), sb.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := mgr.StartSandbox(context.Background(), sb.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	got, _ := mgr.Get(sb.ID)
+	if got.VsockSocketPath != original {
+		t.Fatalf("VsockSocketPath changed across restart: was %q, now %q", original, got.VsockSocketPath)
+	}
+}
+
+// TestHealthCheckDialsPerSandboxVsockPath proves the manager hands the
+// per-sandbox path to the dialer. Without the rename + rewrite, this
+// would dial the old "<socketDir>/<id>-vsock.sock" path.
+func TestHealthCheckDialsPerSandboxVsockPath(t *testing.T) {
+	mgr, _, cacheDir := newTestManager(t)
+	host, guest := net.Pipe()
+	defer host.Close()
+	defer guest.Close()
+	dialer := &fixedDialer{conn: host}
+	mgr.dialer = dialer
+
+	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
+	sb, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := mgr.HealthCheck(context.Background(), sb.ID); err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	dialer.mu.Lock()
+	got := dialer.lastSocket
+	dialer.mu.Unlock()
+	if got != sb.VsockSocketPath {
+		t.Fatalf("health dialed %q, want VsockSocketPath %q", got, sb.VsockSocketPath)
+	}
 }

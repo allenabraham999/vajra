@@ -51,7 +51,7 @@ func (m *SandboxManager) ExecCommand(ctx context.Context, id, command string, ti
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocket, GuestExecPort)
+	conn, err := m.dialer.Dial(dialCtx, sb.VsockSocketPath, GuestExecPort)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: dial vsock: %w", err)
 	}

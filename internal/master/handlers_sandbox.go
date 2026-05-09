@@ -24,6 +24,13 @@ import (
 // takes longest in practice; 60s is generous but bounded.
 const dispatchTimeout = 60 * time.Second
 
+// dispatchReconcileTimeout bounds the GetSandbox probe master fires after
+// a CreateSandbox dispatch failure. Short on purpose: we only want a
+// best-effort answer to "did the agent actually create it?"; if the agent
+// doesn't reply quickly we fall back to ERROR and let the reconciler sort
+// it out on its next pass.
+const dispatchReconcileTimeout = 5 * time.Second
+
 // createSandboxRequest is the body of POST /v1/sandboxes.
 type createSandboxRequest struct {
 	Name       string `json:"name"`
@@ -155,9 +162,10 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		h.log().Error("createSandbox: state transition", "err", err)
 	}
 
+	agent := h.Pool.ClientFor(node)
 	dispatchCtx, cancel := context.WithTimeout(r.Context(), dispatchTimeout)
 	defer cancel()
-	_, dispatchErr := h.Pool.ClientFor(node).CreateSandbox(dispatchCtx, CreateSandboxRequest{
+	_, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
 		ID:           sandboxID,
 		TemplateHash: templateHash,
 		Config: SandboxConfig{
@@ -165,9 +173,37 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		},
 	})
 	if dispatchErr != nil {
-		_ = h.Store.Sandboxes().UpdateState(r.Context(), accountID, sandboxID, models.SandboxStateError)
-		_ = h.Tracker.Complete(r.Context(), opID, dispatchErr)
-		h.log().Error("createSandbox: dispatch", "err", dispatchErr, "sandbox_id", sandboxID)
+		// A dispatch error doesn't mean the agent didn't create the
+		// sandbox — a transport timeout or interrupted response can land
+		// here while the agent finished happily. Probe with GetSandbox
+		// before declaring ERROR; if the agent reports RUNNING we adopt
+		// that and the DB stays consistent with the actual VM. Use a
+		// detached context so a cancelled inbound request still gets the
+		// reconcile probe.
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), dispatchReconcileTimeout)
+		defer probeCancel()
+		sbView, probeErr := agent.GetSandbox(probeCtx, sandboxID)
+		if probeErr == nil && sbView != nil {
+			if mapped, ok := mapAgentState(sbView.State); ok && mapped == models.SandboxStateRunning {
+				if err := h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateRunning); err != nil {
+					h.log().Error("createSandbox: reconcile-after-dispatch update", "err", err, "sandbox_id", sandboxID)
+				}
+				_ = h.Tracker.Complete(probeCtx, opID, nil)
+				h.log().Warn("createSandbox: dispatch reported error but agent has sandbox running",
+					"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
+				out, err := h.Store.Sandboxes().GetByID(probeCtx, accountID, sandboxID)
+				if err != nil {
+					h.log().Error("createSandbox: refetch after reconcile", "err", err)
+					writeErr(w, http.StatusInternalServerError, "internal error")
+					return
+				}
+				writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: out, OperationID: opID})
+				return
+			}
+		}
+		_ = h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateError)
+		_ = h.Tracker.Complete(probeCtx, opID, dispatchErr)
+		h.log().Error("createSandbox: dispatch", "err", dispatchErr, "sandbox_id", sandboxID, "probe_err", probeErr)
 		writeErr(w, http.StatusBadGateway, "agent dispatch failed: "+dispatchErr.Error())
 		return
 	}

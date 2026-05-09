@@ -116,14 +116,14 @@ type CreateSandboxRequest struct {
 // inspects the fields it needs to drive the FSM — extra fields are
 // preserved by the agent but silently ignored here.
 type CreateSandboxResponse struct {
-	ID           string `json:"id"`
-	State        string `json:"state"`
-	TemplateHash string `json:"template_hash,omitempty"`
-	VsockCID     uint32 `json:"vsock_cid,omitempty"`
-	APISocket    string `json:"api_socket,omitempty"`
-	VsockSocket  string `json:"vsock_socket,omitempty"`
-	RootfsPath   string `json:"rootfs_path,omitempty"`
-	FromPool     bool   `json:"from_pool,omitempty"`
+	ID              string `json:"id"`
+	State           string `json:"state"`
+	TemplateHash    string `json:"template_hash,omitempty"`
+	VsockCID        uint32 `json:"vsock_cid,omitempty"`
+	APISocket       string `json:"api_socket,omitempty"`
+	VsockSocketPath string `json:"vsock_socket,omitempty"`
+	RootfsPath      string `json:"rootfs_path,omitempty"`
+	FromPool        bool   `json:"from_pool,omitempty"`
 }
 
 // SandboxView is the minimal slice of a Sandbox the reconciler needs.
