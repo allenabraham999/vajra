@@ -239,14 +239,19 @@ func (r *Reconciler) handleMismatches(ctx context.Context, node *models.Node, ag
 }
 
 // mapAgentState narrows the agent's free-form state string to the
-// SandboxState constants we care about for reconciliation. Returns ok=false
-// for any unrecognised value so callers can skip safely.
+// SandboxState constants we care about for reconciliation and create
+// polling. Returns ok=false for any unrecognised value so callers can
+// skip safely.
 func mapAgentState(s string) (models.SandboxState, bool) {
 	switch s {
+	case "CREATING", "creating":
+		return models.SandboxStateCreating, true
 	case "RUNNING", "running":
 		return models.SandboxStateRunning, true
 	case "STOPPED", "stopped":
 		return models.SandboxStateStopped, true
+	case "ERROR", "error":
+		return models.SandboxStateError, true
 	default:
 		return "", false
 	}

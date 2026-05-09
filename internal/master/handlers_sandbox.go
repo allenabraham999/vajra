@@ -31,6 +31,17 @@ const dispatchTimeout = 60 * time.Second
 // it out on its next pass.
 const dispatchReconcileTimeout = 5 * time.Second
 
+// createPollInterval and createPollTimeout govern the background poller
+// master spawns after dispatching a create. The agent's CreateSandbox is
+// async and returns 202 immediately with state=CREATING; the poller
+// drives the DB row to RUNNING (or ERROR) when the agent's goroutine
+// finishes. 1s ticks keep the user-visible latency low; the 60s ceiling
+// matches the pessimistic restore time on cold paths.
+const (
+	createPollInterval = 1 * time.Second
+	createPollTimeout  = 60 * time.Second
+)
+
 // createSandboxRequest is the body of POST /v1/sandboxes.
 type createSandboxRequest struct {
 	Name       string `json:"name"`
@@ -173,44 +184,17 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		},
 	})
 	if dispatchErr != nil {
-		// A dispatch error doesn't mean the agent didn't create the
-		// sandbox — a transport timeout or interrupted response can land
-		// here while the agent finished happily. Probe with GetSandbox
-		// before declaring ERROR; if the agent reports RUNNING we adopt
-		// that and the DB stays consistent with the actual VM. Use a
-		// detached context so a cancelled inbound request still gets the
-		// reconcile probe.
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), dispatchReconcileTimeout)
-		defer probeCancel()
-		sbView, probeErr := agent.GetSandbox(probeCtx, sandboxID)
-		if probeErr == nil && sbView != nil {
-			if mapped, ok := mapAgentState(sbView.State); ok && mapped == models.SandboxStateRunning {
-				if err := h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateRunning); err != nil {
-					h.log().Error("createSandbox: reconcile-after-dispatch update", "err", err, "sandbox_id", sandboxID)
-				}
-				_ = h.Tracker.Complete(probeCtx, opID, nil)
-				h.log().Warn("createSandbox: dispatch reported error but agent has sandbox running",
-					"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
-				out, err := h.Store.Sandboxes().GetByID(probeCtx, accountID, sandboxID)
-				if err != nil {
-					h.log().Error("createSandbox: refetch after reconcile", "err", err)
-					writeErr(w, http.StatusInternalServerError, "internal error")
-					return
-				}
-				writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: out, OperationID: opID})
-				return
-			}
+		if !h.handleDispatchError(w, agent, accountID, sandboxID, opID, dispatchErr) {
+			return
 		}
-		_ = h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateError)
-		_ = h.Tracker.Complete(probeCtx, opID, dispatchErr)
-		h.log().Error("createSandbox: dispatch", "err", dispatchErr, "sandbox_id", sandboxID, "probe_err", probeErr)
-		writeErr(w, http.StatusBadGateway, "agent dispatch failed: "+dispatchErr.Error())
-		return
+		// Falls through: the agent reports CREATING/RUNNING and we've
+		// already updated the DB / kicked the poller. Refetch and return
+		// the current row to the user.
+	} else {
+		// Happy path: agent accepted the create asynchronously. Leave
+		// the DB row in CREATING and let the poller drive it forward.
+		go h.pollAgentCreate(accountID, sandboxID, opID, agent)
 	}
-	if err := h.Store.Sandboxes().UpdateState(r.Context(), accountID, sandboxID, models.SandboxStateRunning); err != nil {
-		h.log().Error("createSandbox: post-dispatch state", "err", err)
-	}
-	_ = h.Tracker.Complete(r.Context(), opID, nil)
 
 	out, err := h.Store.Sandboxes().GetByID(r.Context(), accountID, sandboxID)
 	if err != nil {
@@ -219,6 +203,145 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		return
 	}
 	writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: out, OperationID: opID})
+}
+
+// handleDispatchError resolves the four cases that can land us here when
+// agent.CreateSandbox returns non-nil. It returns ok=true when the
+// caller should keep going (refetch + 201) and ok=false when an HTTP
+// error has already been written and the handler must return.
+//
+//	probe RUNNING  → DB → RUNNING, complete tracker, ok=true (transport
+//	                 lost the 202 but the agent finished anyway)
+//	probe CREATING → fire poller, ok=true (agent received the request,
+//	                 still working)
+//	probe 404      → DB → DESTROYED, fail tracker, write 502, ok=false
+//	                 (agent has no record; nothing to reconcile to)
+//	probe other    → DB → ERROR, fail tracker, write 502, ok=false
+//	                 (we genuinely can't tell what's running)
+func (h *Handlers) handleDispatchError(
+	w http.ResponseWriter,
+	agent *AgentClient, accountID, sandboxID, opID string,
+	dispatchErr error,
+) bool {
+	probeCtx, cancel := context.WithTimeout(context.Background(), dispatchReconcileTimeout)
+	defer cancel()
+	sbView, probeErr := agent.GetSandbox(probeCtx, sandboxID)
+	if probeErr == nil && sbView != nil {
+		mapped, mapOK := mapAgentState(sbView.State)
+		switch {
+		case mapOK && mapped == models.SandboxStateRunning:
+			if err := h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateRunning); err != nil {
+				h.log().Error("createSandbox: reconcile-after-dispatch update", "err", err, "sandbox_id", sandboxID)
+			}
+			_ = h.Tracker.Complete(probeCtx, opID, nil)
+			h.log().Warn("createSandbox: dispatch reported error but agent has sandbox running",
+				"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
+			return true
+		case mapOK && mapped == models.SandboxStateCreating:
+			// Agent got the request and is still working. Spawn the
+			// poller and let it drive the DB row to RUNNING.
+			h.log().Warn("createSandbox: dispatch reported error but agent still creating",
+				"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
+			go h.pollAgentCreate(accountID, sandboxID, opID, agent)
+			return true
+		}
+	}
+	if isAgentNotFound(probeErr) {
+		// Agent has no record of this sandbox — the create never took
+		// effect (request lost in transit, or agent crashed before
+		// BeginCreate ran). Mark DESTROYED so the row matches reality
+		// and the user sees it as a failed create rather than a stuck
+		// CREATING row that the reconciler will eventually rewrite.
+		if err := h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateDestroyed); err != nil {
+			h.log().Error("createSandbox: dispatch destroyed update", "err", err, "sandbox_id", sandboxID)
+		}
+		_ = h.Tracker.Complete(probeCtx, opID, dispatchErr)
+		h.log().Error("createSandbox: agent has no record after dispatch failure",
+			"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
+		writeErr(w, http.StatusBadGateway, "agent dispatch failed: "+dispatchErr.Error())
+		return false
+	}
+	_ = h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateError)
+	_ = h.Tracker.Complete(probeCtx, opID, dispatchErr)
+	h.log().Error("createSandbox: dispatch", "err", dispatchErr, "sandbox_id", sandboxID, "probe_err", probeErr)
+	writeErr(w, http.StatusBadGateway, "agent dispatch failed: "+dispatchErr.Error())
+	return false
+}
+
+// pollAgentCreate drives a CREATING sandbox to its terminal state
+// (RUNNING or ERROR) by polling the agent. Called as a goroutine from
+// executeCreate, so it owns its own context and never returns to the
+// HTTP handler. createPollTimeout caps how long we'll wait before
+// declaring failure ourselves; if the agent never finishes we mark
+// ERROR rather than letting the row hang in CREATING forever.
+func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *AgentClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), createPollTimeout)
+	defer cancel()
+	ticker := time.NewTicker(createPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			err := fmt.Errorf("create poll timeout after %s", createPollTimeout)
+			if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
+				h.log().Error("createSandbox: poll timeout update", "err", uerr, "sandbox_id", sandboxID)
+			}
+			_ = h.Tracker.Complete(context.Background(), opID, err)
+			h.log().Error("createSandbox: poll timeout", "sandbox_id", sandboxID)
+			return
+		case <-ticker.C:
+			sbView, err := agent.GetSandbox(ctx, sandboxID)
+			if err != nil {
+				if isAgentNotFound(err) {
+					// Agent forgot about the sandbox mid-create —
+					// e.g. the goroutine panicked and was reaped.
+					// Surface as ERROR; the periodic reconciler can
+					// later mark it DESTROYED if needed.
+					if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
+						h.log().Error("createSandbox: poll missing update", "err", uerr, "sandbox_id", sandboxID)
+					}
+					_ = h.Tracker.Complete(context.Background(), opID, err)
+					h.log().Error("createSandbox: agent forgot sandbox during poll", "sandbox_id", sandboxID)
+					return
+				}
+				// Transient probe failure — keep ticking.
+				h.log().Debug("createSandbox: poll transient error",
+					"sandbox_id", sandboxID, "err", err)
+				continue
+			}
+			mapped, ok := mapAgentState(sbView.State)
+			if !ok {
+				continue
+			}
+			switch mapped {
+			case models.SandboxStateRunning:
+				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateRunning); uerr != nil {
+					h.log().Error("createSandbox: poll running update", "err", uerr, "sandbox_id", sandboxID)
+				}
+				_ = h.Tracker.Complete(context.Background(), opID, nil)
+				return
+			case models.SandboxStateError:
+				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
+					h.log().Error("createSandbox: poll error update", "err", uerr, "sandbox_id", sandboxID)
+				}
+				_ = h.Tracker.Complete(context.Background(), opID, fmt.Errorf("agent reported ERROR"))
+				return
+			}
+			// CREATING (or any other intermediate) — keep waiting.
+		}
+	}
+}
+
+// isAgentNotFound reports whether err is the agent's "no such sandbox"
+// signal. The dispatcher wraps non-2xx responses in *httpError so we
+// recognise the 404 the agent's handleGet returns when the manager has
+// no entry for the requested ID.
+func isAgentNotFound(err error) bool {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.Status == http.StatusNotFound
+	}
+	return false
 }
 
 // sandboxWithOp augments a sandbox row with the operation id so the

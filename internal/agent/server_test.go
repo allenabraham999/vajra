@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestServer builds a *Server backed by the same in-test SandboxManager
@@ -41,28 +42,53 @@ func rt(t *testing.T, s *Server, method, path string, body any) *httptest.Respon
 }
 
 func TestServerCreateAndGetSandbox(t *testing.T) {
-	srv, _, _, cacheDir := newTestServer(t)
+	srv, mgr, _, cacheDir := newTestServer(t)
 	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
 
 	w := rt(t, srv, "POST", "/sandbox/create", CreateRequestBody{
 		TemplateHash: hash,
 		Config:       SandboxConfig{VCPUs: 1, MemoryMB: 256},
 	})
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	// Async create: agent registers the placeholder synchronously and
+	// returns 202 with state=CREATING. The CoW + restore work runs in a
+	// goroutine; we poll the manager below to confirm the transition.
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 	var created Sandbox
 	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if created.ID == "" || created.State != SandboxStateRunning {
-		t.Fatalf("unexpected sandbox: %+v", created)
+	if created.ID == "" || created.State != SandboxStateCreating {
+		t.Fatalf("unexpected placeholder: %+v", created)
 	}
 
+	// GET should reach the placeholder immediately.
 	w = rt(t, srv, "GET", "/sandbox/"+created.ID, nil)
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200 from GET, got %d", w.Code)
 	}
+
+	// Wait for the async goroutine to land. This is a unit-test timeout,
+	// not the production poller — keep it tight so a real regression
+	// doesn't hide behind a long sleep.
+	waitForState(t, mgr, created.ID, SandboxStateRunning, 2*time.Second)
+}
+
+// waitForState polls mgr.Get until the sandbox reaches want or the
+// deadline passes. Failing fast surfaces async create regressions.
+func waitForState(t *testing.T, mgr *SandboxManager, id string, want SandboxState, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		sb, err := mgr.Get(id)
+		if err == nil && sb.State == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	sb, _ := mgr.Get(id)
+	t.Fatalf("sandbox %s did not reach %s within %s; last=%+v", id, want, timeout, sb)
 }
 
 func TestServerStopStartDestroy(t *testing.T) {

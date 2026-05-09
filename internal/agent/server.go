@@ -165,17 +165,33 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	sb, err := s.sandboxes.CreateSandbox(r.Context(), CreateRequest{
+	// Async create: register the placeholder synchronously (fast,
+	// validation only) so master's ListSandboxes / GetSandbox sees it
+	// immediately. The CoW + CH restore work runs in a goroutine on a
+	// detached context — r.Context() is cancelled the moment we return
+	// 202, so we must not pass it through. createdTotal is incremented
+	// in the goroutine on success.
+	sb, err := s.sandboxes.BeginCreate(CreateRequest{
 		ID:           body.ID,
 		TemplateHash: body.TemplateHash,
 		Config:       body.Config,
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.createdTotal.Add(1)
-	writeJSON(w, http.StatusCreated, sb)
+	go func(id string) {
+		ctx := context.Background()
+		if err := s.sandboxes.FinishCreate(ctx, id); err != nil {
+			// FinishCreate has already marked the sandbox ERROR with
+			// the cause. Just log here; master will pick up the
+			// terminal state on its next poll.
+			s.logger.Warn("async create failed", "id", id, "err", err)
+			return
+		}
+		s.createdTotal.Add(1)
+	}(sb.ID)
+	writeJSON(w, http.StatusAccepted, sb)
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {

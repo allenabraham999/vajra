@@ -26,10 +26,13 @@ import (
 const DefaultAgentPort = 9000
 
 // agentRequestTimeout caps a single HTTP attempt (excluding retry waits).
-// Operations that legitimately take longer (snapshot, large restore) must
-// pass a context with their own deadline; this is just the per-attempt
-// guardrail so a hung agent can't block a goroutine forever.
-const agentRequestTimeout = 30 * time.Second
+// Sized for the slowest synchronous handler we still serve inline: a
+// CreateSandbox call that does CoW + CH restore + state polling can take
+// 5-15s on cold paths and we want headroom over that. Operations that
+// legitimately exceed this (large snapshot exports) must pass a context
+// with their own deadline; this is just the per-attempt guardrail so a
+// hung agent can't block a goroutine forever.
+const agentRequestTimeout = 60 * time.Second
 
 // RetryPolicy controls exponential-backoff retries inside (*AgentClient).do.
 // Only network errors and 5xx responses are retried; 4xx is surfaced

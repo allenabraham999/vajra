@@ -38,6 +38,7 @@ const GuestExecPort uint32 = 5252
 type SandboxState string
 
 const (
+	SandboxStateCreating  SandboxState = "CREATING"
 	SandboxStateRunning   SandboxState = "RUNNING"
 	SandboxStatePaused    SandboxState = "PAUSED"
 	SandboxStateStopped   SandboxState = "STOPPED"
@@ -77,6 +78,10 @@ type Sandbox struct {
 	Healthy         bool          `json:"healthy"`
 	LastHealthAt    time.Time     `json:"last_health_at"`
 	FromPool        bool          `json:"from_pool"`
+	// Error is set when the async create goroutine fails. GetSandbox
+	// returns this verbatim so the master poller can surface a useful
+	// message to operators.
+	Error string `json:"error,omitempty"`
 }
 
 // CreateRequest captures what callers (master, pool) supply to
@@ -164,20 +169,18 @@ func (m *SandboxManager) AllocateCID() uint32 {
 	return m.nextCID.Add(1) - 1
 }
 
-// CreateSandbox materializes a fresh sandbox from a cached template:
-// CoW-copy the rootfs, materialize a per-sandbox snapshot directory with
-// rewritten paths, restore from it, and register the running VM. Returns
-// the populated Sandbox or an error; on failure any partially-created
-// files are cleaned up.
+// BeginCreate registers a new sandbox in CREATING state and returns the
+// placeholder. The heavy work (CoW rootfs, snapshot prep, CH restore)
+// must be driven by FinishCreate — usually from a goroutine kicked off
+// by the HTTP handler so master sees the placeholder in ListSandboxes
+// while the VM is still coming up. Synchronous callers (the warm pool,
+// integration tests) can use CreateSandbox to get the old all-in-one
+// behavior.
 //
-// The snapshot must be per-sandbox because the original template's
-// config.json carries paths captured at snapshot time — relative disk
-// paths that resolve against CH's CWD and a hardcoded vsock socket. Two
-// concurrent sandboxes cannot share either: they would race on the same
-// rootfs and bind() the same vsock socket. The fix is to copy the
-// snapshot dir, rewrite config.json with absolute per-sandbox paths, and
-// hand CH the rewritten copy.
-func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (*Sandbox, error) {
+// Validation that's cheap and synchronous (template hash, cache hit, ID
+// allocation, CID allocation) happens here so callers get an immediate
+// error for bad inputs instead of a "completed with error" sandbox.
+func (m *SandboxManager) BeginCreate(req CreateRequest) (*Sandbox, error) {
 	if req.TemplateHash == "" {
 		return nil, errors.New("sandbox: template hash required")
 	}
@@ -188,55 +191,123 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (
 	if id == "" {
 		id = newSandboxID()
 	}
+	now := time.Now().UTC()
+	sb := &Sandbox{
+		ID:           id,
+		State:        SandboxStateCreating,
+		TemplateHash: req.TemplateHash,
+		VsockCID:     m.AllocateCID(),
+		Config:       req.Config,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	m.mu.Lock()
+	if _, exists := m.sandboxes[id]; exists {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("sandbox: %s already exists", id)
+	}
+	m.sandboxes[id] = sb
+	m.mu.Unlock()
+	return cloneSandbox(sb), nil
+}
 
-	layout := m.cache.Layout(req.TemplateHash)
+// FinishCreate runs the heavy create work for a sandbox previously
+// registered by BeginCreate: CoW-copy the rootfs, materialize a
+// per-sandbox snapshot directory with rewritten paths, restore from it,
+// and flip the in-memory entry from CREATING to RUNNING. On failure the
+// entry is moved to ERROR (with Error populated) and any partial files
+// are cleaned up; the entry remains in the map so master's poller can
+// observe the failure.
+//
+// The snapshot must be per-sandbox because the original template's
+// config.json carries paths captured at snapshot time — relative disk
+// paths that resolve against CH's CWD and a hardcoded vsock socket. Two
+// concurrent sandboxes cannot share either: they would race on the same
+// rootfs and bind() the same vsock socket. The fix is to copy the
+// snapshot dir, rewrite config.json with absolute per-sandbox paths, and
+// hand CH the rewritten copy.
+func (m *SandboxManager) FinishCreate(ctx context.Context, id string) error {
+	sb, err := m.lookup(id)
+	if err != nil {
+		return err
+	}
+	if sb.State != SandboxStateCreating {
+		return fmt.Errorf("sandbox: %s not in CREATING (got %s)", id, sb.State)
+	}
+	templateHash := sb.TemplateHash
+	layout := m.cache.Layout(templateHash)
 	dir := filepath.Join(m.root, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("sandbox: make dir: %w", err)
+		m.markCreateFailed(id, dir, fmt.Errorf("make dir: %w", err))
+		return fmt.Errorf("sandbox: make dir: %w", err)
 	}
 	overlay := filepath.Join(dir, "rootfs.raw")
 	if err := reflinkOrCopy(layout.RootfsPath, overlay); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("sandbox: copy rootfs: %w", err)
+		m.markCreateFailed(id, dir, fmt.Errorf("copy rootfs: %w", err))
+		return fmt.Errorf("sandbox: copy rootfs: %w", err)
 	}
 	snapshotDir, vsockSocketPath, err := prepareSandboxSnapshot(layout, dir)
 	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("sandbox: prepare snapshot: %w", err)
-	}
-
-	cid := m.AllocateCID()
-	sb := &Sandbox{
-		ID:              id,
-		State:           SandboxStateRunning,
-		TemplateHash:    req.TemplateHash,
-		VsockCID:        cid,
-		RootfsPath:      overlay,
-		VsockSocketPath: vsockSocketPath,
-		Config:          req.Config,
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
-		Healthy:         true,
-		LastHealthAt:    time.Now().UTC(),
+		m.markCreateFailed(id, dir, fmt.Errorf("prepare snapshot: %w", err))
+		return fmt.Errorf("sandbox: prepare snapshot: %w", err)
 	}
 	socketPath, err := m.vmm.RestoreVM(ctx, id, snapshotDir)
 	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("sandbox: restore: %w", err)
+		m.markCreateFailed(id, dir, fmt.Errorf("restore: %w", err))
+		return fmt.Errorf("sandbox: restore: %w", err)
 	}
-	sb.APISocket = socketPath
-
+	now := time.Now().UTC()
 	m.mu.Lock()
-	m.sandboxes[id] = sb
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.State = SandboxStateRunning
+		cur.RootfsPath = overlay
+		cur.VsockSocketPath = vsockSocketPath
+		cur.APISocket = socketPath
+		cur.Healthy = true
+		cur.LastHealthAt = now
+		cur.UpdatedAt = now
+	}
 	m.mu.Unlock()
-
-	m.cache.Touch(req.TemplateHash)
+	m.cache.Touch(templateHash)
 	m.logger.Info("sandbox created",
 		"id", id,
-		"template", req.TemplateHash,
-		"cid", cid,
+		"template", templateHash,
+		"cid", sb.VsockCID,
 	)
-	return cloneSandbox(sb), nil
+	return nil
+}
+
+// CreateSandbox is the synchronous BeginCreate+FinishCreate helper used
+// by the warm pool and integration tests. The HTTP handler does not call
+// this — it splits the two halves around the request boundary so it can
+// return 202 immediately.
+func (m *SandboxManager) CreateSandbox(ctx context.Context, req CreateRequest) (*Sandbox, error) {
+	sb, err := m.BeginCreate(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.FinishCreate(ctx, sb.ID); err != nil {
+		return nil, err
+	}
+	return m.Get(sb.ID)
+}
+
+// markCreateFailed flips a CREATING sandbox to ERROR with the given
+// reason and removes its on-disk state. The entry stays in the map so
+// the master poller can observe the failure on its next GetSandbox tick;
+// a later DestroySandbox cleans the map entry.
+func (m *SandboxManager) markCreateFailed(id, dir string, cause error) {
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+	m.mu.Lock()
+	if cur, ok := m.sandboxes[id]; ok {
+		cur.State = SandboxStateError
+		cur.Error = cause.Error()
+		cur.UpdatedAt = time.Now().UTC()
+	}
+	m.mu.Unlock()
+	m.logger.Error("sandbox create failed", "id", id, "err", cause)
 }
 
 // AdoptSandbox registers a Sandbox that some other component (typically

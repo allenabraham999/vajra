@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/allenabraham999/vajra/internal/models"
+	"github.com/allenabraham999/vajra/internal/store"
 )
 
 // testHarness wires a handlerStore + Server into an httptest.Server for
@@ -350,6 +352,131 @@ func TestCreateSandboxNoNode(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("want 503, got %d", resp.StatusCode)
+	}
+}
+
+// waitForSandboxState polls the in-memory store until the sandbox row
+// reaches want or the deadline expires. Used to verify the async create
+// poller actually drives the DB transition.
+func waitForSandboxState(t *testing.T, h *testHarness, accountID, id string, want models.SandboxState, timeout time.Duration) *models.Sandbox {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last *models.Sandbox
+	for time.Now().Before(deadline) {
+		sb, err := h.store.Sandboxes().GetByID(context.Background(), accountID, id)
+		if err == nil {
+			last = sb
+			if sb.State == want {
+				return sb
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("sandbox %s did not reach %s within %s; last=%+v", id, want, timeout, last)
+	return nil
+}
+
+// TestCreateSandboxAsyncPollerDrivesToRunning exercises the async path
+// end-to-end: agent returns 202 + CREATING, then GETs flip from CREATING
+// to RUNNING. Master must return 201 quickly with CREATING, then the
+// background poller must drive the DB row to RUNNING within a few
+// seconds.
+func TestCreateSandboxAsyncPollerDrivesToRunning(t *testing.T) {
+	h := newTestHarness(t)
+	accountID, key := h.register(t, "alice@example.com", "supersecret")
+	c := h.seedCluster(t)
+	h.seedNode(t, c.ID)
+	h.seedTemplate(t, accountID)
+
+	// First few GETs return CREATING; subsequent GETs return RUNNING.
+	// The atomic counter makes the test deterministic regardless of how
+	// many ticks the poller fires before flipping.
+	var getCalls int32
+	h.agentHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/create":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "sb-test", // ignored by master, which uses its own ID
+				"state": "CREATING",
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sandbox/"):
+			n := atomic.AddInt32(&getCalls, 1)
+			state := "CREATING"
+			if n >= 2 {
+				state = "RUNNING"
+			}
+			id := strings.TrimPrefix(r.URL.Path, "/sandbox/")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    id,
+				"state": state,
+			})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+
+	resp, body := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+		"name": "demo", "source": "image", "template_id": "tmpl-1",
+		"vcpus": 2, "memory_mb": 1024, "disk_gb": 10,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("want 201, got %d body %s", resp.StatusCode, body)
+	}
+	var got sandboxWithOp
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Sandbox == nil || got.Sandbox.State != models.SandboxStateCreating {
+		t.Fatalf("expected CREATING in response, got %+v", got.Sandbox)
+	}
+
+	// Poll the DB until the background poller flips the row to RUNNING.
+	waitForSandboxState(t, h, accountID, got.Sandbox.ID, models.SandboxStateRunning, 5*time.Second)
+}
+
+// TestCreateSandboxDispatchFailUnknown covers the case the user reported
+// in production: master's dispatch fails (timeout, network error) AND
+// the agent doesn't actually have the sandbox. We must not leave the
+// row in CREATING (the periodic reconciler would later rewrite it to
+// DESTROYED anyway); persist DESTROYED immediately so the DB matches
+// reality and return 502.
+func TestCreateSandboxDispatchFailUnknown(t *testing.T) {
+	h := newTestHarness(t)
+	accountID, key := h.register(t, "alice@example.com", "supersecret")
+	c := h.seedCluster(t)
+	h.seedNode(t, c.ID)
+	h.seedTemplate(t, accountID)
+
+	h.agentHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/create":
+			http.Error(w, "simulated upstream timeout", http.StatusInternalServerError)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sandbox/"):
+			http.Error(w, "no such sandbox", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+
+	resp, _ := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+		"name": "demo", "source": "image", "template_id": "tmpl-1",
+		"vcpus": 2, "memory_mb": 1024, "disk_gb": 10,
+	})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("want 502, got %d", resp.StatusCode)
+	}
+	// Locate the sandbox in the store — POST returned 502 with no body
+	// id, but the row was created before dispatch and is account-scoped.
+	rows, err := h.store.Sandboxes().ListByAccount(context.Background(), accountID, store.ListOpts{Limit: 100})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 sandbox row, got %d", len(rows))
+	}
+	if rows[0].State != models.SandboxStateDestroyed {
+		t.Fatalf("DB state = %s, want DESTROYED", rows[0].State)
 	}
 }
 
