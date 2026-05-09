@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	_ "github.com/lib/pq"
 
 	"github.com/allenabraham999/vajra/internal/master"
 	"github.com/allenabraham999/vajra/internal/store"
@@ -94,17 +97,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Migrations run on a dedicated *sql.DB that's closed before the
+	// main store pool is opened. Sharing the pool with the migrator
+	// means mig.Close() (which closes the underlying driver) tears
+	// down the connection the server is about to use.
+	if err := runMigrations(cfg.DSN, cfg.MigrationsDir, logger); err != nil {
+		logger.Error("migrations", "err", err)
+		os.Exit(1)
+	}
+
 	st, err := store.New(ctx, store.DefaultConfig(cfg.DSN))
 	if err != nil {
 		logger.Error("store: connect", "err", err)
 		os.Exit(1)
 	}
 	defer st.Close()
-
-	if err := runMigrations(st, cfg.MigrationsDir, logger); err != nil {
-		logger.Error("migrations", "err", err)
-		os.Exit(1)
-	}
 
 	signer := master.NewJWTSigner([]byte(cfg.JWTSecret))
 	pool := master.NewAgentPool(cfg.AgentSharedSecret, logger)
@@ -138,15 +145,24 @@ func main() {
 	logger.Info("vajra-master shutdown complete")
 }
 
-// runMigrations applies schema migrations on startup. The dir is a
-// filesystem path; we prepend the file:// scheme if the caller didn't
-// already.
-func runMigrations(st *store.Postgres, dir string, logger *slog.Logger) error {
+// runMigrations applies schema migrations on startup. It opens its own
+// dedicated *sql.DB from the DSN, runs migrations, and closes that
+// connection — the main store pool must NOT be shared with the
+// migrator because mig.Close() closes the underlying database driver,
+// which would tear down the server's pool. The dir is a filesystem
+// path; we prepend the file:// scheme if the caller didn't already.
+func runMigrations(dsn, dir string, logger *slog.Logger) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("open migrator db: %w", err)
+	}
+	defer db.Close()
+
 	source := dir
 	if !strings.Contains(source, "://") {
 		source = "file://" + source
 	}
-	mig, err := store.NewMigrator(st.DB().DB, source)
+	mig, err := store.NewMigrator(db, source)
 	if err != nil {
 		return fmt.Errorf("open migrator: %w", err)
 	}
