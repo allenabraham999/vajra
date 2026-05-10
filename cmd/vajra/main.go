@@ -1,7 +1,8 @@
 // Package main is the entry point for the vajra CLI.
 //
 // The vajra CLI lets users create, manage, and inspect sandboxes against
-// a vajra-master endpoint.
+// a vajra-master endpoint. Configuration (api_url, api_key, jwt) lives at
+// ~/.vajra/config.json; --api-url and --api-key flags override it.
 package main
 
 import (
@@ -10,17 +11,8 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("vajra — AI sandbox cloud platform")
-		fmt.Println("usage: vajra <command> [args]")
-		os.Exit(0)
-	}
-
-	switch os.Args[1] {
-	case "version", "--version", "-v":
-		fmt.Println("vajra 0.0.1")
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+	if err := newRootCmd().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, errStyle("error: ")+err.Error())
 		os.Exit(1)
 	}
 }
