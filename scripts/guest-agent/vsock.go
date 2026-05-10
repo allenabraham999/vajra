@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,14 +64,37 @@ func serveVsock(ctx context.Context, port uint32, handler func(net.Conn, *prefix
 	}
 }
 
-// vsockConn wraps an accepted vsock fd into a net.Conn. We go via
-// os.NewFile + net.FileConn so the runtime takes ownership of close,
-// timeouts (where supported), and goroutine integration.
+// vsockConn wraps an accepted vsock fd into a net.Conn. We can't use
+// net.FileConn here: it calls getsockname() to recover the address family
+// and Go's stdlib doesn't recognise AF_VSOCK, so it returns
+// "address family not supported by protocol" and every accepted connection
+// is dropped before the handler ever sees it. Wrapping os.File directly
+// gives us Read/Write/Close + per-op deadlines via the runtime poller, and
+// we provide stub addresses so callers that only need net.Conn semantics
+// keep working.
 func vsockConn(fd int) (net.Conn, error) {
 	f := os.NewFile(uintptr(fd), "vsock")
 	if f == nil {
 		return nil, fmt.Errorf("os.NewFile returned nil for fd %d", fd)
 	}
-	defer f.Close() // FileConn dups; the original wrapper is no longer needed.
-	return net.FileConn(f)
+	return &vsockNetConn{f: f}, nil
 }
+
+// vsockNetConn adapts os.File to net.Conn for an AF_VSOCK fd.
+type vsockNetConn struct {
+	f *os.File
+}
+
+type vsockAddr struct{}
+
+func (vsockAddr) Network() string { return "vsock" }
+func (vsockAddr) String() string  { return "vsock" }
+
+func (c *vsockNetConn) Read(p []byte) (int, error)         { return c.f.Read(p) }
+func (c *vsockNetConn) Write(p []byte) (int, error)        { return c.f.Write(p) }
+func (c *vsockNetConn) Close() error                       { return c.f.Close() }
+func (c *vsockNetConn) LocalAddr() net.Addr                { return vsockAddr{} }
+func (c *vsockNetConn) RemoteAddr() net.Addr               { return vsockAddr{} }
+func (c *vsockNetConn) SetDeadline(t time.Time) error      { return c.f.SetDeadline(t) }
+func (c *vsockNetConn) SetReadDeadline(t time.Time) error  { return c.f.SetReadDeadline(t) }
+func (c *vsockNetConn) SetWriteDeadline(t time.Time) error { return c.f.SetWriteDeadline(t) }
