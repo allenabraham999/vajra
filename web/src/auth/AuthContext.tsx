@@ -1,11 +1,12 @@
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { auth, setAuthToken } from '../api/client'
+import { auth, nodes, setAuthToken } from '../api/client'
 
 interface AuthState {
   email: string | null
   token: string | null
   expiresAt: string | null
+  isAdmin: boolean
 }
 
 interface AuthContextValue extends AuthState {
@@ -18,19 +19,30 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 const SESSION_EMAIL_KEY = 'vajra.email'
 
+async function detectAdmin(): Promise<boolean> {
+  try {
+    await nodes.list()
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   // Email persists across reloads for UX; the JWT does not.
   const [state, setState] = useState<AuthState>(() => ({
     email: sessionStorage.getItem(SESSION_EMAIL_KEY),
     token: null,
     expiresAt: null,
+    isAdmin: false,
   }))
 
   const login = useCallback(async (email: string, password: string) => {
     const r = await auth.login(email, password)
     setAuthToken(r.token)
     sessionStorage.setItem(SESSION_EMAIL_KEY, email)
-    setState({ email, token: r.token, expiresAt: r.expires_at })
+    const isAdmin = await detectAdmin()
+    setState({ email, token: r.token, expiresAt: r.expires_at, isAdmin })
   }, [])
 
   const register = useCallback(async (email: string, password: string) => {
@@ -43,7 +55,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     setAuthToken(null)
     sessionStorage.removeItem(SESSION_EMAIL_KEY)
-    setState({ email: null, token: null, expiresAt: null })
+    setState({ email: null, token: null, expiresAt: null, isAdmin: false })
   }, [])
 
   const value = useMemo<AuthContextValue>(

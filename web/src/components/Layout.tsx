@@ -12,36 +12,29 @@ import {
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthContext'
 
-const ADMIN_FLAG_KEY = 'vajra.admin'
-
 interface NavItem {
   to: string
   label: string
   icon: typeof Boxes
+  admin?: boolean
 }
 
 const items: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard },
   { to: '/sandboxes', label: 'Sandboxes', icon: Boxes },
   { to: '/templates', label: 'Templates', icon: PackageSearch },
-  { to: '/nodes', label: 'Nodes', icon: Server },
+  { to: '/nodes', label: 'Nodes', icon: Server, admin: true },
   { to: '/api-keys', label: 'API Keys', icon: KeyRound },
   { to: '/usage', label: 'Usage', icon: Receipt },
   { to: '/metrics', label: 'Metrics', icon: Activity },
+  { to: '/admin', label: 'Admin', icon: ShieldCheck, admin: true },
 ]
 
-const adminItem: NavItem = { to: '/admin', label: 'Admin', icon: ShieldCheck }
-
-function isAdmin(): boolean {
-  return localStorage.getItem(ADMIN_FLAG_KEY) === '1'
-}
-
 export default function Layout() {
-  const { email, logout } = useAuth()
+  const { email, isAdmin, logout } = useAuth()
   const nav = useNavigate()
-  const showAdmin = isAdmin()
 
-  const navItems = showAdmin ? [...items, adminItem] : items
+  const navItems = items.filter((item) => !item.admin || isAdmin)
 
   return (
     <div className="flex h-full min-h-screen bg-zinc-950 text-zinc-100">

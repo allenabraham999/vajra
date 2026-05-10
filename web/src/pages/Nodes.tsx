@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Server } from 'lucide-react'
-import api from '../api/client'
+import { Server, ShieldOff } from 'lucide-react'
+import api, { ApiError } from '../api/client'
 import type { Node } from '../api/types'
 import PageHeader from '../components/PageHeader'
 import EmptyState from '../components/EmptyState'
@@ -13,22 +13,45 @@ export default function NodesPage() {
   const toast = useToast()
   const [items, setItems] = useState<Node[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [forbidden, setForbidden] = useState(false)
 
   async function load() {
     try {
       const r = await api.nodes.list()
       setItems(r)
+      setForbidden(false)
     } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        setForbidden(true)
+        return
+      }
       toast.error(err instanceof Error ? err.message : 'list nodes failed')
     }
   }
 
   useEffect(() => {
     load()
-    const t = setInterval(load, 10_000)
+    const t = setInterval(() => {
+      if (!forbidden) load()
+    }, 10_000)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [forbidden])
+
+  if (forbidden) {
+    return (
+      <>
+        <PageHeader title="Nodes" />
+        <div className="p-6">
+          <EmptyState
+            icon={<ShieldOff size={32} />}
+            title="You don't have permission to view this page"
+            description="The Nodes page is restricted to administrators."
+          />
+        </div>
+      </>
+    )
+  }
 
   async function drain(id: string) {
     if (!window.confirm('Drain this node? Running sandboxes will be marked for migration.')) return
