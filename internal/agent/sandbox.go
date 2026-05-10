@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -236,15 +237,18 @@ func (m *SandboxManager) FinishCreate(ctx context.Context, id string) error {
 	}
 	templateHash := sb.TemplateHash
 	layout := m.cache.Layout(templateHash)
+	if err := m.cache.EnsureRootfsBacking(templateHash); err != nil {
+		return fmt.Errorf("sandbox: ensure rootfs backing: %w", err)
+	}
 	dir := filepath.Join(m.root, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		m.markCreateFailed(id, dir, fmt.Errorf("make dir: %w", err))
 		return fmt.Errorf("sandbox: make dir: %w", err)
 	}
-	overlay := filepath.Join(dir, "rootfs.raw")
-	if err := reflinkOrCopy(layout.RootfsPath, overlay); err != nil {
-		m.markCreateFailed(id, dir, fmt.Errorf("copy rootfs: %w", err))
-		return fmt.Errorf("sandbox: copy rootfs: %w", err)
+	overlay := filepath.Join(dir, "rootfs.qcow2")
+	if err := createRootfsOverlay(layout.RootfsBackingPath, overlay, m.logger); err != nil {
+		m.markCreateFailed(id, dir, fmt.Errorf("create rootfs overlay: %w", err))
+		return fmt.Errorf("sandbox: create rootfs overlay: %w", err)
 	}
 	snapshotDir, vsockSocketPath, err := prepareSandboxSnapshot(layout, dir)
 	if err != nil {
@@ -424,6 +428,14 @@ func (m *SandboxManager) DestroySandbox(ctx context.Context, id string) error {
 // means the guest responded; the manager's own health bookkeeping is
 // updated as a side effect so HealthChecker can call this without
 // duplicating state.
+//
+// When the dial fails AND the vsock socket file is gone, the VMM has
+// exited (CH unlinks its bind path on shutdown). That's a terminal
+// failure — without the socket the sandbox can never be reached again,
+// and a stuck RUNNING+Healthy=false entry causes the agent to keep
+// counting dead capacity in heartbeat usage, eventually starving the
+// scheduler. We therefore demote the sandbox to ERROR so subsequent
+// heartbeats stop reserving its CPU/memory/disk.
 func (m *SandboxManager) HealthCheck(ctx context.Context, id string) error {
 	sb, err := m.lookup(id)
 	if err != nil {
@@ -439,10 +451,22 @@ func (m *SandboxManager) HealthCheck(ctx context.Context, id string) error {
 	if conn != nil {
 		_ = conn.Close()
 	}
+	socketGone := false
+	if !healthy {
+		if _, statErr := os.Stat(sb.VsockSocketPath); errors.Is(statErr, os.ErrNotExist) {
+			socketGone = true
+		}
+	}
 	m.mu.Lock()
 	if cur, ok := m.sandboxes[id]; ok {
 		cur.Healthy = healthy
 		cur.LastHealthAt = time.Now().UTC()
+		if socketGone && cur.State == SandboxStateRunning {
+			cur.State = SandboxStateError
+			cur.UpdatedAt = time.Now().UTC()
+			m.logger.Warn("sandbox demoted to ERROR: vsock socket missing",
+				"id", id, "socket", sb.VsockSocketPath)
+		}
 	}
 	m.mu.Unlock()
 	if !healthy {
@@ -502,25 +526,27 @@ func newSandboxID() string {
 	return "sb-" + hex.EncodeToString(b[:])
 }
 
-// prepareSandboxSnapshot stages a per-sandbox copy of the template's
+// prepareSandboxSnapshot stages a per-sandbox view of the template's
 // snapshot directory under sandboxDir/snapshot and rewrites config.json
 // so every path resolves on this host without ambiguity:
 //
-//   - disk paths → the per-sandbox CoW rootfs (sandboxDir/rootfs.raw)
+//   - disk paths → the per-sandbox CoW rootfs (sandboxDir/rootfs.qcow2)
 //   - vsock socket → sandboxDir/vsock.sock (avoids cross-sandbox bind() races)
 //   - kernel/initramfs/firmware → absolute paths inside the template cache
 //
-// CH writes config.json relative to wherever the original VM ran, so a
-// fresh restore on a different host (or a second sandbox on the same host)
-// fails with NotFound on the disk or EADDRINUSE on the vsock unless we
-// rewrite first. Returns the per-sandbox snapshot directory and the
-// absolute path of the rewritten vsock socket — callers must store the
-// latter on the Sandbox so health probes, exec, file I/O, and forwards
-// dial the path CH actually bound, not a stale derived one.
+// The staging is done via hardlinks: CH only reads memory-ranges and
+// state.json during restore, never writes them, so sharing the inodes
+// with the cache is safe and turns a 500+ MB byte copy into a handful of
+// directory entries. config.json must be a fresh inode because we
+// rewrite it per-sandbox; rewriteSnapshotConfig replaces the hardlink
+// atomically via temp + rename so the cache's copy is never truncated.
+//
+// Falls back to byte copies if hardlinking fails (e.g. cross-device
+// staging in a test environment using multiple FS roots).
 func prepareSandboxSnapshot(layout TemplateLayout, sandboxDir string) (string, string, error) {
 	dst := filepath.Join(sandboxDir, "snapshot")
-	if err := copyDirReflink(layout.SnapshotDir, dst); err != nil {
-		return "", "", fmt.Errorf("copy snapshot dir: %w", err)
+	if err := linkSnapshotDir(layout.SnapshotDir, dst); err != nil {
+		return "", "", fmt.Errorf("stage snapshot dir: %w", err)
 	}
 	vsockSocketPath := filepath.Join(sandboxDir, "vsock.sock")
 	if err := rewriteSnapshotConfig(filepath.Join(dst, "config.json"), sandboxDir, layout); err != nil {
@@ -531,7 +557,10 @@ func prepareSandboxSnapshot(layout TemplateLayout, sandboxDir string) (string, s
 
 // rewriteSnapshotConfig parses the snapshot's config.json as a generic
 // map (so unknown CH fields survive the round trip), patches the few
-// path-bearing fields, and writes the result back to the same file.
+// path-bearing fields, and replaces the file via temp + rename. The
+// rename is essential when the original entry is a hardlink to the
+// cache's config.json: a direct os.WriteFile would O_TRUNC the shared
+// inode and corrupt every other sandbox plus the cache.
 func rewriteSnapshotConfig(configPath, sandboxDir string, layout TemplateLayout) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -541,7 +570,7 @@ func rewriteSnapshotConfig(configPath, sandboxDir string, layout TemplateLayout)
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("parse config.json: %w", err)
 	}
-	rootfs := filepath.Join(sandboxDir, "rootfs.raw")
+	rootfs := filepath.Join(sandboxDir, "rootfs.qcow2")
 	if disks, ok := cfg["disks"].([]any); ok {
 		for _, d := range disks {
 			disk, ok := d.(map[string]any)
@@ -567,18 +596,29 @@ func rewriteSnapshotConfig(configPath, sandboxDir string, layout TemplateLayout)
 	if err != nil {
 		return fmt.Errorf("marshal config.json: %w", err)
 	}
-	if err := os.WriteFile(configPath, out, 0o644); err != nil {
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
 		return fmt.Errorf("write config.json: %w", err)
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("commit config.json: %w", err)
 	}
 	return nil
 }
 
-// copyDirReflink mirrors src into dst, using reflinkOrCopy on every
-// regular file so the (often hundreds-of-MB) memory image inside a CH
-// snapshot is shared via copy-on-write where the filesystem supports it.
-// Symlinks and special files are skipped — CH snapshots only contain
-// regular files.
-func copyDirReflink(src, dst string) error {
+// linkSnapshotDir mirrors src into dst by hardlinking every regular
+// file. CH treats the snapshot files (memory-ranges, state.json,
+// config.json) as read-only inputs during restore, so multiple sandboxes
+// can share the same inodes without interference. The single mutated
+// file — config.json — is replaced atomically by rewriteSnapshotConfig
+// via rename, which breaks the hardlink without disturbing the cache's
+// inode.
+//
+// Falls back to a reflink/byte copy if os.Link fails (e.g. cross-device
+// staging). Symlinks and special files are skipped — CH snapshots only
+// contain regular files.
+func linkSnapshotDir(src, dst string) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", src, err)
@@ -590,7 +630,7 @@ func copyDirReflink(src, dst string) error {
 		srcPath := filepath.Join(src, e.Name())
 		dstPath := filepath.Join(dst, e.Name())
 		if e.IsDir() {
-			if err := copyDirReflink(srcPath, dstPath); err != nil {
+			if err := linkSnapshotDir(srcPath, dstPath); err != nil {
 				return err
 			}
 			continue
@@ -598,11 +638,41 @@ func copyDirReflink(src, dst string) error {
 		if !e.Type().IsRegular() {
 			continue
 		}
+		if err := os.Link(srcPath, dstPath); err == nil {
+			continue
+		}
 		if err := reflinkOrCopy(srcPath, dstPath); err != nil {
-			return fmt.Errorf("copy %s: %w", srcPath, err)
+			return fmt.Errorf("stage %s: %w", srcPath, err)
 		}
 	}
 	return nil
+}
+
+// createRootfsOverlay produces a thin per-sandbox copy-on-write view of
+// the (read-only) template backing image at src, which must itself be a
+// qcow2 file (see ImageCache.EnsureRootfsBacking). The overlay is a fresh
+// qcow2 with src recorded as its backing file: creation is O(1) regardless
+// of rootfs size because qemu-img only writes a header.
+//
+// Cloud Hypervisor (≤ v43) opens backing files by probing for qcow2 magic
+// rather than honouring the qcow2 header's backing_file_format extension,
+// so we deliberately use a qcow2-on-qcow2 chain. A raw backing file fails
+// at restore time with InvalidMagic.
+//
+// The fallback to reflinkOrCopy is retained for environments where
+// qemu-img is unavailable (e.g. unit tests that don't need real CoW
+// semantics). The fallback writes raw bytes to a .qcow2-named path; CH
+// won't accept that file, but environments without qemu-img also use a
+// fake VMM that never opens the disk.
+func createRootfsOverlay(src, dst string, logger *slog.Logger) error {
+	cmd := exec.Command("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", src, dst)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		return nil
+	} else if logger != nil {
+		logger.Warn("qemu-img qcow2 overlay failed; falling back to copy",
+			"src", src, "dst", dst, "err", err, "output", strings.TrimSpace(string(out)))
+	}
+	return reflinkOrCopy(src, dst)
 }
 
 // reflinkOrCopy first tries `cp --reflink=auto` (so on btrfs/xfs/apfs the

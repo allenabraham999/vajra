@@ -231,7 +231,7 @@ func TestSandboxCreateRewritesSnapshotConfig(t *testing.T) {
 		t.Fatalf("disks missing from rewritten config: %v", got)
 	}
 	disk0 := disks[0].(map[string]any)
-	wantDisk := filepath.Join(sandboxDir, "rootfs.raw")
+	wantDisk := filepath.Join(sandboxDir, "rootfs.qcow2")
 	if disk0["path"] != wantDisk {
 		t.Errorf("disk path: got %q, want %q", disk0["path"], wantDisk)
 	}

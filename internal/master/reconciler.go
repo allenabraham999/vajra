@@ -227,11 +227,25 @@ func (r *Reconciler) handleMismatches(ctx context.Context, node *models.Node, ag
 			"db_state", string(sb.State),
 			"agent_state", agentSb.State,
 		)
-		// Only act on the DB→STOPPED transition for now; everything else
-		// is left for the next pass once we extend the mapper.
-		if sb.State == models.SandboxStateRunning && mapped == models.SandboxStateStopped {
+		// Two transitions are safe to act on automatically:
+		//   1. DB=RUNNING, agent=STOPPED — guest stopped itself; update DB.
+		//   2. DB=ERROR,   agent=RUNNING/CREATING — DB is already terminal
+		//      (the create poller, dispatch path, or a prior tick decided
+		//      the sandbox failed) but the agent still has a live entry
+		//      reserving CPU/memory/disk in heartbeat usage. Treat the
+		//      agent's view as the orphan and ask it to destroy. Without
+		//      this backstop a stuck agent entry starves the scheduler
+		//      until the agent process restarts.
+		switch {
+		case sb.State == models.SandboxStateRunning && mapped == models.SandboxStateStopped:
 			if err := r.store.Sandboxes().UpdateState(ctx, sb.AccountID, id, models.SandboxStateStopped); err != nil {
 				r.logger.Error("reconcile: mismatch update failed",
+					"op", "state_mismatch", "node_id", node.ID, "sandbox_id", id, "err", err)
+			}
+		case sb.State == models.SandboxStateError &&
+			(mapped == models.SandboxStateRunning || mapped == models.SandboxStateCreating):
+			if err := r.agents.DestroySandbox(ctx, node, id); err != nil {
+				r.logger.Error("reconcile: destroy stale agent entry failed",
 					"op", "state_mismatch", "node_id", node.ID, "sandbox_id", id, "err", err)
 			}
 		}

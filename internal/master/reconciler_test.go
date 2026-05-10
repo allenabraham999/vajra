@@ -141,6 +141,41 @@ func TestReconcile_StateMismatch_RunningToStopped(t *testing.T) {
 	}
 }
 
+func TestReconcile_StateMismatch_ErrorWithLiveAgentEntryGetsDestroyed(t *testing.T) {
+	fs := newFakeStore()
+	node := &models.Node{ID: "n1", State: models.NodeStateActive}
+	fs.nodes.all = []*models.Node{node}
+	// DB has already concluded the sandbox failed (e.g. create poller hit
+	// timeout, or a prior reconcile noticed a crash). Agent still has it
+	// listed as RUNNING and is reporting capacity for it. Reconciler must
+	// nudge the agent to drop the stale entry so usage frees up.
+	sb := mkSandbox("s1", "acct", models.SandboxStateError, 1, 512)
+	fs.sandboxes.byNode = map[string][]*models.Sandbox{"n1": {sb}}
+	fs.sandboxes.byID = map[string]*models.Sandbox{"s1": sb}
+
+	agents := &fakeAgents{
+		listFns: map[string]func() ([]AgentSandbox, error){
+			"n1": func() ([]AgentSandbox, error) {
+				return []AgentSandbox{{ID: "s1", State: "RUNNING"}}, nil
+			},
+		},
+	}
+
+	r, _ := reconcilerSetup(t, fs, agents)
+	r.tickOnce(context.Background())
+
+	if len(agents.destroyCalls) != 1 {
+		t.Fatalf("expected 1 DestroySandbox call, got %d", len(agents.destroyCalls))
+	}
+	got := agents.destroyCalls[0]
+	if got.NodeID != "n1" || got.SandboxID != "s1" {
+		t.Fatalf("unexpected destroy target: %+v", got)
+	}
+	if len(fs.sandboxes.updateStateCalls) != 0 {
+		t.Fatalf("expected no UpdateState — DB row already terminal; got %d", len(fs.sandboxes.updateStateCalls))
+	}
+}
+
 func TestReconcile_StateMismatch_NotInScopeIsIgnored(t *testing.T) {
 	fs := newFakeStore()
 	node := &models.Node{ID: "n1", State: models.NodeStateActive}

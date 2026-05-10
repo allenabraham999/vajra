@@ -143,6 +143,13 @@ func registerWithMaster(ctx context.Context, master *agent.MasterClient, cfg con
 }
 
 func heartbeatLoop(ctx context.Context, master *agent.MasterClient, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
+	// Send one heartbeat immediately so master can schedule onto this
+	// node within milliseconds of agent startup rather than waiting up
+	// to a full interval. Without this primer, a fresh agent looks
+	// stale to the scheduler (last_heartbeat is whatever the DB held
+	// from the previous run, often well past heartbeatStaleAfter).
+	sendHeartbeat(ctx, master, sandboxes, cfg, logger)
+
 	ticker := time.NewTicker(cfg.heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -151,22 +158,25 @@ func heartbeatLoop(ctx context.Context, master *agent.MasterClient, sandboxes *a
 			return
 		case <-ticker.C:
 		}
-		req := agent.HeartbeatRequest{
-			NodeID:    cfg.nodeID,
-			Timestamp: time.Now().UTC(),
-		}
-		used := computeUsage(sandboxes.List())
-		req.Usage.UsedCPU = used.cpu
-		req.Usage.UsedMemoryMB = used.memMB
-		req.Usage.UsedDiskGB = used.diskGB
-		req.SandboxCount = used.count
+		sendHeartbeat(ctx, master, sandboxes, cfg, logger)
+	}
+}
 
-		hbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := master.Heartbeat(hbCtx, req)
-		cancel()
-		if err != nil {
-			logger.Warn("heartbeat failed", "err", err)
-		}
+func sendHeartbeat(ctx context.Context, master *agent.MasterClient, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
+	req := agent.HeartbeatRequest{
+		NodeID:    cfg.nodeID,
+		Timestamp: time.Now().UTC(),
+	}
+	used := computeUsage(sandboxes.List())
+	req.Usage.UsedCPU = used.cpu
+	req.Usage.UsedMemoryMB = used.memMB
+	req.Usage.UsedDiskGB = used.diskGB
+	req.SandboxCount = used.count
+
+	hbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := master.Heartbeat(hbCtx, req); err != nil {
+		logger.Warn("heartbeat failed", "err", err)
 	}
 }
 
@@ -177,7 +187,12 @@ type usageTotals struct {
 func computeUsage(sandboxes []*agent.Sandbox) usageTotals {
 	var u usageTotals
 	for _, sb := range sandboxes {
-		if sb.State == agent.SandboxStateDestroyed {
+		// DESTROYED is terminal-clean; ERROR is terminal-failed. Neither
+		// is using KVM/RAM/disk in a way that should block scheduling
+		// new sandboxes onto the same node, so both are excluded from
+		// heartbeat usage. (The dirs may linger until master issues a
+		// destroy, but that's a cleanup concern, not a capacity one.)
+		if sb.State == agent.SandboxStateDestroyed || sb.State == agent.SandboxStateError {
 			continue
 		}
 		u.cpu += sb.Config.VCPUs
@@ -229,7 +244,7 @@ func loadConfig() (config, error) {
 		socketDir:         envOr("VAJRA_AGENT_SOCKET_DIR", vmm.DefaultSocketDir),
 		chBinary:          envOr("VAJRA_AGENT_CH_BINARY", vmm.DefaultBinaryPath),
 		poolTemplate:      os.Getenv("VAJRA_AGENT_POOL_TEMPLATE"),
-		heartbeatInterval: envDuration("VAJRA_AGENT_HEARTBEAT_INTERVAL", 30*time.Second),
+		heartbeatInterval: envDuration("VAJRA_AGENT_HEARTBEAT_INTERVAL", 5*time.Second),
 		healthInterval:    envDuration("VAJRA_AGENT_HEALTH_INTERVAL", agent.DefaultHealthInterval),
 	}
 	cfg.cacheMaxBytes = envInt64("VAJRA_AGENT_CACHE_MAX_BYTES", 50*1024*1024*1024)
