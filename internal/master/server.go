@@ -144,6 +144,10 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"GET /v1/nodes":              h.listNodes,
 		"POST /v1/nodes/{id}/drain":  h.drainNode,
 
+		// Admin: autoscaler
+		"GET /v1/admin/autoscale":          h.getAutoscaleStatus,
+		"POST /v1/admin/autoscale/trigger": h.triggerAutoscale,
+
 		// Usage
 		"GET /v1/usage": h.getUsage,
 	}

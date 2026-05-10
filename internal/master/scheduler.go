@@ -6,11 +6,14 @@ package master
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
+	"github.com/allenabraham999/vajra/internal/cache"
 	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
 )
@@ -74,6 +77,8 @@ type QuotaProvider func(accountID string) Quota
 type dbScheduler struct {
 	store store.Store
 	quota QuotaProvider
+	cache cache.Cache
+	log   *slog.Logger
 	// now is overridable so tests can pin a deterministic clock for the
 	// stale-heartbeat check. Production uses time.Now.
 	now func() time.Time
@@ -82,7 +87,38 @@ type dbScheduler struct {
 // NewScheduler builds a dbScheduler. quotaProvider may be nil, in which
 // case DefaultQuota applies to every account.
 func NewScheduler(s store.Store, quotaProvider QuotaProvider) *dbScheduler {
-	return &dbScheduler{store: s, quota: quotaProvider, now: time.Now}
+	return &dbScheduler{store: s, quota: quotaProvider, now: time.Now, cache: cache.NewNoopCache(), log: slog.Default()}
+}
+
+// WithCache wires a cache.Cache into the scheduler. Used by main to
+// hand the same Redis client to both handlers and scheduler. Returns
+// the receiver for chaining.
+func (d *dbScheduler) WithCache(c cache.Cache) *dbScheduler {
+	if c != nil {
+		d.cache = c
+	}
+	return d
+}
+
+// WithLogger overrides the scheduler's logger.
+func (d *dbScheduler) WithLogger(l *slog.Logger) *dbScheduler {
+	if l != nil {
+		d.log = l
+	}
+	return d
+}
+
+// nodeResourcesPayload is the JSON shape we store in Redis under
+// node:{id}:resources. Keep stable so heartbeat writers and PickNode
+// readers stay aligned.
+type nodeResourcesPayload struct {
+	TotalCPU      int       `json:"total_cpu"`
+	UsedCPU       int       `json:"used_cpu"`
+	TotalMemoryMB int       `json:"total_mem_mb"`
+	UsedMemoryMB  int       `json:"used_mem_mb"`
+	TotalDiskGB   int       `json:"total_disk_gb"`
+	UsedDiskGB    int       `json:"used_disk_gb"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
 }
 
 // Schedule composes the full pipeline: quota check, cluster pick, node
@@ -163,12 +199,35 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 		if n.State != models.NodeStateActive {
 			continue
 		}
-		if n.LastHeartbeat.Before(cutoff) {
+		// Prefer Redis-cached usage when available — heartbeats refresh
+		// it every 5s, so this dodges any lag between the heartbeat
+		// handler's UpdateUsage write and the next ListByCluster read.
+		// Cache miss / parse error / stale entry → fall through to the
+		// row we already loaded from Postgres. Hit also gives us a
+		// fresher heartbeat timestamp than what's on the node row.
+		usedCPU := n.UsedResources.UsedCPU
+		usedMemMB := n.UsedResources.UsedMemoryMB
+		usedDiskGB := n.UsedResources.UsedDiskGB
+		hb := n.LastHeartbeat
+		if d.cache != nil {
+			if raw, err := d.cache.Get(ctx, cache.NodeResourcesKey(n.ID)); err == nil {
+				var p nodeResourcesPayload
+				if jerr := json.Unmarshal([]byte(raw), &p); jerr == nil {
+					usedCPU = p.UsedCPU
+					usedMemMB = p.UsedMemoryMB
+					usedDiskGB = p.UsedDiskGB
+					if !p.LastHeartbeat.IsZero() {
+						hb = p.LastHeartbeat
+					}
+				}
+			}
+		}
+		if hb.Before(cutoff) {
 			continue
 		}
-		freeCPU := n.Capacity.TotalCPU - n.UsedResources.UsedCPU
-		freeMemMB := n.Capacity.TotalMemoryMB - n.UsedResources.UsedMemoryMB
-		freeDiskGB := n.Capacity.TotalDiskGB - n.UsedResources.UsedDiskGB
+		freeCPU := n.Capacity.TotalCPU - usedCPU
+		freeMemMB := n.Capacity.TotalMemoryMB - usedMemMB
+		freeDiskGB := n.Capacity.TotalDiskGB - usedDiskGB
 		if freeCPU < req.VCPUs || freeMemMB < req.MemoryMB || freeDiskGB < req.DiskGB {
 			continue
 		}

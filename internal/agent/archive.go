@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -25,6 +26,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/klauspost/compress/zstd"
 )
+
+// progressLogStep is the byte interval between progress log lines for S3
+// transfers. Sized so a 100 MB archive emits ~10 lines.
+const progressLogStep int64 = 10 * 1024 * 1024
 
 // DefaultArchiveDir is the per-host directory holding offline archives. It
 // is kept distinct from DefaultSandboxRoot so the agent can sweep stale
@@ -192,13 +197,14 @@ func (a *ArchiveManager) RehydrateSandbox(ctx context.Context, id, archivePath s
 	}
 	now := time.Now().UTC()
 	sb := &Sandbox{
-		ID:         id,
-		State:      SandboxStateStopped,
-		VsockCID:   a.sandboxes.AllocateCID(),
-		RootfsPath: filepath.Join(sandboxDir, "rootfs.qcow2"),
-		StateDir:   stateDir,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:              id,
+		State:           SandboxStateStopped,
+		VsockCID:        a.sandboxes.AllocateCID(),
+		RootfsPath:      filepath.Join(sandboxDir, "rootfs.qcow2"),
+		StateDir:        stateDir,
+		VsockSocketPath: filepath.Join(sandboxDir, "vsock.sock"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 	a.sandboxes.AdoptSandbox(sb)
 	a.logger.Info("sandbox rehydrated", "id", id, "dir", sandboxDir)
@@ -277,15 +283,30 @@ func (a *ArchiveManager) uploadS3(ctx context.Context, localPath, key string) er
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
+	total, _ := fileSize(localPath)
+	a.logger.Info("s3 upload starting",
+		"bucket", a.opts.S3Bucket, "key", key, "bytes", total)
+	start := time.Now()
+	pr := &progressReader{
+		r:      f,
+		total:  total,
+		step:   progressLogStep,
+		logger: a.logger,
+		label:  "s3 upload progress",
+		key:    key,
+	}
 	uploader := manager.NewUploader(client)
 	_, err = uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: &a.opts.S3Bucket,
 		Key:    &key,
-		Body:   f,
+		Body:   pr,
 	})
 	if err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
+	a.logger.Info("s3 upload complete",
+		"bucket", a.opts.S3Bucket, "key", key,
+		"bytes", pr.read.Load(), "duration", time.Since(start))
 	return nil
 }
 
@@ -299,15 +320,76 @@ func (a *ArchiveManager) downloadS3(ctx context.Context, bucket, key, destPath s
 		return fmt.Errorf("create: %w", err)
 	}
 	defer f.Close()
+	a.logger.Info("s3 download starting", "bucket", bucket, "key", key)
+	start := time.Now()
+	pw := &progressWriterAt{
+		w:      f,
+		step:   progressLogStep,
+		logger: a.logger,
+		label:  "s3 download progress",
+		key:    key,
+	}
 	downloader := manager.NewDownloader(client)
-	_, err = downloader.Download(ctx, f, &s3.GetObjectInput{
+	_, err = downloader.Download(ctx, pw, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
 	})
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
+	a.logger.Info("s3 download complete",
+		"bucket", bucket, "key", key,
+		"bytes", pw.written.Load(), "duration", time.Since(start))
 	return nil
+}
+
+// progressReader wraps an io.Reader and logs progress every step bytes.
+// Used for S3 uploads where the SDK consumes a Reader.
+type progressReader struct {
+	r      io.Reader
+	total  int64
+	read   atomic.Int64
+	last   atomic.Int64
+	step   int64
+	logger *slog.Logger
+	label  string
+	key    string
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		read := p.read.Add(int64(n))
+		last := p.last.Load()
+		if read-last >= p.step && p.last.CompareAndSwap(last, read) {
+			p.logger.Info(p.label, "key", p.key, "bytes", read, "total", p.total)
+		}
+	}
+	return n, err
+}
+
+// progressWriterAt wraps an io.WriterAt and logs progress every step bytes.
+// Used for S3 downloads where the SDK uses parallel ranged GETs.
+type progressWriterAt struct {
+	w       io.WriterAt
+	written atomic.Int64
+	last    atomic.Int64
+	step    int64
+	logger  *slog.Logger
+	label   string
+	key     string
+}
+
+func (p *progressWriterAt) WriteAt(b []byte, off int64) (int, error) {
+	n, err := p.w.WriteAt(b, off)
+	if n > 0 {
+		written := p.written.Add(int64(n))
+		last := p.last.Load()
+		if written-last >= p.step && p.last.CompareAndSwap(last, written) {
+			p.logger.Info(p.label, "key", p.key, "bytes", written)
+		}
+	}
+	return n, err
 }
 
 func parseS3URL(u string) (string, string, error) {

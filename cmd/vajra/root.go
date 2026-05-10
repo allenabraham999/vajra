@@ -50,6 +50,7 @@ func newRootCmd() *cobra.Command {
 		newNodeCmd(),
 		newFileCmd(),
 		newAPIKeyCmd(),
+		newAdminCmd(),
 	)
 	return root
 }

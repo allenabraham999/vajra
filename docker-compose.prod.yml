@@ -1,22 +1,4 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: vajra-postgres
-    environment:
-      POSTGRES_USER: vajra
-      POSTGRES_PASSWORD: vajra
-      POSTGRES_DB: vajra
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vajra -d vajra"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
   redis:
     image: redis:7-alpine
     container_name: vajra-redis
@@ -49,6 +31,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  postgres-data:
   redis-data:
   nats-data:

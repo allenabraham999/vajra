@@ -19,6 +19,11 @@ import (
 
 	_ "github.com/lib/pq"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+
+	"github.com/allenabraham999/vajra/internal/cache"
+	"github.com/allenabraham999/vajra/internal/events"
 	"github.com/allenabraham999/vajra/internal/master"
 	"github.com/allenabraham999/vajra/internal/store"
 )
@@ -39,6 +44,9 @@ type config struct {
 	PublicBaseDomain  string
 	RateLimitRPS      int
 	Version           master.VersionInfo
+	RedisURL          string
+	NATSURL           string
+	Autoscale         master.AutoscaleConfig
 }
 
 // loadConfig reads the runtime config from process env. Required vars
@@ -89,6 +97,37 @@ func loadConfig() (*config, error) {
 	if cfg.AgentSharedSecret == "" {
 		return nil, errors.New("AGENT_SHARED_SECRET is required")
 	}
+
+	cfg.RedisURL = os.Getenv("REDIS_URL")
+	cfg.NATSURL = os.Getenv("NATS_URL")
+	cfg.Autoscale = master.AutoscaleConfig{
+		Enabled:       os.Getenv("VAJRA_AUTOSCALE_ENABLED") == "true",
+		AMI:           os.Getenv("VAJRA_AUTOSCALE_AMI"),
+		InstanceType:  getenvDefault("VAJRA_AUTOSCALE_INSTANCE_TYPE", "c8i.large"),
+		Region:        getenvDefault("VAJRA_AUTOSCALE_REGION", "us-east-1"),
+		SecurityGroup: os.Getenv("VAJRA_AUTOSCALE_SECURITY_GROUP"),
+		KeyPair:       os.Getenv("VAJRA_AUTOSCALE_KEY_PAIR"),
+		SubnetID:      os.Getenv("VAJRA_AUTOSCALE_SUBNET_ID"),
+		MasterURL:     os.Getenv("VAJRA_AUTOSCALE_MASTER_URL"),
+		AgentSecret:   cfg.AgentSharedSecret,
+		ClusterID:     getenvDefault("VAJRA_AUTOSCALE_CLUSTER_ID", "cluster-1"),
+		S3Bucket:      os.Getenv("VAJRA_AUTOSCALE_S3_BUCKET"),
+	}
+	if v := os.Getenv("VAJRA_AUTOSCALE_MIN_NODES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.MinNodes = n
+		}
+	}
+	if v := os.Getenv("VAJRA_AUTOSCALE_MAX_NODES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.MaxNodes = n
+		}
+	}
+	if v := os.Getenv("VAJRA_AUTOSCALE_COOLDOWN_MINS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.CooldownMins = n
+		}
+	}
 	return cfg, nil
 }
 
@@ -129,15 +168,69 @@ func main() {
 	}
 	defer st.Close()
 
+	// Optional Redis cache. Empty REDIS_URL → NoopCache; everything
+	// short-circuits to a miss and callers fall through to Postgres.
+	var c cache.Cache = cache.NewNoopCache()
+	if cfg.RedisURL != "" {
+		rc, err := cache.NewRedisCache(cfg.RedisURL)
+		if err != nil {
+			logger.Warn("redis connect failed; using noop cache", "err", err)
+		} else {
+			c = rc
+			defer rc.Close()
+			logger.Info("redis cache enabled", "url", cfg.RedisURL)
+		}
+	}
+
+	// Optional NATS event bus. Empty NATS_URL → NoopBus.
+	var bus events.EventBus = events.NewNoopBus()
+	if cfg.NATSURL != "" {
+		nb, err := events.NewNATSBus(cfg.NATSURL, logger)
+		if err != nil {
+			logger.Warn("nats connect failed; using noop bus", "err", err)
+		} else {
+			bus = nb
+			defer nb.Close()
+			logger.Info("nats event bus enabled", "url", cfg.NATSURL)
+		}
+	}
+
 	signer := master.NewJWTSigner([]byte(cfg.JWTSecret))
 	pool := master.NewAgentPool(cfg.AgentSharedSecret, logger)
-	scheduler := master.NewScheduler(st, nil)
+	scheduler := master.NewScheduler(st, nil).WithCache(c).WithLogger(logger)
 	tracker := master.NewOperationTracker(st)
 	handlers := master.NewHandlers(st, signer, scheduler, pool, tracker)
 	handlers.Logger = logger
 	handlers.Version = cfg.Version
 	handlers.AgentSharedSecret = cfg.AgentSharedSecret
 	handlers.PublicBaseDomain = cfg.PublicBaseDomain
+	handlers.Cache = c
+	handlers.Bus = bus
+
+	// Optional autoscaler. Disabled by default — handler check
+	// (Autoscaler != nil && Config.Enabled) keeps existing 503 path
+	// when VAJRA_AUTOSCALE_ENABLED is unset.
+	if cfg.Autoscale.Enabled {
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Autoscale.Region))
+		if err != nil {
+			logger.Warn("aws config failed; autoscaler disabled", "err", err)
+		} else {
+			ec2c := ec2.NewFromConfig(awsCfg)
+			scaler := master.NewAutoscaler(cfg.Autoscale, ec2c, st, c, scheduler, logger)
+			handlers.Autoscaler = scaler
+			go scaler.RunScaleDown(ctx)
+			logger.Info("autoscaler enabled", "min", scaler.Config.MinNodes, "max", scaler.Config.MaxNodes)
+		}
+	}
+
+	// NATS subscriber: drive Redis from agent heartbeats, batch DB
+	// writes. Only meaningful when NATS_URL is set; with NoopBus the
+	// Subscribe calls succeed silently but never receive anything.
+	subscriber := master.NewSubscriber(bus, st, c, logger)
+	if err := subscriber.Subscribe(); err != nil {
+		logger.Warn("nats subscribe failed", "err", err)
+	}
+	go subscriber.Run(ctx)
 
 	reconciler := master.NewReconciler(st, pool.AsAgentLister(), logger, cfg.ReconcileInterval)
 	go reconciler.Run(ctx)

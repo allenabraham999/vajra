@@ -167,6 +167,13 @@ func (h *Handlers) lifecycleAction(w http.ResponseWriter, r *http.Request, p lif
 	if err := h.Store.Sandboxes().UpdateState(r.Context(), accountID, sb.ID, p.final); err != nil {
 		h.log().Error("lifecycle: final-state", "err", err, "op", p.opType)
 	}
+	h.writeSandboxStateCache(r.Context(), sb.ID, p.final)
+	h.publishStateChange(r.Context(), sb, sb.State, p.final)
+	if p.final == models.SandboxStateDestroyed {
+		h.invalidateSandboxStateCache(r.Context(), sb.ID)
+		h.decrAccountSandboxCount(r.Context(), accountID)
+		h.publishSandboxDestroyed(r.Context(), sb)
+	}
 	if p.final == models.SandboxStateStopped || p.final == models.SandboxStateDestroyed {
 		h.recordUsageStop(r.Context(), sb.ID)
 	}

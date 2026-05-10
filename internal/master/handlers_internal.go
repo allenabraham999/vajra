@@ -170,6 +170,12 @@ func (h *Handlers) nodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// Refresh Redis so the scheduler sees fresh capacity without an
+	// extra DB round-trip. Best-effort; a load-the-row failure here
+	// just means the next heartbeat repopulates the cache.
+	if node, err := h.Store.Nodes().GetByID(r.Context(), id); err == nil {
+		h.writeNodeResourcesCache(r.Context(), node)
+	}
 	if body.Version != "" {
 		LogAgentVersionMismatch(h.log(), id, body.Version)
 	}

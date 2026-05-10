@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/allenabraham999/vajra/internal/agent"
+	"github.com/allenabraham999/vajra/internal/events"
 	"github.com/allenabraham999/vajra/internal/vmm"
 )
 
@@ -47,6 +48,7 @@ type config struct {
 	totalCPU     int
 	totalMemMB   int
 	totalDiskGB  int
+	natsURL      string
 }
 
 func main() {
@@ -102,6 +104,21 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	if cfg.masterURL != "" {
 		master = agent.NewMasterClient(cfg.masterURL, cfg.nodeID, cfg.apiKey, logger)
 	}
+
+	// Optional NATS bus. When NATS_URL is unset we wire NoopBus and the
+	// HTTP heartbeat path below stays in charge — full backward compat.
+	var bus events.EventBus = events.NewNoopBus()
+	if cfg.natsURL != "" {
+		nb, err := events.NewNATSBus(cfg.natsURL, logger)
+		if err != nil {
+			logger.Warn("nats connect failed; falling back to http only", "err", err)
+		} else {
+			bus = nb
+			defer nb.Close()
+		}
+	}
+	publisher := agent.NewPublisher(bus, cfg.nodeID, logger)
+
 	health := agent.NewHealthChecker(sandboxes, masterAsNotifier(master), cfg.healthInterval, logger)
 	health.Start(ctx)
 	defer health.Stop()
@@ -110,7 +127,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		if err := registerWithMaster(ctx, master, cfg); err != nil {
 			logger.Warn("master registration failed; continuing", "err", err)
 		}
-		go heartbeatLoop(ctx, master, sandboxes, cfg, logger)
+		go heartbeatLoop(ctx, master, publisher, sandboxes, cfg, logger)
 	}
 
 	srv := agent.NewServer(cfg.listenAddr, sandboxes, pool, logger)
@@ -152,13 +169,13 @@ func registerWithMaster(ctx context.Context, master *agent.MasterClient, cfg con
 	return master.Register(regCtx, req)
 }
 
-func heartbeatLoop(ctx context.Context, master *agent.MasterClient, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
+func heartbeatLoop(ctx context.Context, master *agent.MasterClient, publisher *agent.Publisher, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
 	// Send one heartbeat immediately so master can schedule onto this
 	// node within milliseconds of agent startup rather than waiting up
 	// to a full interval. Without this primer, a fresh agent looks
 	// stale to the scheduler (last_heartbeat is whatever the DB held
 	// from the previous run, often well past heartbeatStaleAfter).
-	sendHeartbeat(ctx, master, sandboxes, cfg, logger)
+	sendHeartbeat(ctx, master, publisher, sandboxes, cfg, logger)
 
 	ticker := time.NewTicker(cfg.heartbeatInterval)
 	defer ticker.Stop()
@@ -168,16 +185,32 @@ func heartbeatLoop(ctx context.Context, master *agent.MasterClient, sandboxes *a
 			return
 		case <-ticker.C:
 		}
-		sendHeartbeat(ctx, master, sandboxes, cfg, logger)
+		sendHeartbeat(ctx, master, publisher, sandboxes, cfg, logger)
 	}
 }
 
-func sendHeartbeat(ctx context.Context, master *agent.MasterClient, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
+func sendHeartbeat(ctx context.Context, master *agent.MasterClient, publisher *agent.Publisher, sandboxes *agent.SandboxManager, cfg config, logger *slog.Logger) {
+	used := computeUsage(sandboxes.List())
+
+	// Always publish to NATS when wired — the master subscriber
+	// updates Redis immediately and batches the DB write. This is the
+	// primary control-plane signal when the bus is configured.
+	publisher.PublishHeartbeat(ctx, agent.NodeUsageSnapshot{
+		UsedCPU:      used.cpu,
+		UsedMemoryMB: used.memMB,
+		UsedDiskGB:   used.diskGB,
+		SandboxCount: used.count,
+	}, agentVersion)
+
+	// Keep the HTTP heartbeat too. NATS isn't a guaranteed delivery
+	// channel for vital health signals; the HTTP write to Postgres is
+	// the canonical truth. When NATS is disabled this is the only
+	// path. (Future optimisation: drop HTTP heartbeats entirely once
+	// the subscriber is proven in production.)
 	req := agent.HeartbeatRequest{
 		NodeID:    cfg.nodeID,
 		Timestamp: time.Now().UTC(),
 	}
-	used := computeUsage(sandboxes.List())
 	req.Usage.UsedCPU = used.cpu
 	req.Usage.UsedMemoryMB = used.memMB
 	req.Usage.UsedDiskGB = used.diskGB
@@ -258,6 +291,7 @@ func loadConfig() (config, error) {
 		poolTemplate:      os.Getenv("VAJRA_AGENT_POOL_TEMPLATE"),
 		heartbeatInterval: envDuration("VAJRA_AGENT_HEARTBEAT_INTERVAL", 5*time.Second),
 		healthInterval:    envDuration("VAJRA_AGENT_HEALTH_INTERVAL", agent.DefaultHealthInterval),
+		natsURL:           os.Getenv("NATS_URL"),
 	}
 	cfg.cacheMaxBytes = envInt64("VAJRA_AGENT_CACHE_MAX_BYTES", 50*1024*1024*1024)
 	cfg.poolMinSize = envInt("VAJRA_AGENT_POOL_MIN_SIZE", 0)

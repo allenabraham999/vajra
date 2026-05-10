@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/allenabraham999/vajra/internal/cache"
+	"github.com/allenabraham999/vajra/internal/events"
 	"github.com/allenabraham999/vajra/internal/store"
 )
 
@@ -41,6 +43,20 @@ type Handlers struct {
 	Tracker   *OperationTracker
 	Logger    *slog.Logger
 	Version   VersionInfo
+
+	// Cache is the hot-path key/value layer. Defaults to NoopCache so
+	// every read is a miss and callers fall through to Postgres —
+	// preserving the pre-Redis behaviour when REDIS_URL is unset.
+	Cache cache.Cache
+
+	// Bus is the async event bus. Defaults to NoopBus so Publish is a
+	// no-op when NATS_URL is unset.
+	Bus events.EventBus
+
+	// Autoscaler is the optional EC2 capacity provisioner. Nil unless
+	// VAJRA_AUTOSCALE_ENABLED is set; when nil, scheduler ErrNoCapacity
+	// surfaces directly as a 503.
+	Autoscaler *Autoscaler
 
 	// AdminAccountID is the placeholder admin gate: an account whose ID
 	// matches this string is treated as administrator. Until accounts
@@ -76,7 +92,26 @@ func NewHandlers(s store.Store, signer *JWTSigner, sched Scheduler, pool *AgentP
 		Tracker:   tracker,
 		Logger:    slog.Default(),
 		Now:       time.Now,
+		Cache:     cache.NewNoopCache(),
+		Bus:       events.NewNoopBus(),
 	}
+}
+
+// getCache returns h.Cache or a fresh NoopCache when nil — so every
+// handler can call h.getCache() without nil checks.
+func (h *Handlers) getCache() cache.Cache {
+	if h.Cache != nil {
+		return h.Cache
+	}
+	return cache.NewNoopCache()
+}
+
+// getBus returns h.Bus or a fresh NoopBus when nil.
+func (h *Handlers) getBus() events.EventBus {
+	if h.Bus != nil {
+		return h.Bus
+	}
+	return events.NewNoopBus()
 }
 
 // now is the internal clock. Returns time.Now when the override is nil so

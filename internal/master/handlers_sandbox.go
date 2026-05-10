@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/allenabraham999/vajra/internal/cache"
 	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
 )
@@ -115,11 +116,24 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		return
 	}
 
-	cluster, node, err := h.Scheduler.Schedule(r.Context(), SchedRequest{
+	schedReq := SchedRequest{
 		AccountID: accountID,
 		VCPUs:     body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
 		Region: body.Region,
-	})
+	}
+	cluster, node, err := h.Scheduler.Schedule(r.Context(), schedReq)
+	if err != nil && errors.Is(err, ErrNoCapacity) && h.Autoscaler != nil && h.Autoscaler.Config.Enabled {
+		// Autoscaler launches a fresh node and waits for it to register.
+		// On success we re-run Schedule so the regular scoring picks the
+		// new node like any other; HandleNoCapacity blocks until either
+		// registration succeeds or the 5min ceiling fires.
+		h.log().Info("createSandbox: triggering autoscale", "account_id", accountID)
+		if _, scaleErr := h.Autoscaler.HandleNoCapacity(r.Context(), *body, accountID); scaleErr == nil {
+			cluster, node, err = h.Scheduler.Schedule(r.Context(), schedReq)
+		} else {
+			err = scaleErr
+		}
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrQuotaExceeded):
@@ -165,6 +179,8 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	h.incrAccountSandboxCount(r.Context(), accountID)
+	h.writeSandboxStateCache(r.Context(), sandboxID, models.SandboxStatePending)
 	opID, _ := h.Tracker.Start(r.Context(), accountID, sandboxID, models.OperationTypeCreate)
 
 	// Move PENDING → CREATING before the dispatcher call so an outside
@@ -172,6 +188,8 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	if err := h.Store.Sandboxes().UpdateState(r.Context(), accountID, sandboxID, models.SandboxStateCreating); err != nil {
 		h.log().Error("createSandbox: state transition", "err", err)
 	}
+	h.writeSandboxStateCache(r.Context(), sandboxID, models.SandboxStateCreating)
+	h.publishStateChange(r.Context(), sb, models.SandboxStatePending, models.SandboxStateCreating)
 
 	agent := h.Pool.ClientFor(node)
 	dispatchCtx, cancel := context.WithTimeout(r.Context(), dispatchTimeout)
@@ -321,8 +339,11 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateRunning); uerr != nil {
 					h.log().Error("createSandbox: poll running update", "err", uerr, "sandbox_id", sandboxID)
 				}
+				h.writeSandboxStateCache(context.Background(), sandboxID, models.SandboxStateRunning)
 				if sb, _ := h.Store.Sandboxes().GetByID(context.Background(), accountID, sandboxID); sb != nil {
 					h.recordUsageStart(context.Background(), accountID, sandboxID, sb.Config)
+					h.publishSandboxCreated(context.Background(), sb)
+					h.publishStateChange(context.Background(), sb, models.SandboxStateCreating, models.SandboxStateRunning)
 				}
 				_ = h.Tracker.Complete(context.Background(), opID, nil)
 				return
@@ -425,7 +446,12 @@ func (h *Handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// getSandbox returns one sandbox by ID.
+// getSandbox returns one sandbox by ID. The Postgres row is the source
+// of truth; the Redis state cache only seeds the response when the row
+// shows a stale state (e.g. master_A wrote RUNNING via cache while
+// master_B still has CREATING in Postgres because heartbeat-driven
+// replication hadn't landed yet). This is best-effort — a cache miss
+// or parse error is fine, the row is returned as-is.
 func (h *Handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 	accountID, ok := RequireAccount(w, r)
 	if !ok {
@@ -441,6 +467,15 @@ func (h *Handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if v, cerr := h.getCache().Get(r.Context(), cache.SandboxStateKey(sb.ID)); cerr == nil {
+		cached := models.SandboxState(v)
+		if cached.Valid() && cached != sb.State {
+			sb.State = cached
+		}
+	}
+	// Repopulate cache so subsequent reads hit Redis even after a TTL
+	// expiry. Best-effort.
+	h.writeSandboxStateCache(r.Context(), sb.ID, sb.State)
 	writeJSON(w, http.StatusOK, sb)
 }
 
