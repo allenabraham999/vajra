@@ -63,8 +63,29 @@ func (h *handlerStore) Snapshots() store.SnapshotStore   { return &hsSnapshot{h:
 func (h *handlerStore) Templates() store.TemplateStore   { return &hsTemplate{h: h} }
 func (h *handlerStore) Operations() store.OperationStore { return &hsOperation{h: h} }
 func (h *handlerStore) ShareLinks() store.ShareLinkStore { return &hsShareLink{h: h} }
+func (h *handlerStore) Usage() store.UsageStore          { return &hsUsage{h: h} }
 func (h *handlerStore) Ping(context.Context) error       { return h.pingErr }
 func (h *handlerStore) Close() error                     { return nil }
+
+// hsUsage is a no-op fake. Tests that exercise usage call into pgUsageStore
+// against a real Postgres in store/postgres_integration_test.go; in the
+// handler tests we only need RecordStart/RecordStop to be non-nil so the
+// FSM transitions don't NPE.
+type hsUsage struct{ h *handlerStore }
+
+func (u *hsUsage) RecordStart(_ context.Context, _, _ string, _ models.SandboxConfig, _ time.Time) error {
+	return nil
+}
+func (u *hsUsage) RecordStop(_ context.Context, _ string, _ time.Time) error { return nil }
+func (u *hsUsage) FinalizeOpenIntervals(_ context.Context, _ string, _ time.Time) (int, error) {
+	return 0, nil
+}
+func (u *hsUsage) SumByAccount(_ context.Context, _ string, from, to time.Time) (store.UsageRollup, error) {
+	return store.UsageRollup{From: from, To: to}, nil
+}
+func (u *hsUsage) PerSandbox(_ context.Context, _ string, _, _ time.Time) ([]store.UsageRow, error) {
+	return nil, nil
+}
 
 // WithTx in the fake just runs fn against the same store — there is no
 // real transaction, but rollback semantics are not tested separately.

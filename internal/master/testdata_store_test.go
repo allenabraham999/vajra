@@ -66,6 +66,7 @@ func (f *fakeStore) Snapshots() store.SnapshotStore   { return nil }
 func (f *fakeStore) Templates() store.TemplateStore   { return nil }
 func (f *fakeStore) Operations() store.OperationStore { return nil }
 func (f *fakeStore) ShareLinks() store.ShareLinkStore { return nil }
+func (f *fakeStore) Usage() store.UsageStore          { return nil }
 func (f *fakeStore) Ping(context.Context) error       { return nil }
 func (f *fakeStore) WithTx(context.Context, func(store.Store) error) error {
 	return errUnimplemented

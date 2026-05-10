@@ -52,7 +52,142 @@ func newSandboxCmd() *cobra.Command {
 		newSandboxStopCmd(),
 		newSandboxStartCmd(),
 		newSandboxDestroyCmd(),
+		newSandboxArchiveCmd(),
+		newSandboxRehydrateCmd(),
+		newSandboxMigrateCmd(),
 	)
+	return cmd
+}
+
+// archiveResult is the body returned by POST /v1/sandboxes/{id}/archive.
+type archiveResult struct {
+	OperationID string `json:"operation_id"`
+	ID          string `json:"id"`
+	Path        string `json:"path"`
+	Location    string `json:"location"`
+	SizeBytes   int64  `json:"size_bytes"`
+}
+
+// migrateResult is the body returned by POST /v1/sandboxes/{id}/migrate.
+type migrateResult struct {
+	OperationID string `json:"operation_id"`
+	ID          string `json:"id"`
+	SourceNode  string `json:"source_node_id"`
+	TargetNode  string `json:"target_node_id"`
+	BytesSent   int64  `json:"bytes_sent"`
+}
+
+func newSandboxArchiveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "archive <id>",
+		Short: "Stop and compress a sandbox into cold storage",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			c, _, err := resolveClient()
+			if err != nil {
+				return err
+			}
+			if err := requireAuth(c); err != nil {
+				return err
+			}
+			ctx, cancel := withCtx()
+			defer cancel()
+			var res archiveResult
+			if err := c.do(ctx, "POST", "/v1/sandboxes/"+args[0]+"/archive", nil, &res); err != nil {
+				return err
+			}
+			if gFlags.asJSON {
+				return printJSON(res)
+			}
+			table([]string{"FIELD", "VALUE"}, [][]string{
+				{"ID", res.ID},
+				{"Operation", res.OperationID},
+				{"Location", res.Location},
+				{"Path", res.Path},
+				{"Size", fmt.Sprintf("%d bytes", res.SizeBytes)},
+			})
+			return nil
+		},
+	}
+}
+
+func newSandboxRehydrateCmd() *cobra.Command {
+	var archivePath, nodeID string
+	cmd := &cobra.Command{
+		Use:   "rehydrate <id>",
+		Short: "Restore an archived sandbox to STOPPED",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			c, _, err := resolveClient()
+			if err != nil {
+				return err
+			}
+			if err := requireAuth(c); err != nil {
+				return err
+			}
+			ctx, cancel := withCtx()
+			defer cancel()
+			body := map[string]any{}
+			if archivePath != "" {
+				body["archive_path"] = archivePath
+			}
+			if nodeID != "" {
+				body["node_id"] = nodeID
+			}
+			var sb sandbox
+			if err := c.do(ctx, "POST", "/v1/sandboxes/"+args[0]+"/rehydrate", body, &sb); err != nil {
+				return err
+			}
+			if gFlags.asJSON {
+				return printJSON(sb)
+			}
+			renderSandbox(&sb)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&archivePath, "archive-path", "", "explicit archive locator (path or s3://...)")
+	cmd.Flags().StringVar(&nodeID, "node", "", "target node ID (default: original node or scheduler)")
+	return cmd
+}
+
+func newSandboxMigrateCmd() *cobra.Command {
+	var targetNode string
+	cmd := &cobra.Command{
+		Use:   "migrate <id> --target <node-id>",
+		Short: "Move a sandbox to another node (admin)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if targetNode == "" {
+				return fmt.Errorf("--target is required")
+			}
+			c, _, err := resolveClient()
+			if err != nil {
+				return err
+			}
+			if err := requireAuth(c); err != nil {
+				return err
+			}
+			ctx, cancel := withCtx()
+			defer cancel()
+			body := map[string]any{"target_node_id": targetNode}
+			var res migrateResult
+			if err := c.do(ctx, "POST", "/v1/sandboxes/"+args[0]+"/migrate", body, &res); err != nil {
+				return err
+			}
+			if gFlags.asJSON {
+				return printJSON(res)
+			}
+			table([]string{"FIELD", "VALUE"}, [][]string{
+				{"ID", res.ID},
+				{"Operation", res.OperationID},
+				{"From node", res.SourceNode},
+				{"To node", res.TargetNode},
+				{"Bytes sent", fmt.Sprintf("%d", res.BytesSent)},
+			})
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&targetNode, "target", "", "target node ID (required)")
 	return cmd
 }
 

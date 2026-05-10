@@ -22,6 +22,7 @@ type Server struct {
 	addr      string
 	sandboxes *SandboxManager
 	pool      *PoolManager
+	archives  *ArchiveManager
 	logger    *slog.Logger
 	http      *http.Server
 
@@ -50,6 +51,11 @@ func NewServer(addr string, sandboxes *SandboxManager, pool *PoolManager, logger
 		logger:    logger,
 	}
 }
+
+// SetArchiveManager swaps in the archive manager used by the
+// /sandbox/{id}/archive and /sandbox/{id}/rehydrate handlers. Wired from
+// main so the server constructor remains stable for tests.
+func (s *Server) SetArchiveManager(a *ArchiveManager) { s.archives = a }
 
 // ListenAndServe binds the configured address and serves until ctx is
 // cancelled. It returns the first non-shutdown error from http.Server.
@@ -92,6 +98,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandbox/{id}/start", s.handleStart)
 	mux.HandleFunc("DELETE /sandbox/{id}", s.handleDestroy)
 	mux.HandleFunc("POST /sandbox/{id}/snapshot", s.handleSandboxSnapshot)
+	mux.HandleFunc("POST /sandbox/{id}/archive", s.handleArchive)
+	mux.HandleFunc("POST /sandbox/{id}/rehydrate", s.handleRehydrate)
+	mux.HandleFunc("POST /sandbox/{id}/migrate", s.handleMigrate)
+	mux.HandleFunc("POST /sandbox/receive", s.handleReceive)
 	mux.HandleFunc("POST /sandbox/{id}/files/upload", s.handleFileUpload)
 	mux.HandleFunc("GET /sandbox/{id}/files/download", s.handleFileDownload)
 	mux.HandleFunc("GET /sandbox/{id}/files/list", s.handleFileList)

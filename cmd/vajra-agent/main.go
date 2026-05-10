@@ -21,6 +21,11 @@ import (
 	"github.com/allenabraham999/vajra/internal/vmm"
 )
 
+// agentVersion is the build-time version stamp. -ldflags overridable so
+// release pipelines can inject a real semver / commit; defaults to "dev"
+// for ad-hoc builds.
+var agentVersion = "dev"
+
 // config bundles every env-var the agent reads. Filled by loadConfig at
 // startup so the rest of main is a straight-line wiring exercise.
 type config struct {
@@ -31,6 +36,7 @@ type config struct {
 	apiKey       string
 	cacheDir     string
 	sandboxRoot  string
+	archiveDir   string
 	socketDir    string
 	cacheMaxBytes int64
 	poolMinSize  int
@@ -75,6 +81,9 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		WithSocketDir(cfg.socketDir)
 	cache := agent.NewImageCache(cfg.cacheDir, cfg.cacheMaxBytes, logger)
 	sandboxes := agent.NewSandboxManager(cfg.sandboxRoot, cfg.socketDir, cache, vm, nil, logger)
+	archives := agent.NewArchiveManager(sandboxes, agent.ArchiveOptions{
+		ArchiveDir: cfg.archiveDir,
+	}, logger)
 
 	var pool *agent.PoolManager
 	if cfg.poolMinSize > 0 && cfg.poolTemplate != "" {
@@ -105,6 +114,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	}
 
 	srv := agent.NewServer(cfg.listenAddr, sandboxes, pool, logger)
+	srv.SetArchiveManager(archives)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		return fmt.Errorf("http server: %w", err)
 	}
@@ -172,6 +182,7 @@ func sendHeartbeat(ctx context.Context, master *agent.MasterClient, sandboxes *a
 	req.Usage.UsedMemoryMB = used.memMB
 	req.Usage.UsedDiskGB = used.diskGB
 	req.SandboxCount = used.count
+	req.Version = agentVersion
 
 	hbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -241,6 +252,7 @@ func loadConfig() (config, error) {
 		apiKey:            os.Getenv("VAJRA_AGENT_API_KEY"),
 		cacheDir:          envOr("VAJRA_AGENT_CACHE_DIR", agent.DefaultCacheDir),
 		sandboxRoot:       envOr("VAJRA_AGENT_SANDBOX_ROOT", agent.DefaultSandboxRoot),
+		archiveDir:        envOr("VAJRA_AGENT_ARCHIVE_DIR", agent.DefaultArchiveDir),
 		socketDir:         envOr("VAJRA_AGENT_SOCKET_DIR", vmm.DefaultSocketDir),
 		chBinary:          envOr("VAJRA_AGENT_CH_BINARY", vmm.DefaultBinaryPath),
 		poolTemplate:      os.Getenv("VAJRA_AGENT_POOL_TEMPLATE"),

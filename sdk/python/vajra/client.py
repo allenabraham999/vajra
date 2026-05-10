@@ -124,6 +124,55 @@ class _SandboxResource(_Resource):
         data = self._client._request("DELETE", f"/v1/sandboxes/{sandbox_id}")
         return Sandbox.from_dict(data)
 
+    # Archive / migrate ---------------------------------------------------
+
+    def archive(self, sandbox_id: str) -> dict[str, Any]:
+        """Stop and compress a sandbox into cold storage.
+
+        Returns the archive descriptor: ``{operation_id, id, path,
+        location, size_bytes}``. ``path`` is a filesystem path when
+        ``location == "local"`` and an ``s3://...`` URL otherwise.
+        Hold onto the path if you might rehydrate onto a different
+        host than the original.
+        """
+        return self._client._request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/archive"
+        ) or {}
+
+    def rehydrate(
+        self,
+        sandbox_id: str,
+        archive_path: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> Sandbox:
+        """Restore an archived sandbox to STOPPED.
+
+        ``archive_path`` is optional — when omitted the agent resolves
+        the archive from its configured store. ``node_id`` overrides
+        placement; otherwise the original node is reused if still
+        ACTIVE, falling through to the scheduler.
+        """
+        body: dict[str, Any] = {}
+        if archive_path is not None:
+            body["archive_path"] = archive_path
+        if node_id is not None:
+            body["node_id"] = node_id
+        data = self._client._request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/rehydrate", json=body
+        )
+        return Sandbox.from_dict(data)
+
+    def migrate(self, sandbox_id: str, target_node_id: str) -> dict[str, Any]:
+        """Move a sandbox to another node (admin-only).
+
+        Returns the migration descriptor:
+        ``{operation_id, id, source_node_id, target_node_id, bytes_sent}``.
+        """
+        return self._client._request(
+            "POST", f"/v1/sandboxes/{sandbox_id}/migrate",
+            json={"target_node_id": target_node_id},
+        ) or {}
+
     # Files ---------------------------------------------------------------
 
     def upload_file(

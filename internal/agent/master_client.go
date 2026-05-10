@@ -61,7 +61,8 @@ type HeartbeatRequest struct {
 		UsedMemoryMB int `json:"used_memory_mb"`
 		UsedDiskGB   int `json:"used_disk_gb"`
 	} `json:"usage"`
-	SandboxCount int `json:"sandbox_count"`
+	SandboxCount int    `json:"sandbox_count"`
+	Version      string `json:"version,omitempty"`
 }
 
 // Register tells master that this agent is online. Master responds with a

@@ -34,6 +34,7 @@ func (s *opTestStore) ShareLinks() store.ShareLinkStore {
 func (s *opTestStore) Operations() store.OperationStore {
 	return s.ops
 }
+func (s *opTestStore) Usage() store.UsageStore    { panic("opTestStore: Usage not implemented") }
 func (s *opTestStore) Ping(context.Context) error { return nil }
 func (s *opTestStore) WithTx(context.Context, func(store.Store) error) error {
 	return errors.New("WithTx not implemented")

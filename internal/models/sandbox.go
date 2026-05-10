@@ -94,6 +94,7 @@ type Sandbox struct {
 //   - RUNNING → DESTROYING: delete a running sandbox
 //   - STOPPED → RUNNING:    start a stopped sandbox (re-restore on agent)
 //   - STOPPED → DESTROYING: delete a stopped sandbox without archival
+//   - ARCHIVED → STOPPED:   rehydrate an archived sandbox back to disk
 //
 // Transitions to ERROR are handled separately in CanTransition.
 var validSandboxTransitions = map[SandboxState][]SandboxState{
@@ -105,7 +106,7 @@ var validSandboxTransitions = map[SandboxState][]SandboxState{
 	SandboxStateStopping:   {SandboxStateStopped},
 	SandboxStateStopped:    {SandboxStateArchiving, SandboxStateRunning, SandboxStateDestroying},
 	SandboxStateArchiving:  {SandboxStateArchived},
-	SandboxStateArchived:   {SandboxStateDestroying},
+	SandboxStateArchived:   {SandboxStateDestroying, SandboxStateStopped},
 	SandboxStateDestroying: {SandboxStateDestroyed},
 	SandboxStateDestroyed:  nil,
 	SandboxStateError:      nil,

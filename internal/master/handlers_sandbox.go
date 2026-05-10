@@ -233,6 +233,9 @@ func (h *Handlers) handleDispatchError(
 			if err := h.Store.Sandboxes().UpdateState(probeCtx, accountID, sandboxID, models.SandboxStateRunning); err != nil {
 				h.log().Error("createSandbox: reconcile-after-dispatch update", "err", err, "sandbox_id", sandboxID)
 			}
+			if sb, _ := h.Store.Sandboxes().GetByID(probeCtx, accountID, sandboxID); sb != nil {
+				h.recordUsageStart(probeCtx, accountID, sandboxID, sb.Config)
+			}
 			_ = h.Tracker.Complete(probeCtx, opID, nil)
 			h.log().Warn("createSandbox: dispatch reported error but agent has sandbox running",
 				"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
@@ -318,6 +321,9 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateRunning); uerr != nil {
 					h.log().Error("createSandbox: poll running update", "err", uerr, "sandbox_id", sandboxID)
 				}
+				if sb, _ := h.Store.Sandboxes().GetByID(context.Background(), accountID, sandboxID); sb != nil {
+					h.recordUsageStart(context.Background(), accountID, sandboxID, sb.Config)
+				}
 				_ = h.Tracker.Complete(context.Background(), opID, nil)
 				return
 			case models.SandboxStateError:
@@ -342,6 +348,32 @@ func isAgentNotFound(err error) bool {
 		return he.Status == http.StatusNotFound
 	}
 	return false
+}
+
+// recordUsageStart opens a sandbox_usage interval for billing. Best-
+// effort: a failed insert never blocks the lifecycle, but we log so
+// operators notice persistent mis-tracking. Skip when the store has
+// no Usage backend (test fakes return nil).
+func (h *Handlers) recordUsageStart(ctx context.Context, accountID, sandboxID string, cfg models.SandboxConfig) {
+	usage := h.Store.Usage()
+	if usage == nil {
+		return
+	}
+	if err := usage.RecordStart(ctx, accountID, sandboxID, cfg, h.now().UTC()); err != nil {
+		h.log().Warn("usage RecordStart failed", "err", err, "sandbox_id", sandboxID)
+	}
+}
+
+// recordUsageStop closes any open sandbox_usage interval. See
+// recordUsageStart on best-effort error handling.
+func (h *Handlers) recordUsageStop(ctx context.Context, sandboxID string) {
+	usage := h.Store.Usage()
+	if usage == nil {
+		return
+	}
+	if err := usage.RecordStop(ctx, sandboxID, h.now().UTC()); err != nil {
+		h.log().Warn("usage RecordStop failed", "err", err, "sandbox_id", sandboxID)
+	}
 }
 
 // sandboxWithOp augments a sandbox row with the operation id so the

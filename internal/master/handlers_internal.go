@@ -127,7 +127,8 @@ type nodeHeartbeatRequest struct {
 		UsedMemoryMB int `json:"used_memory_mb"`
 		UsedDiskGB   int `json:"used_disk_gb"`
 	} `json:"usage"`
-	SandboxCount int `json:"sandbox_count"`
+	SandboxCount int    `json:"sandbox_count"`
+	Version      string `json:"version,omitempty"`
 }
 
 // nodeHeartbeat handles POST /internal/nodes/{id}/heartbeat.
@@ -168,6 +169,9 @@ func (h *Handlers) nodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		h.log().Error("nodeHeartbeat: ts", "err", err)
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	if body.Version != "" {
+		LogAgentVersionMismatch(h.log(), id, body.Version)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

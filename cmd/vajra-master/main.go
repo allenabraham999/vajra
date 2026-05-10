@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,7 @@ type config struct {
 	ReconcileInterval time.Duration
 	AdminAccountID    string
 	PublicBaseDomain  string
+	RateLimitRPS      int
 	Version           master.VersionInfo
 }
 
@@ -51,11 +53,25 @@ func loadConfig() (*config, error) {
 		MigrationsDir:     getenvDefault("MIGRATIONS_DIR", "./migrations"),
 		AdminAccountID:    os.Getenv("ADMIN_ACCOUNT_ID"),
 		PublicBaseDomain:  os.Getenv("PUBLIC_BASE_DOMAIN"),
-		Version: master.VersionInfo{
-			Version: getenvDefault("VAJRA_VERSION", "dev"),
-			Commit:  getenvDefault("VAJRA_COMMIT", "unknown"),
-			BuiltAt: getenvDefault("VAJRA_BUILT_AT", ""),
-		},
+		Version: master.BuildInfo(),
+	}
+	// Allow env-var overrides on top of the ldflags-stamped values so
+	// dev builds can spoof the version triple without rebuilding.
+	if v := os.Getenv("VAJRA_VERSION"); v != "" {
+		cfg.Version.Version = v
+	}
+	if v := os.Getenv("VAJRA_COMMIT"); v != "" {
+		cfg.Version.Commit = v
+	}
+	if v := os.Getenv("VAJRA_BUILT_AT"); v != "" {
+		cfg.Version.BuiltAt = v
+	}
+	if v := os.Getenv("VAJRA_RATE_LIMIT_RPS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("VAJRA_RATE_LIMIT_RPS %q: %w", v, err)
+		}
+		cfg.RateLimitRPS = n
 	}
 	interval := getenvDefault("RECONCILE_INTERVAL", "60s")
 	d, err := time.ParseDuration(interval)
@@ -131,6 +147,7 @@ func main() {
 		Logger:         logger,
 		InternalSecret: cfg.AgentSharedSecret,
 		AdminAccountID: cfg.AdminAccountID,
+		RateLimitRPS:   cfg.RateLimitRPS,
 	}, handlers)
 
 	logger.Info("vajra-master starting",

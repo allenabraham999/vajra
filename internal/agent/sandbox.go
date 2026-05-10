@@ -324,6 +324,21 @@ func (m *SandboxManager) AdoptSandbox(sb *Sandbox) {
 	m.mu.Unlock()
 }
 
+// removeEntry drops a sandbox from the in-memory registry without touching
+// the on-disk state. Used by ArchiveManager and the migration target after
+// the sandbox has been moved off-host: the caller is responsible for
+// freeing or relocating the underlying files first.
+func (m *SandboxManager) removeEntry(id string) {
+	m.mu.Lock()
+	delete(m.sandboxes, id)
+	m.mu.Unlock()
+}
+
+// Root exposes the sandbox-state root so sibling files (archive, migrate)
+// can resolve the on-disk directory for a given sandbox without exporting
+// the whole struct.
+func (m *SandboxManager) Root() string { return m.root }
+
 // StopSandbox pauses the VM and snapshots its state to disk so a later
 // StartSandbox can resume it. The VMM process is then torn down — only
 // the saved state survives until Start.

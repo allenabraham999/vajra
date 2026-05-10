@@ -97,6 +97,7 @@ func (h *Handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
 	if err := h.Store.Sandboxes().UpdateState(r.Context(), accountID, sb.ID, models.SandboxStateRunning); err != nil {
 		h.log().Error("startSandbox: state", "err", err)
 	}
+	h.recordUsageStart(r.Context(), accountID, sb.ID, sb.Config)
 	_ = h.Tracker.Complete(r.Context(), opID, nil)
 
 	out, _ := h.Store.Sandboxes().GetByID(r.Context(), accountID, sb.ID)
@@ -165,6 +166,9 @@ func (h *Handlers) lifecycleAction(w http.ResponseWriter, r *http.Request, p lif
 	}
 	if err := h.Store.Sandboxes().UpdateState(r.Context(), accountID, sb.ID, p.final); err != nil {
 		h.log().Error("lifecycle: final-state", "err", err, "op", p.opType)
+	}
+	if p.final == models.SandboxStateStopped || p.final == models.SandboxStateDestroyed {
+		h.recordUsageStop(r.Context(), sb.ID)
 	}
 	_ = h.Tracker.Complete(r.Context(), opID, nil)
 

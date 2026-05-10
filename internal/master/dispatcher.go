@@ -160,6 +160,37 @@ type SnapshotResult struct {
 	SizeBytes    int64  `json:"size_bytes"`
 }
 
+// ArchiveResult is the body returned by the agent's POST /sandbox/{id}/archive.
+// Path is a local filesystem path when Location=="local" and an
+// "s3://bucket/key" URL when Location=="s3".
+type ArchiveResult struct {
+	ID         string    `json:"id"`
+	Path       string    `json:"path"`
+	Location   string    `json:"location"`
+	SizeBytes  int64     `json:"size_bytes"`
+	ArchivedAt time.Time `json:"archived_at"`
+}
+
+// MigrateResult is the body returned by the agent's POST /sandbox/{id}/migrate
+// after a successful transfer.
+type MigrateResult struct {
+	ID         string    `json:"id"`
+	TargetURL  string    `json:"target_url"`
+	BytesSent  int64     `json:"bytes_sent"`
+	MigratedAt time.Time `json:"migrated_at"`
+}
+
+// rehydrateRequestBody mirrors agent.RehydrateRequestBody.
+type rehydrateRequestBody struct {
+	ArchivePath string `json:"archive_path,omitempty"`
+}
+
+// migrateRequestBody mirrors agent.MigrateRequestBody.
+type migrateRequestBody struct {
+	TargetAddr string `json:"target_addr"`
+	AuthToken  string `json:"auth_token,omitempty"`
+}
+
 // execRequestBody is the JSON body of POST /sandbox/{id}/exec.
 type execRequestBody struct {
 	Command   string `json:"command"`
@@ -250,6 +281,37 @@ func (c *AgentClient) ListSandboxes(ctx context.Context) ([]AgentSandboxView, er
 	var out []AgentSandboxView
 	if err := c.do(ctx, http.MethodGet, "/sandbox/list", nil, &out); err != nil {
 		return nil, fmt.Errorf("agent ListSandboxes: %w", err)
+	}
+	return out, nil
+}
+
+// ArchiveSandbox issues POST /sandbox/{id}/archive on the agent.
+func (c *AgentClient) ArchiveSandbox(ctx context.Context, id string) (*ArchiveResult, error) {
+	out := &ArchiveResult{}
+	if err := c.do(ctx, http.MethodPost, "/sandbox/"+id+"/archive", nil, out); err != nil {
+		return nil, fmt.Errorf("agent ArchiveSandbox(%s): %w", id, err)
+	}
+	return out, nil
+}
+
+// RehydrateSandbox issues POST /sandbox/{id}/rehydrate on the agent.
+// archivePath may be empty to let the agent resolve from its configured
+// store, or an "s3://..." / local path recorded at archive time.
+func (c *AgentClient) RehydrateSandbox(ctx context.Context, id, archivePath string) error {
+	body := rehydrateRequestBody{ArchivePath: archivePath}
+	if err := c.do(ctx, http.MethodPost, "/sandbox/"+id+"/rehydrate", body, nil); err != nil {
+		return fmt.Errorf("agent RehydrateSandbox(%s): %w", id, err)
+	}
+	return nil
+}
+
+// MigrateSandbox issues POST /sandbox/{id}/migrate on the source agent.
+// targetAddr is the base URL of the destination agent ("http://10.0.1.5:9000").
+func (c *AgentClient) MigrateSandbox(ctx context.Context, id, targetAddr, authToken string) (*MigrateResult, error) {
+	body := migrateRequestBody{TargetAddr: targetAddr, AuthToken: authToken}
+	out := &MigrateResult{}
+	if err := c.do(ctx, http.MethodPost, "/sandbox/"+id+"/migrate", body, out); err != nil {
+		return nil, fmt.Errorf("agent MigrateSandbox(%s): %w", id, err)
 	}
 	return out, nil
 }

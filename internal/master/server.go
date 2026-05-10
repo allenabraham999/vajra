@@ -25,6 +25,10 @@ type ServerConfig struct {
 	Logger         *slog.Logger
 	InternalSecret string
 	AdminAccountID string
+	// RateLimitRPS is the per-account ceiling for the authed surface; 0
+	// falls back to DefaultRateLimitRPS. Anonymous traffic (login,
+	// register) shares a single bucket at the same rate.
+	RateLimitRPS int
 }
 
 // Server bundles a configured *Handlers with the http.Server it serves
@@ -32,6 +36,7 @@ type ServerConfig struct {
 type Server struct {
 	cfg      ServerConfig
 	handlers *Handlers
+	limiter  *RateLimiter
 	http     *http.Server
 }
 
@@ -49,7 +54,8 @@ func NewServer(cfg ServerConfig, h *Handlers) *Server {
 	if h.Logger == nil {
 		h.Logger = cfg.Logger
 	}
-	return &Server{cfg: cfg, handlers: h}
+	limiter := NewRateLimiter(RateLimitConfig{RPS: cfg.RateLimitRPS})
+	return &Server{cfg: cfg, handlers: h, limiter: limiter}
 }
 
 // ctxKeyRequestID is the context key for the per-request ID injected by
@@ -66,15 +72,18 @@ func (s *Server) Routes() http.Handler {
 	// Public routes — no auth.
 	mux.HandleFunc("GET /health", h.getHealth)
 	mux.HandleFunc("GET /version", h.getVersion)
-	mux.HandleFunc("POST /v1/auth/register", h.register)
-	mux.HandleFunc("POST /v1/auth/login", h.login)
+	// Rate-limit auth endpoints under the shared "anonymous" bucket so a
+	// brute-force login loop can't outpace a single tenant's quota.
+	mux.Handle("POST /v1/auth/register", s.limiter.Middleware(http.HandlerFunc(h.register)))
+	mux.Handle("POST /v1/auth/login", s.limiter.Middleware(http.HandlerFunc(h.login)))
 
-	// Authed routes — wrap each with AuthMiddleware so per-route
-	// composition stays flat. There's no "auth subtree" with
-	// http.ServeMux, so we register the wrapped HandlerFunc directly.
+	// Authed routes — wrap each with AuthMiddleware + the per-account
+	// rate limiter. The limiter is applied AFTER auth so the bucket is
+	// keyed on account_id rather than IP; anonymous spam is bounded
+	// further upstream by the (login|register) middleware below.
 	auth := AuthMiddleware(h.Signer, s.handlers.Store.APIKeys())
 	for pattern, hf := range s.authedRoutes() {
-		mux.Handle(pattern, auth(http.HandlerFunc(hf)))
+		mux.Handle(pattern, auth(s.limiter.Middleware(http.HandlerFunc(hf))))
 	}
 
 	// Internal routes — pre-shared secret only.
@@ -107,6 +116,9 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"DELETE /v1/sandboxes/{id}":             h.destroySandbox,
 		"POST /v1/sandboxes/{id}/snapshot":      h.snapshotSandbox,
 		"GET /v1/sandboxes/{id}/snapshots":      h.listSandboxSnapshots,
+		"POST /v1/sandboxes/{id}/archive":       h.archiveSandbox,
+		"POST /v1/sandboxes/{id}/rehydrate":     h.rehydrateSandbox,
+		"POST /v1/sandboxes/{id}/migrate":       h.migrateSandbox,
 
 		// Files (proxy through agent)
 		"POST /v1/sandboxes/{id}/files/upload":   h.uploadFile,

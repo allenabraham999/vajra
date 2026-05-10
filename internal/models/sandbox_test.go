@@ -37,7 +37,7 @@ var validForward = map[SandboxState][]SandboxState{
 	SandboxStateStopping:   {SandboxStateStopped},
 	SandboxStateStopped:    {SandboxStateArchiving, SandboxStateRunning, SandboxStateDestroying},
 	SandboxStateArchiving:  {SandboxStateArchived},
-	SandboxStateArchived:   {SandboxStateDestroying},
+	SandboxStateArchived:   {SandboxStateDestroying, SandboxStateStopped},
 	SandboxStateDestroying: {SandboxStateDestroyed},
 }
 

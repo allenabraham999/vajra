@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/allenabraham999/vajra/internal/models"
+	"github.com/allenabraham999/vajra/internal/store"
 )
 
 // listClusters returns every cluster known to master.
@@ -57,22 +58,25 @@ func (h *Handlers) drainNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "draining", "node_id": id})
 }
 
-// usageReport is the response shape of GET /v1/usage. The fields are
-// stubs in this milestone — there is no rolled-up sandbox_usage reader
-// in the store yet, so we report active sandbox configs as a proxy.
+// usageReport is the response shape of GET /v1/usage. Rollup uses the
+// sandbox_usage ledger when one is wired (production); when the store
+// has no UsageStore (test fakes), we fall back to a config-based
+// approximation so the endpoint still returns useful data.
 type usageReport struct {
-	From                 time.Time `json:"from"`
-	To                   time.Time `json:"to"`
-	SandboxCount         int       `json:"sandbox_count"`
-	TotalVCPUSeconds     int64     `json:"total_vcpu_seconds"`
-	TotalMemoryMBSeconds int64     `json:"total_memory_mb_seconds"`
-	TotalDiskGBSeconds   int64     `json:"total_disk_gb_seconds"`
-	Note                 string    `json:"note,omitempty"`
+	From                 time.Time           `json:"from"`
+	To                   time.Time           `json:"to"`
+	SandboxCount         int                 `json:"sandbox_count"`
+	TotalVCPUSeconds     int64               `json:"total_vcpu_seconds"`
+	TotalMemoryMBSeconds int64               `json:"total_memory_mb_seconds"`
+	TotalDiskGBSeconds   int64               `json:"total_disk_gb_seconds"`
+	Cost                 float64             `json:"cost"`
+	PerSandbox           []store.UsageRow    `json:"per_sandbox,omitempty"`
+	Note                 string              `json:"note,omitempty"`
 }
 
-// getUsage stub-reports usage for the calling account. Rolled-up
-// totals from sandbox_usage are pending; for now we sum config across
-// non-DESTROYED sandboxes scaled by the request window.
+// getUsage rolls up sandbox_usage rows over the [from, to) window. When
+// the store has no UsageStore (test fakes), we fall back to a stub that
+// scales current sandbox configs across the window.
 func (h *Handlers) getUsage(w http.ResponseWriter, r *http.Request) {
 	accountID, ok := RequireAccount(w, r)
 	if !ok {
@@ -87,19 +91,46 @@ func (h *Handlers) getUsage(w http.ResponseWriter, r *http.Request) {
 	if from.IsZero() {
 		from = to.Add(-24 * time.Hour)
 	}
-	windowSec := int64(to.Sub(from).Seconds())
-	if windowSec < 0 {
+	if to.Before(from) {
 		writeErr(w, http.StatusBadRequest, "to must be after from")
 		return
 	}
 
+	usage := h.Store.Usage()
+	if usage != nil {
+		rollup, err := usage.SumByAccount(r.Context(), accountID, from, to)
+		if err != nil {
+			h.log().Error("getUsage: rollup", "err", err)
+			writeErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		perSandbox, err := usage.PerSandbox(r.Context(), accountID, from, to)
+		if err != nil {
+			h.log().Error("getUsage: per-sandbox", "err", err)
+			writeErr(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, usageReport{
+			From: rollup.From, To: rollup.To,
+			SandboxCount:         len(perSandbox),
+			TotalVCPUSeconds:     rollup.VCPUSeconds,
+			TotalMemoryMBSeconds: rollup.MemoryMBSeconds,
+			TotalDiskGBSeconds:   rollup.DiskGBSeconds,
+			Cost:                 rollup.Cost,
+			PerSandbox:           perSandbox,
+		})
+		return
+	}
+
+	// Fallback: scale current sandbox configs across the window.
+	windowSec := int64(to.Sub(from).Seconds())
 	sandboxes, err := h.Store.Sandboxes().ListByAccount(r.Context(), accountID, parseListOpts(r))
 	if err != nil {
 		h.log().Error("getUsage: list sandboxes", "err", err)
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	report := usageReport{From: from, To: to, Note: "rolled-up usage pending; this is a stub"}
+	report := usageReport{From: from, To: to, Note: "approximate (no UsageStore wired)"}
 	for _, sb := range sandboxes {
 		if sb.State == models.SandboxStateDestroyed || sb.State == models.SandboxStateError {
 			continue
@@ -109,6 +140,7 @@ func (h *Handlers) getUsage(w http.ResponseWriter, r *http.Request) {
 		report.TotalMemoryMBSeconds += int64(sb.Config.MemoryMB) * windowSec
 		report.TotalDiskGBSeconds += int64(sb.Config.DiskGB) * windowSec
 	}
+	report.Cost = store.CalculateCost(report.TotalVCPUSeconds, report.TotalMemoryMBSeconds, report.TotalDiskGBSeconds)
 	writeJSON(w, http.StatusOK, report)
 }
 

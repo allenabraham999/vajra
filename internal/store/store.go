@@ -44,6 +44,7 @@ type Store interface {
 	Templates() TemplateStore
 	Operations() OperationStore
 	ShareLinks() ShareLinkStore
+	Usage() UsageStore
 
 	// Ping verifies a working database connection.
 	Ping(ctx context.Context) error
