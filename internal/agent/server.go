@@ -141,9 +141,9 @@ func (r *statusRecorder) WriteHeader(code int) {
 }
 
 // CreateRequestBody is the JSON shape accepted by POST /sandbox/create.
-// FromPool=true short-circuits CreateSandbox by handing back a warm pool
-// member; if the pool is empty the server falls through to a fresh
-// restore.
+// The pool is consulted on every request when configured; FromPool is
+// kept for wire-compatibility with the master dispatcher but currently
+// ignored — the agent always prefers a warm member to a cold restore.
 type CreateRequestBody struct {
 	ID           string        `json:"id,omitempty"`
 	TemplateHash string        `json:"template_hash"`
@@ -163,17 +163,18 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.FromPool && s.pool != nil {
-		if id, err := s.pool.AssignFromPool(); err == nil {
-			sb, err := s.sandboxes.Get(id)
-			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
-				return
-			}
+	if s.pool != nil {
+		t0 := time.Now()
+		if sb, ok := s.tryAssignFromPool(r.Context(), body); ok {
+			s.logger.Info("pool hit",
+				"id", sb.ID,
+				"elapsed_ms", time.Since(t0).Milliseconds(),
+			)
 			s.createdTotal.Add(1)
 			writeJSON(w, http.StatusOK, sb)
 			return
 		}
+		s.logger.Info("pool miss: cold create", "template", body.TemplateHash)
 	}
 	// Async create: register the placeholder synchronously (fast,
 	// validation only) so master's ListSandboxes / GetSandbox sees it
@@ -254,12 +255,19 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Recycle the CID back to the pool BEFORE destroy so a fast-follow
+	// pool warm-up can reuse it. We snapshot CID under the manager's
+	// lock; if the sandbox is gone already the destroy is a no-op.
+	var cid uint32
+	if sb, err := s.sandboxes.Get(id); err == nil {
+		cid = sb.VsockCID
+	}
 	if err := s.sandboxes.DestroySandbox(r.Context(), id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if s.pool != nil {
-		s.pool.Release(id)
+	if s.pool != nil && cid >= DefaultPoolFirstCID {
+		s.pool.Release(cid)
 	}
 	s.destroyedTotal.Add(1)
 	w.WriteHeader(http.StatusNoContent)
@@ -271,6 +279,45 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.pool.Stats())
+}
+
+// tryAssignFromPool attempts to claim a warm member matching the
+// request's template, resume it, and adopt it into the sandbox manager.
+// Returns ok=false when the pool is empty or the requested template
+// doesn't match what the pool was started for, so the caller can fall
+// through to cold create. On resume failure the member is destroyed and
+// ok=false is returned — never propagate a half-baked pool sandbox to
+// the API surface.
+func (s *Server) tryAssignFromPool(ctx context.Context, body CreateRequestBody) (*Sandbox, bool) {
+	if body.TemplateHash != "" {
+		stats := s.pool.Stats()
+		if stats.Template != "" && stats.Template != body.TemplateHash {
+			return nil, false
+		}
+	}
+	ps, err := s.pool.AssignFromPool()
+	if err != nil {
+		return nil, false
+	}
+	resumeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := s.sandboxes.VMM().ResumeVM(resumeCtx, ps.APISocket); err != nil {
+		s.logger.Warn("pool resume failed; destroying pool member", "id", ps.ID, "err", err)
+		// Best-effort cleanup: bring the host back to a known state. The
+		// pool will replenish itself on the next tick.
+		_ = s.sandboxes.VMM().DestroyVM(context.WithoutCancel(ctx), ps.APISocket)
+		s.pool.Release(ps.CID)
+		return nil, false
+	}
+	sb := s.pool.MakeSandbox(ps)
+	if body.ID != "" {
+		sb.ID = body.ID
+	}
+	if cfg := body.Config; cfg.VCPUs != 0 || cfg.MemoryMB != 0 || cfg.DiskGB != 0 {
+		sb.Config = cfg
+	}
+	s.sandboxes.AdoptSandbox(sb)
+	return sb, true
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -305,11 +352,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	for state, n := range stateCounts {
 		fmt.Fprintf(w, "vajra_agent_sandboxes{state=%q} %d\n", string(state), n)
 	}
-	fmt.Fprintf(w, "# HELP vajra_agent_pool_available Warm pool members ready for assignment\n")
-	fmt.Fprintf(w, "# TYPE vajra_agent_pool_available gauge\n")
-	fmt.Fprintf(w, "vajra_agent_pool_available %d\n", poolStats.Available)
-	fmt.Fprintf(w, "vajra_agent_pool_in_use %d\n", poolStats.InUse)
-	fmt.Fprintf(w, "vajra_agent_pool_creating %d\n", poolStats.Creating)
+	fmt.Fprintf(w, "# HELP vajra_pool_available Warm pool members ready for assignment\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_available gauge\n")
+	fmt.Fprintf(w, "vajra_pool_available %d\n", poolStats.Available)
+	fmt.Fprintf(w, "# HELP vajra_pool_warming Pool members currently being pre-warmed\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_warming gauge\n")
+	fmt.Fprintf(w, "vajra_pool_warming %d\n", poolStats.Warming)
+	fmt.Fprintf(w, "# HELP vajra_pool_target Dynamic target pool size\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_target gauge\n")
+	fmt.Fprintf(w, "vajra_pool_target %d\n", poolStats.TargetSize)
+	fmt.Fprintf(w, "# HELP vajra_pool_hits_total Pool assignments served from a warm member\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_hits_total counter\n")
+	fmt.Fprintf(w, "vajra_pool_hits_total %d\n", poolStats.TotalHits)
+	fmt.Fprintf(w, "# HELP vajra_pool_misses_total Pool assignments that fell back to a cold create\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_misses_total counter\n")
+	fmt.Fprintf(w, "vajra_pool_misses_total %d\n", poolStats.TotalMisses)
+	fmt.Fprintf(w, "# HELP vajra_pool_hit_rate Rolling pool hit-rate (0-100)\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_hit_rate gauge\n")
+	fmt.Fprintf(w, "vajra_pool_hit_rate %.2f\n", poolStats.HitRatePct)
 }
 
 func decodeBody(r *http.Request, dst any) error {

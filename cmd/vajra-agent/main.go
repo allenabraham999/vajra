@@ -41,6 +41,7 @@ type config struct {
 	socketDir    string
 	cacheMaxBytes int64
 	poolMinSize  int
+	poolMaxSize  int
 	poolTemplate string
 	heartbeatInterval time.Duration
 	healthInterval    time.Duration
@@ -88,16 +89,19 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	}, logger)
 
 	var pool *agent.PoolManager
-	if cfg.poolMinSize > 0 && cfg.poolTemplate != "" {
+	if cfg.poolTemplate != "" {
 		pool = agent.NewPoolManager(
 			cfg.poolMinSize,
+			cfg.poolMaxSize,
 			cfg.poolTemplate,
 			agent.SandboxConfig{VCPUs: 2, MemoryMB: 512, DiskGB: 4},
 			sandboxes,
 			logger,
 		)
+		// WarmUp runs in the background — the agent serves HTTP
+		// immediately so cold creates work while the pool fills.
 		pool.Start(ctx)
-		defer pool.Stop()
+		defer pool.Shutdown()
 	}
 
 	var master *agent.MasterClient
@@ -295,6 +299,7 @@ func loadConfig() (config, error) {
 	}
 	cfg.cacheMaxBytes = envInt64("VAJRA_AGENT_CACHE_MAX_BYTES", 50*1024*1024*1024)
 	cfg.poolMinSize = envInt("VAJRA_AGENT_POOL_MIN_SIZE", 0)
+	cfg.poolMaxSize = envInt("VAJRA_AGENT_POOL_MAX_SIZE", 0)
 	cfg.totalCPU = envInt("VAJRA_AGENT_TOTAL_CPU", 0)
 	cfg.totalMemMB = envInt("VAJRA_AGENT_TOTAL_MEMORY_MB", 0)
 	cfg.totalDiskGB = envInt("VAJRA_AGENT_TOTAL_DISK_GB", 0)

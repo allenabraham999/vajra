@@ -140,6 +140,31 @@ func (m *VMManager) SpawnVM(ctx context.Context, vmID string, cfg VmConfig) (str
 // against the child process CWD, which is why VMManager.workDir must
 // match the directory where the original VM was launched.
 func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (string, error) {
+	return m.restoreInternal(ctx, vmID, snapshotPath, true)
+}
+
+// RestoreVMPaused is like RestoreVM but stops after the VM reaches PAUSED
+// state — Resume is not issued. The warm pool uses this to pre-restore
+// sandboxes into low-power standby; Assign issues the final ResumeVM,
+// which is ~10 ms, when the sandbox is handed out.
+func (m *VMManager) RestoreVMPaused(ctx context.Context, vmID, snapshotPath string) (string, error) {
+	return m.restoreInternal(ctx, vmID, snapshotPath, false)
+}
+
+// PauseVM freezes vCPUs without tearing down the VMM. Used by the pool
+// recovery path on rare cases where a pool member ends up RUNNING.
+func (m *VMManager) PauseVM(ctx context.Context, socketPath string) error {
+	return NewClient(socketPath).Pause(ctx)
+}
+
+// ResumeVM unfreezes vCPUs on a paused VM. The warm pool calls this on
+// assignment; on a paused-in-memory VM the operation is dominated by a
+// single CH API round-trip (~5-15 ms in practice).
+func (m *VMManager) ResumeVM(ctx context.Context, socketPath string) error {
+	return NewClient(socketPath).Resume(ctx)
+}
+
+func (m *VMManager) restoreInternal(ctx context.Context, vmID, snapshotPath string, resume bool) (string, error) {
 	snapshotDir := strings.TrimPrefix(snapshotPath, "file://")
 	abs, err := filepath.Abs(snapshotDir)
 	if err != nil {
@@ -175,15 +200,18 @@ func (m *VMManager) RestoreVM(ctx context.Context, vmID, snapshotPath string) (s
 		m.killProcess(socketPath)
 		return "", fmt.Errorf("wait for restored vm to reach Paused: %w", err)
 	}
-	client := NewClient(socketPath)
-	if err := client.Resume(ctx); err != nil {
-		m.killProcess(socketPath)
-		return "", fmt.Errorf("resume restored vm: %w", err)
+	if resume {
+		client := NewClient(socketPath)
+		if err := client.Resume(ctx); err != nil {
+			m.killProcess(socketPath)
+			return "", fmt.Errorf("resume restored vm: %w", err)
+		}
 	}
 	m.logger.Info("vm restored",
 		"vm_id", vmID,
 		"socket", socketPath,
 		"snapshot", snapshotPath,
+		"resumed", resume,
 		"elapsed_ms", time.Since(t0).Milliseconds(),
 	)
 	return socketPath, nil

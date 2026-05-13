@@ -108,12 +108,17 @@ type VsockDialer interface {
 	Dial(ctx context.Context, hostSocket string, port uint32) (io.ReadWriteCloser, error)
 }
 
-// VMM is the subset of vmm.VMManager used by SandboxManager. Pulling it
-// behind an interface lets unit tests stub out cloud-hypervisor entirely.
+// VMM is the subset of vmm.VMManager used by SandboxManager and the warm
+// pool. Pulling it behind an interface lets unit tests stub out
+// cloud-hypervisor entirely. RestoreVMPaused/PauseVM/ResumeVM are only
+// exercised by the pool; cold creates go through RestoreVM as before.
 type VMM interface {
 	RestoreVM(ctx context.Context, vmID, snapshotPath string) (string, error)
+	RestoreVMPaused(ctx context.Context, vmID, snapshotPath string) (string, error)
 	SnapshotVM(ctx context.Context, socketPath, destDir string, resume bool) error
 	DestroyVM(ctx context.Context, socketPath string) error
+	PauseVM(ctx context.Context, socketPath string) error
+	ResumeVM(ctx context.Context, socketPath string) error
 }
 
 // SandboxManager owns the lifecycle of every sandbox running on this host.
@@ -338,6 +343,16 @@ func (m *SandboxManager) removeEntry(id string) {
 // can resolve the on-disk directory for a given sandbox without exporting
 // the whole struct.
 func (m *SandboxManager) Root() string { return m.root }
+
+// Cache returns the image cache the manager uses. The warm pool reads it
+// to resolve template layouts when staging a pool member outside the
+// usual BeginCreate / FinishCreate path.
+func (m *SandboxManager) Cache() *ImageCache { return m.cache }
+
+// VMM returns the underlying VMM. Used by the warm pool to issue
+// RestoreVMPaused / ResumeVM / DestroyVM against pool members it owns
+// before they're adopted into the registry.
+func (m *SandboxManager) VMM() VMM { return m.vmm }
 
 // StopSandbox pauses the VM and snapshots its state to disk so a later
 // StartSandbox can resume it. The VMM process is then torn down — only

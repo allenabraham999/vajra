@@ -21,12 +21,15 @@ import (
 type fakeVMM struct {
 	socketDir string
 
-	mu          sync.Mutex
-	restoreCalls   int
-	snapshotCalls  int
-	destroyCalls   int
-	failRestore    bool
-	failSnapshot   bool
+	mu            sync.Mutex
+	restoreCalls  int
+	snapshotCalls int
+	destroyCalls  int
+	pauseCalls    int
+	resumeCalls   int
+	failRestore   bool
+	failSnapshot  bool
+	failResume    bool
 }
 
 func newFakeVMM(t *testing.T) *fakeVMM {
@@ -35,6 +38,16 @@ func newFakeVMM(t *testing.T) *fakeVMM {
 }
 
 func (f *fakeVMM) RestoreVM(_ context.Context, vmID, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restoreCalls++
+	if f.failRestore {
+		return "", errFakeRestore
+	}
+	return filepath.Join(f.socketDir, vmID+".sock"), nil
+}
+
+func (f *fakeVMM) RestoreVMPaused(_ context.Context, vmID, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.restoreCalls++
@@ -61,9 +74,27 @@ func (f *fakeVMM) DestroyVM(_ context.Context, _ string) error {
 	return nil
 }
 
+func (f *fakeVMM) PauseVM(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pauseCalls++
+	return nil
+}
+
+func (f *fakeVMM) ResumeVM(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumeCalls++
+	if f.failResume {
+		return errFakeResume
+	}
+	return nil
+}
+
 var (
 	errFakeRestore  = errFake("fake restore error")
 	errFakeSnapshot = errFake("fake snapshot error")
+	errFakeResume   = errFake("fake resume error")
 )
 
 type errFake string

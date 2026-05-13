@@ -9,7 +9,7 @@
 # Two execution modes:
 #   1. Run on a workstation — opens SSH to the EC2 host and runs the
 #      remote section over there. Required env / defaults:
-#          EC2_HOST=43.205.229.245
+#          EC2_HOST=13.126.126.66
 #          EC2_USER=ubuntu
 #          EC2_KEY=~/.ssh/mini-daytona-key.pem
 #   2. Run on the EC2 host directly — set VAJRA_LOCAL=1 to skip SSH.

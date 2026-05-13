@@ -48,6 +48,7 @@ func newRootCmd() *cobra.Command {
 		newSnapshotCmd(),
 		newTemplateCmd(),
 		newNodeCmd(),
+		newPoolCmd(),
 		newFileCmd(),
 		newAPIKeyCmd(),
 		newAdminCmd(),
