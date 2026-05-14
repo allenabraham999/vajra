@@ -129,23 +129,40 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		Region: body.Region,
 	}
 	cluster, node, err := h.Scheduler.Schedule(r.Context(), schedReq)
-	if err != nil && errors.Is(err, ErrNoCapacity) && h.Autoscaler != nil && h.Autoscaler.Config.Enabled {
-		// Autoscaler launches a fresh node and waits for it to register.
-		// On success we re-run Schedule so the regular scoring picks the
-		// new node like any other; HandleNoCapacity blocks until either
-		// registration succeeds or the 5min ceiling fires.
-		h.log().Info("createSandbox: triggering autoscale", "account_id", accountID)
-		if _, scaleErr := h.Autoscaler.HandleNoCapacity(r.Context(), *body, accountID); scaleErr == nil {
-			cluster, node, err = h.Scheduler.Schedule(r.Context(), schedReq)
-		} else {
-			err = scaleErr
+	if err != nil && errors.Is(err, ErrNoCapacity) {
+		// At this point the user would normally see a 503. We diverge
+		// based on what the autoscaler can actually do for this request:
+		//
+		//   1. Request exceeds the largest node we know how to launch →
+		//      400. No amount of waiting fixes it.
+		//   2. Snapshot-pinned create → still 503, because the user
+		//      asked for a specific node that's full and we can't
+		//      migrate the snapshot to a fresh box.
+		//   3. Autoscaler enabled → take the async path: persist the
+		//      sandbox in CREATING, kick a background goroutine that
+		//      scales + retries Schedule + dispatches, return 201 now.
+		//   4. Autoscaler disabled but request could fit somewhere →
+		//      503 with a friendlier "waiting for autoscaler" message
+		//      so the user knows they're not stuck on an oversize ask.
+		if ExceedsAnyNodeCapacity(body.VCPUs, body.MemoryMB) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+				"requested resources exceed maximum node capacity (max %d vCPU, %d MB)",
+				maxNodeVCPUs(), maxNodeMemoryMB()))
+			return
 		}
+		if snapshot == nil && h.Autoscaler != nil && h.Autoscaler.Config.Enabled {
+			h.startAsyncCreate(w, r, accountID, body, templateID, templateHash)
+			return
+		}
+		writeErr(w, http.StatusServiceUnavailable,
+			"all nodes at capacity, waiting for auto-scaler")
+		return
 	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrQuotaExceeded):
 			writeErr(w, http.StatusTooManyRequests, err.Error())
-		case errors.Is(err, ErrNoCluster), errors.Is(err, ErrNoCapacity):
+		case errors.Is(err, ErrNoCluster):
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		default:
 			h.log().Error("createSandbox: schedule", "err", err)
@@ -245,6 +262,147 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		return
 	}
 	writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: out, OperationID: opID})
+}
+
+// startAsyncCreate handles the "no capacity + autoscale enabled" branch.
+// We persist a CREATING sandbox row with no node placement, return 201
+// to the caller immediately, and let a background goroutine wait for
+// the autoscaler to register a fresh node, then schedule + dispatch.
+// The user polls GET /v1/sandboxes/{id} until state is RUNNING.
+//
+// The async path skips snapshot-sourced requests — those pin to a
+// specific node by design (snapshot bytes are local), so a freshly
+// launched box can't host them. Caller already filters that out.
+func (h *Handlers) startAsyncCreate(
+	w http.ResponseWriter, r *http.Request, accountID string,
+	body *createSandboxRequest, templateID, templateHash string,
+) {
+	sandboxID, err := randomHex(16)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	now := h.now().UTC()
+	autoStop := models.DefaultAutoStopMinutes
+	if body.AutoStopMinutes != nil {
+		autoStop = *body.AutoStopMinutes
+		if autoStop < 0 {
+			autoStop = 0
+		}
+	}
+	autoArchive := models.DefaultAutoArchiveMinutes
+	if body.AutoArchiveMinutes != nil {
+		autoArchive = *body.AutoArchiveMinutes
+		if autoArchive < 0 {
+			autoArchive = 0
+		}
+	}
+	sb := &models.Sandbox{
+		ID: sandboxID, Name: body.Name, AccountID: accountID,
+		TemplateID: templateID,
+		State:      models.SandboxStateCreating,
+		Config: models.SandboxConfig{
+			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
+		},
+		AutoStopMinutes:    autoStop,
+		AutoArchiveMinutes: autoArchive,
+		LastActivity:       now,
+		CreatedAt:          now, UpdatedAt: now,
+	}
+	if err := h.Store.Sandboxes().Create(r.Context(), sb); err != nil {
+		h.log().Error("createSandbox: async insert", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	h.incrAccountSandboxCount(r.Context(), accountID)
+	h.writeSandboxStateCache(r.Context(), sandboxID, models.SandboxStateCreating)
+	opID, _ := h.Tracker.Start(r.Context(), accountID, sandboxID, models.OperationTypeCreate)
+
+	h.log().Info("createSandbox: queued for autoscale",
+		"account_id", accountID, "sandbox_id", sandboxID,
+		"vcpus", body.VCPUs, "memory_mb", body.MemoryMB)
+
+	go h.driveAsyncCreate(accountID, sandboxID, opID, *body, templateHash)
+
+	writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: sb, OperationID: opID})
+}
+
+// driveAsyncCreate is the background half of startAsyncCreate. It calls
+// HandleNoCapacity to block until a fresh node registers, re-runs the
+// scheduler so the new node gets scored like any other, updates the
+// sandbox row with the placement, and dispatches to the agent. Any
+// failure flips the sandbox to ERROR so the user's poll resolves
+// instead of spinning forever.
+func (h *Handlers) driveAsyncCreate(
+	accountID, sandboxID, opID string,
+	body createSandboxRequest, templateHash string,
+) {
+	ctx := context.Background()
+	fail := func(err error) {
+		h.log().Error("createSandbox: async drive failed",
+			"sandbox_id", sandboxID, "err", err)
+		if uerr := h.Store.Sandboxes().UpdateState(ctx, accountID, sandboxID, models.SandboxStateError); uerr != nil {
+			h.log().Error("createSandbox: async error update", "err", uerr, "sandbox_id", sandboxID)
+		}
+		h.writeSandboxStateCache(ctx, sandboxID, models.SandboxStateError)
+		_ = h.Tracker.Complete(ctx, opID, err)
+	}
+
+	if _, err := h.Autoscaler.HandleNoCapacity(ctx, body, accountID); err != nil {
+		fail(fmt.Errorf("autoscale: %w", err))
+		return
+	}
+
+	schedReq := SchedRequest{
+		AccountID: accountID,
+		VCPUs:     body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
+		Region: body.Region,
+	}
+	cluster, node, err := h.Scheduler.Schedule(ctx, schedReq)
+	if err != nil {
+		fail(fmt.Errorf("post-scale schedule: %w", err))
+		return
+	}
+	if err := h.Store.Sandboxes().UpdatePlacement(ctx, sandboxID, cluster.ID, node.ID); err != nil {
+		fail(fmt.Errorf("update placement: %w", err))
+		return
+	}
+
+	agent := h.Pool.ClientFor(node)
+	dispatchCtx, cancel := context.WithTimeout(ctx, dispatchTimeout)
+	defer cancel()
+	_, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
+		ID:           sandboxID,
+		TemplateHash: templateHash,
+		Config: SandboxConfig{
+			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
+		},
+	})
+	if dispatchErr != nil {
+		// Run the same probe-then-reconcile dance as the sync path. We
+		// have no HTTP response to write, so on a hard failure we just
+		// flip to ERROR here instead.
+		probeCtx, pcancel := context.WithTimeout(ctx, dispatchReconcileTimeout)
+		defer pcancel()
+		sbView, probeErr := agent.GetSandbox(probeCtx, sandboxID)
+		if probeErr == nil && sbView != nil {
+			if mapped, ok := mapAgentState(sbView.State); ok {
+				switch mapped {
+				case models.SandboxStateRunning:
+					_ = h.Store.Sandboxes().UpdateState(ctx, accountID, sandboxID, models.SandboxStateRunning)
+					h.writeSandboxStateCache(ctx, sandboxID, models.SandboxStateRunning)
+					_ = h.Tracker.Complete(ctx, opID, nil)
+					return
+				case models.SandboxStateCreating:
+					h.pollAgentCreate(accountID, sandboxID, opID, agent)
+					return
+				}
+			}
+		}
+		fail(fmt.Errorf("agent dispatch: %w", dispatchErr))
+		return
+	}
+	h.pollAgentCreate(accountID, sandboxID, opID, agent)
 }
 
 // handleDispatchError resolves the four cases that can land us here when

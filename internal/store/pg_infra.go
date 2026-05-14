@@ -130,19 +130,24 @@ func (s *pgNodeStore) Delete(ctx context.Context, id string) error {
 
 type pgTemplateStore struct{ ext sqlx.ExtContext }
 
-const templateColumns = `id, account_id, name, version, hash, rootfs_path, kernel_path, snapshot_path, created_at`
+const templateColumns = `id, account_id, name, version, hash, rootfs_path, kernel_path, snapshot_path, public, created_at`
 
 func (s *pgTemplateStore) Create(ctx context.Context, t *models.Template) error {
 	const q = `INSERT INTO templates (` + templateColumns + `)
-	           VALUES (:id, :account_id, :name, :version, :hash, :rootfs_path, :kernel_path, :snapshot_path, :created_at)`
+	           VALUES (:id, :account_id, :name, :version, :hash, :rootfs_path, :kernel_path, :snapshot_path, :public, :created_at)`
 	_, err := sqlx.NamedExecContext(ctx, s.ext, q, t)
 	return translate(err)
 }
 
+// GetByID resolves templates the caller owns or any public template.
+// Sandbox creation calls this with the user's account_id and the chosen
+// template_id; without the OR public branch a fresh account couldn't
+// launch from a system image even though ListByAccount would show it.
 func (s *pgTemplateStore) GetByID(ctx context.Context, accountID, id string) (*models.Template, error) {
 	var t models.Template
 	err := sqlx.GetContext(ctx, s.ext, &t,
-		`SELECT `+templateColumns+` FROM templates WHERE account_id = $1 AND id = $2`,
+		`SELECT `+templateColumns+` FROM templates
+		 WHERE id = $2 AND (account_id = $1 OR public = TRUE)`,
 		accountID, id)
 	if err != nil {
 		return nil, translate(err)
@@ -161,16 +166,26 @@ func (s *pgTemplateStore) GetByHash(ctx context.Context, hash string) (*models.T
 	return &t, nil
 }
 
+// ListByAccount returns the caller's own templates plus any public
+// templates. Public rows are deduplicated implicitly — a template is
+// either owned by the caller or it isn't.
 func (s *pgTemplateStore) ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Template, error) {
 	limit, offset := applyListDefaults(opts)
 	out := []*models.Template{}
 	err := sqlx.SelectContext(ctx, s.ext, &out,
-		`SELECT `+templateColumns+` FROM templates WHERE account_id = $1
+		`SELECT `+templateColumns+` FROM templates
+		 WHERE account_id = $1 OR public = TRUE
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, accountID, limit, offset)
 	if err != nil {
 		return nil, translate(err)
 	}
 	return out, nil
+}
+
+func (s *pgTemplateStore) SetPublic(ctx context.Context, id string, public bool) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE templates SET public = $2 WHERE id = $1`, id, public)
+	return expectAffected(res, err)
 }
 
 func (s *pgTemplateStore) Delete(ctx context.Context, accountID, id string) error {

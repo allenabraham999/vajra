@@ -152,14 +152,21 @@ type SnapshotStore interface {
 	Delete(ctx context.Context, accountID, id string) error
 }
 
-// TemplateStore is account-scoped. GetByHash bypasses scoping by design:
-// content-addressable hashes are global identifiers, and looking one up
-// reveals nothing about ownership.
+// TemplateStore is account-scoped on writes. Reads also surface public
+// templates: ListByAccount and GetByID return the account's own templates
+// plus any row with public = true, so a fresh account can launch sandboxes
+// from system images without copying them in. GetByHash bypasses scoping
+// by design — content-addressable hashes are global identifiers, and
+// looking one up reveals nothing about ownership.
+//
+// SetPublic is unscoped: the admin endpoint is the only caller and it
+// already proved authorization at the HTTP boundary.
 type TemplateStore interface {
 	Create(ctx context.Context, t *models.Template) error
 	GetByID(ctx context.Context, accountID, id string) (*models.Template, error)
 	GetByHash(ctx context.Context, hash string) (*models.Template, error)
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Template, error)
+	SetPublic(ctx context.Context, id string, public bool) error
 	Delete(ctx context.Context, accountID, id string) error
 }
 

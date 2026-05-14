@@ -505,7 +505,7 @@ func (s *hsTemplate) Create(_ context.Context, t *models.Template) error {
 func (s *hsTemplate) GetByID(_ context.Context, accountID, id string) (*models.Template, error) {
 	s.h.mu.Lock()
 	defer s.h.mu.Unlock()
-	if t, ok := s.h.templates[id]; ok && t.AccountID == accountID {
+	if t, ok := s.h.templates[id]; ok && (t.AccountID == accountID || t.Public) {
 		cp := *t
 		return &cp, nil
 	}
@@ -527,12 +527,21 @@ func (s *hsTemplate) ListByAccount(_ context.Context, accountID string, _ store.
 	defer s.h.mu.Unlock()
 	out := []*models.Template{}
 	for _, t := range s.h.templates {
-		if t.AccountID == accountID {
+		if t.AccountID == accountID || t.Public {
 			cp := *t
 			out = append(out, &cp)
 		}
 	}
 	return out, nil
+}
+func (s *hsTemplate) SetPublic(_ context.Context, id string, public bool) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if t, ok := s.h.templates[id]; ok {
+		t.Public = public
+		return nil
+	}
+	return store.ErrNotFound
 }
 func (s *hsTemplate) Delete(context.Context, string, string) error { return nil }
 

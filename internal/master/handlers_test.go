@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -296,6 +297,49 @@ func (h *testHarness) seedTemplate(t *testing.T, accountID string) *models.Templ
 	return tmpl
 }
 
+// TestListTemplatesIncludesPublic exercises the dashboard-empty-dropdown
+// bug: a public template owned by one account must appear in another
+// account's listing, and the second account must be able to GET/launch
+// from it.
+func TestListTemplatesIncludesPublic(t *testing.T) {
+	h := newTestHarness(t)
+	systemID, _ := h.register(t, "system@vajra.dev", "supersecret")
+	_, freshKey := h.register(t, "fresh@vajra.dev", "supersecret")
+
+	public := &models.Template{
+		ID: "tmpl-public", AccountID: systemID, Name: "ubuntu-noble",
+		Version: "1.0", Hash: "publichash",
+		RootfsPath: "/r", KernelPath: "/k", SnapshotPath: "/s",
+		Public:    true,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := h.store.Templates().Create(context.Background(), public); err != nil {
+		t.Fatalf("seed public: %v", err)
+	}
+	private := &models.Template{
+		ID: "tmpl-private", AccountID: systemID, Name: "secret",
+		Version: "1.0", Hash: "privatehash",
+		RootfsPath: "/r", KernelPath: "/k", SnapshotPath: "/s",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := h.store.Templates().Create(context.Background(), private); err != nil {
+		t.Fatalf("seed private: %v", err)
+	}
+
+	resp, body := h.req(t, "GET", "/v1/templates", freshKey, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d body %s", resp.StatusCode, body)
+	}
+	var got []*models.Template
+	_ = json.Unmarshal(body, &got)
+	if len(got) != 1 {
+		t.Fatalf("fresh account should see exactly 1 (public) template, got %d", len(got))
+	}
+	if got[0].ID != "tmpl-public" {
+		t.Fatalf("expected public template, got %q", got[0].ID)
+	}
+}
+
 func TestCreateSandboxHappy(t *testing.T) {
 	h := newTestHarness(t)
 	accountID, key := h.register(t, "alice@example.com", "supersecret")
@@ -346,13 +390,84 @@ func TestCreateSandboxNoNode(t *testing.T) {
 	h.seedTemplate(t, accountID)
 	// Note: no node seeded.
 
-	resp, _ := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+	resp, body := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
 		"name": "demo", "source": "image", "template_id": "tmpl-1",
 		"vcpus": 2, "memory_mb": 1024, "disk_gb": 10,
 	})
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("want 503, got %d", resp.StatusCode)
+		t.Fatalf("want 503, got %d body %s", resp.StatusCode, body)
 	}
+	if !strings.Contains(string(body), "waiting for auto-scaler") {
+		t.Fatalf("503 should mention auto-scaler in the message, got %s", body)
+	}
+}
+
+// TestCreateSandboxExceedsMaxNode covers branch (1) of the new flow:
+// a request bigger than any instance the autoscaler can launch must
+// fail with 400, never 503 — no amount of scaling helps.
+func TestCreateSandboxExceedsMaxNode(t *testing.T) {
+	h := newTestHarness(t)
+	accountID, key := h.register(t, "alice@example.com", "supersecret")
+	h.seedCluster(t)
+	h.seedTemplate(t, accountID)
+	_ = accountID
+
+	resp, body := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+		"name": "demo", "source": "image", "template_id": "tmpl-1",
+		"vcpus": 128, "memory_mb": 1024, "disk_gb": 10,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for oversize request, got %d body %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "exceed maximum node capacity") {
+		t.Fatalf("400 should explain oversize, got %s", body)
+	}
+}
+
+// TestCreateSandboxAutoscaleQueues exercises the new async path: when
+// no node has capacity but the autoscaler is enabled, master must
+// persist a CREATING row and return 201 immediately rather than 503.
+// The background drive goroutine will fail (no real EC2) and flip the
+// row to ERROR — we don't care about its outcome here, only that the
+// 201 path fires.
+func TestCreateSandboxAutoscaleQueues(t *testing.T) {
+	h := newTestHarness(t)
+	accountID, key := h.register(t, "alice@example.com", "supersecret")
+	h.seedCluster(t)
+	h.seedTemplate(t, accountID)
+	// No node seeded → Schedule returns ErrNoCapacity.
+
+	// Stub the autoscaler with a fake EC2 that returns an error so the
+	// background goroutine resolves quickly. The handler must respond
+	// before that goroutine runs to completion regardless.
+	fec2 := newFakeEC2()
+	fec2.runErr = errors.New("fake ec2 unavailable")
+	cfg := AutoscaleConfig{Enabled: true, AMI: "ami-test", MaxNodes: 5}
+	h.server.handlers.Autoscaler = NewAutoscaler(
+		cfg, fec2, h.store, nil, h.server.handlers.Scheduler, asMaster())
+
+	resp, body := h.req(t, "POST", "/v1/sandboxes", key, map[string]any{
+		"name": "demo", "source": "image", "template_id": "tmpl-1",
+		"vcpus": 2, "memory_mb": 1024, "disk_gb": 10,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("want 201 with autoscale enabled, got %d body %s", resp.StatusCode, body)
+	}
+	var got sandboxWithOp
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v body=%s", err, body)
+	}
+	if got.Sandbox == nil || got.State != models.SandboxStateCreating {
+		t.Fatalf("expected state=CREATING with no node placement, got %+v", got.Sandbox)
+	}
+	if got.NodeID != nil {
+		t.Fatalf("autoscale path should leave NodeID nil until placement, got %v", *got.NodeID)
+	}
+
+	// Background drive goroutine should eventually flip to ERROR once
+	// the fake EC2 fails. Wait briefly so the goroutine clears before
+	// the test exits (and the harness tears down).
+	waitForSandboxState(t, h, accountID, got.ID, models.SandboxStateError, 3*time.Second)
 }
 
 // waitForSandboxState polls the in-memory store until the sandbox row

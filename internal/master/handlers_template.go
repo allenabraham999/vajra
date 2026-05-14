@@ -15,10 +15,8 @@ import (
 	"github.com/allenabraham999/vajra/internal/store"
 )
 
-// listTemplates returns templates owned by the calling account.
-//
-// TODO: surface "public" templates owned by a system account (e.g.
-// VAJRA_PUBLIC_ACCOUNT_ID) once that concept is wired into the schema.
+// listTemplates returns templates the caller owns plus any templates
+// marked public. The store applies that union — see TemplateStore.
 func (h *Handlers) listTemplates(w http.ResponseWriter, r *http.Request) {
 	accountID, ok := RequireAccount(w, r)
 	if !ok {
@@ -31,6 +29,36 @@ func (h *Handlers) listTemplates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// setTemplatePublic flips the public flag on a template. Admin-only
+// because making a template public exposes it to every account.
+func (h *Handlers) setTemplatePublic(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireAdmin(w, r); !ok {
+		return
+	}
+	id := pathID(r)
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "missing template id")
+		return
+	}
+	var body struct {
+		Public bool `json:"public"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.Store.Templates().SetPublic(r.Context(), id, body.Public); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "template not found")
+			return
+		}
+		h.log().Error("setTemplatePublic", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "public": body.Public})
 }
 
 // createTemplateRequest is the body of POST /v1/templates.
