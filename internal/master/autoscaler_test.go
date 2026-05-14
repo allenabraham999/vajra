@@ -149,11 +149,14 @@ func TestScaleUpOnNoCapacity(t *testing.T) {
 
 // TestMaxNodesLimit: when the node count is already at MaxNodes,
 // HandleNoCapacity must short-circuit without ever calling EC2.
+// Nodes need fresh heartbeats so they count toward the live cap;
+// managedNodeCount filters out stale rows on purpose.
 func TestMaxNodesLimit(t *testing.T) {
 	st := newTestStore(t)
 	for i := 0; i < 3; i++ {
 		_ = st.Nodes().Create(context.Background(), &models.Node{
 			ID: "n" + string(rune('0'+i)), ClusterID: "c1", State: models.NodeStateActive,
+			LastHeartbeat: time.Now().UTC(),
 		})
 	}
 	fec2 := newFakeEC2()
@@ -167,6 +170,46 @@ func TestMaxNodesLimit(t *testing.T) {
 	}
 	if atomic.LoadInt32(&fec2.runCalls) != 0 {
 		t.Fatalf("EC2 launched while at max — runCalls=%d", fec2.runCalls)
+	}
+}
+
+// TestStaleHeartbeatNodesDoNotBlockScaleUp: nodes whose last heartbeat
+// is older than staleHeartbeatThreshold must not count toward MaxNodes.
+// Without this filter zombie rows (EC2 terminated, agent crashed) pin
+// the autoscaler at capacity forever.
+func TestStaleHeartbeatNodesDoNotBlockScaleUp(t *testing.T) {
+	st := newTestStore(t)
+	stale := time.Now().Add(-time.Hour).UTC()
+	for i := 0; i < 3; i++ {
+		_ = st.Nodes().Create(context.Background(), &models.Node{
+			ID: "stale" + string(rune('0'+i)), ClusterID: "c1", State: models.NodeStateActive,
+			LastHeartbeat: stale,
+		})
+	}
+	fec2 := newFakeEC2()
+	cfg := AutoscaleConfig{Enabled: true, MaxNodes: 3, AMI: "ami-test", InstanceType: "c5.large"}
+	a := NewAutoscaler(cfg, fec2, st, cache.NewNoopCache(), stubScheduler{}, asMaster())
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = st.Nodes().Create(context.Background(), &models.Node{
+			ID: "fresh", ClusterID: "c1", State: models.NodeStateActive,
+			LastHeartbeat: time.Now().UTC(),
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	id, err := a.HandleNoCapacity(ctx,
+		createSandboxRequest{Name: "x", Source: "image", VCPUs: 1, MemoryMB: 256, DiskGB: 1, TemplateID: "t1"}, "acc1")
+	if err != nil {
+		t.Fatalf("HandleNoCapacity: %v", err)
+	}
+	if id != "fresh" {
+		t.Fatalf("got node %q, want fresh", id)
+	}
+	if atomic.LoadInt32(&fec2.runCalls) != 1 {
+		t.Fatalf("expected 1 EC2 launch (stale nodes should not block), got %d", fec2.runCalls)
 	}
 }
 
