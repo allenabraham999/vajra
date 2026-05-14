@@ -83,6 +83,10 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		WithBinary(cfg.chBinary).
 		WithSocketDir(cfg.socketDir)
 	cache := agent.NewImageCache(cfg.cacheDir, cfg.cacheMaxBytes, logger)
+	// Pre-warm rootfs.qcow2 backing for every template already on disk so
+	// the first sandbox doesn't pay the raw→qcow2 conversion tax (3-6s on
+	// a ~10G rootfs). Async so HTTP serving starts immediately.
+	go prewarmCache(cache, cfg.cacheDir, logger)
 	sandboxes := agent.NewSandboxManager(cfg.sandboxRoot, cfg.socketDir, cache, vm, nil, logger)
 	archives := agent.NewArchiveManager(sandboxes, agent.ArchiveOptions{
 		ArchiveDir: cfg.archiveDir,
@@ -249,6 +253,29 @@ func computeUsage(sandboxes []*agent.Sandbox) usageTotals {
 		u.count++
 	}
 	return u
+}
+
+// prewarmCache walks the cache directory and ensures rootfs.qcow2 exists
+// for every hash present, so the first sandbox per template doesn't wait
+// for the raw→qcow2 conversion. Skips entries whose name doesn't look
+// like a content hash and logs (not fatal) on individual failures.
+func prewarmCache(cache *agent.ImageCache, dir string, logger *slog.Logger) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		logger.Warn("prewarm: read cache dir", "dir", dir, "err", err)
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !cache.HasTemplate(e.Name()) {
+			continue
+		}
+		start := time.Now()
+		if err := cache.EnsureRootfsBacking(e.Name()); err != nil {
+			logger.Warn("prewarm: EnsureRootfsBacking", "hash", e.Name(), "err", err)
+			continue
+		}
+		logger.Info("prewarm: qcow2 backing ready", "hash", e.Name(), "elapsed_ms", time.Since(start).Milliseconds())
+	}
 }
 
 // primaryIP returns the first non-loopback IPv4 address on the host. We
