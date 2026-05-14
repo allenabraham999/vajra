@@ -152,9 +152,10 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"POST /v1/webhooks/{id}/test": h.testWebhook,
 
 		// Admin
-		"GET /v1/clusters":           h.listClusters,
-		"GET /v1/nodes":              h.listNodes,
-		"POST /v1/nodes/{id}/drain":  h.drainNode,
+		"GET /v1/clusters":                 h.listClusters,
+		"GET /v1/nodes":                    h.listNodes,
+		"POST /v1/nodes/{id}/drain":        h.drainNode,
+		"PATCH /v1/admin/templates/{id}":   h.setTemplatePublic,
 
 		// Admin: autoscaler
 		"GET /v1/admin/autoscale":          h.getAutoscaleStatus,
@@ -176,6 +177,7 @@ func (s *Server) internalRoutes() map[string]http.HandlerFunc {
 		"POST /internal/sandboxes/{id}/unhealthy": h.sandboxUnhealthyAlias,
 		"GET /internal/proxy/route":               h.proxyRoute,
 		"GET /internal/proxy/validate-share":      h.validateShare,
+		"GET /internal/binaries/{name}":           h.serveBinary,
 	}
 }
 

@@ -30,8 +30,12 @@ const (
 	// the post-restore wait tight without flooding the CH API server.
 	VMStatePollInterval = 10 * time.Millisecond
 	// DefaultPollTimeout bounds how long we wait for the API socket on
-	// spawn/restore before giving up.
-	DefaultPollTimeout = 5 * time.Second
+	// spawn/restore before giving up. Generous enough to cover cold-page-
+	// cache first-restore on a freshly-booted node where reading the
+	// snapshot's memory-ranges file can take 25-30s from cold EBS gp2;
+	// warm-cache restores still complete in ~160ms so the ceiling has no
+	// cost there.
+	DefaultPollTimeout = 90 * time.Second
 	// DefaultShutdownGrace is the total wall-clock budget DestroyVM gives
 	// the VMM to exit cleanly (vmm.shutdown + process exit combined)
 	// before SIGKILL.

@@ -13,7 +13,10 @@ import (
 )
 
 // DefaultRequestTimeout is the per-request hard ceiling used by NewClient.
-const DefaultRequestTimeout = 5 * time.Second
+// 30s accommodates cold-cache restore on freshly-launched nodes where a
+// single /vm.info round-trip can stall while CH faults in a ~500 MB
+// memory-ranges file from cold EBS; warm-path calls return in <10ms.
+const DefaultRequestTimeout = 30 * time.Second
 
 // apiBase is a placeholder host. The Unix-socket transport ignores host and
 // port; the path portion is what matters.

@@ -306,6 +306,70 @@ func TestHandleNoCapacityDisabled(t *testing.T) {
 	}
 }
 
+// TestInstanceTypeForResources locks the ladder mapping from the brief
+// so a future edit can't silently shrink what we'll launch.
+func TestInstanceTypeForResources(t *testing.T) {
+	cases := []struct {
+		vcpu, mem int
+		want      string
+	}{
+		{1, 1024, "c8i.large"},
+		{2, 2048, "c8i.large"},
+		{2, 4096, "c8i.large"},
+		{3, 4097, "c8i.xlarge"},
+		{4, 8192, "c8i.xlarge"},
+		{5, 8192, "c8i.2xlarge"},
+		{8, 16384, "c8i.2xlarge"},
+		{9, 16384, "c8i.4xlarge"},
+		{16, 32768, "c8i.4xlarge"},
+		{17, 1024, ""},        // exceeds ceiling on vCPU
+		{1, 32769, ""},        // exceeds ceiling on memory
+		{128, 256 * 1024, ""}, // way past the ceiling
+	}
+	for _, c := range cases {
+		got := instanceTypeForResources(c.vcpu, c.mem)
+		if got != c.want {
+			t.Errorf("instanceTypeForResources(%d, %d) = %q, want %q",
+				c.vcpu, c.mem, got, c.want)
+		}
+	}
+}
+
+// TestExceedsAnyNodeCapacity verifies the handler-side check the brief
+// asks for: 128 vCPU is rejected up front, whereas anything inside the
+// ladder ceiling is allowed.
+func TestExceedsAnyNodeCapacity(t *testing.T) {
+	if ExceedsAnyNodeCapacity(16, 32*1024) {
+		t.Fatal("ladder ceiling reported as exceeding capacity")
+	}
+	if !ExceedsAnyNodeCapacity(128, 1024) {
+		t.Fatal("128 vCPU request should be flagged as oversize")
+	}
+	if !ExceedsAnyNodeCapacity(2, 256*1024) {
+		t.Fatal("256 GB request should be flagged as oversize")
+	}
+}
+
+// TestPickInstanceTypeFromQueue covers the resource-aware ladder pick:
+// the autoscaler must launch a node large enough for the biggest
+// queued waiter, not just the most recent one.
+func TestPickInstanceTypeFromQueue(t *testing.T) {
+	a := &Autoscaler{Config: AutoscaleConfig{}, logger: asMaster(), now: time.Now}
+	a.pendingQueue = []*PendingCreate{
+		{Request: createSandboxRequest{VCPUs: 2, MemoryMB: 2 * 1024}},
+		{Request: createSandboxRequest{VCPUs: 8, MemoryMB: 8 * 1024}},
+		{Request: createSandboxRequest{VCPUs: 1, MemoryMB: 512}},
+	}
+	if got := a.pickInstanceType(); got != "c8i.2xlarge" {
+		t.Fatalf("biggest waiter is 8/8 — want c8i.2xlarge, got %q", got)
+	}
+
+	a.Config.InstanceType = "c5.large"
+	if got := a.pickInstanceType(); got != "c5.large" {
+		t.Fatalf("operator override should win, got %q", got)
+	}
+}
+
 // Stop bound for the wait loop so tests don't run for 5 minutes when
 // the goroutine that creates the node never fires. We close ctx in
 // the test path, so this is just defence in depth.

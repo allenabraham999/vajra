@@ -39,6 +39,12 @@ type EC2API interface {
 
 // AutoscaleConfig captures every knob the autoscaler reads. Enabled is
 // the master switch; the rest only matters when Enabled is true.
+//
+// InstanceType is treated as an override: when set, every scale-up uses
+// that exact type. When empty, the autoscaler picks the smallest type
+// from instanceLadder that fits the requested sandbox resources, so a
+// user asking for 8 vCPU on a host with only a c8i.large lights up a
+// c6i.2xlarge instead of a too-small c8i.large.
 type AutoscaleConfig struct {
 	Enabled       bool
 	AMI           string
@@ -54,10 +60,20 @@ type AutoscaleConfig struct {
 	MaxNodes      int
 	CooldownMins  int
 	S3Bucket      string
+	// RootVolumeGB overrides the AMI's default root volume size. 0 means
+	// inherit the AMI snapshot's size; a positive value resizes the root
+	// gp3 volume so sandboxes that request disk_gb > AMI-free-space have
+	// somewhere to land. Filesystem growth on first boot is handled by
+	// cloud-init's growpart module, which Ubuntu cloud images enable by
+	// default.
+	RootVolumeGB int
 }
 
 // withDefaults fills in unset numeric knobs so callers don't have to
-// remember the defaults documented in the brief.
+// remember the defaults documented in the brief. InstanceType is
+// intentionally left empty so scaleUp falls through to the resource-fit
+// ladder; setting a default here would silently override resource-aware
+// selection.
 func (c AutoscaleConfig) withDefaults() AutoscaleConfig {
 	if c.MinNodes == 0 {
 		c.MinNodes = 1
@@ -68,10 +84,73 @@ func (c AutoscaleConfig) withDefaults() AutoscaleConfig {
 	if c.CooldownMins == 0 {
 		c.CooldownMins = 15
 	}
-	if c.InstanceType == "" {
-		c.InstanceType = "c8i.large"
-	}
 	return c
+}
+
+// instanceSpec describes one rung of the resource-fit ladder.
+type instanceSpec struct {
+	Type     string
+	VCPUs    int
+	MemoryMB int
+}
+
+// instanceLadder is the ordered list of supported EC2 types, smallest
+// first. instanceTypeForResources picks the first rung that fits the
+// request. The ceiling (c6i.4xlarge) caps what a single sandbox can ask
+// for — requests above that are rejected at the handler with 400 since
+// no single node we know how to launch could host them.
+//
+// The brief defines this mapping explicitly. Keep entries sorted by
+// VCPUs (then MemoryMB) so the linear scan stays correct.
+var instanceLadder = []instanceSpec{
+	{Type: "c8i.large", VCPUs: 2, MemoryMB: 4 * 1024},
+	{Type: "c8i.xlarge", VCPUs: 4, MemoryMB: 8 * 1024},
+	{Type: "c8i.2xlarge", VCPUs: 8, MemoryMB: 16 * 1024},
+	{Type: "c8i.4xlarge", VCPUs: 16, MemoryMB: 32 * 1024},
+}
+
+// instanceTypeForResources returns the smallest instance type in
+// instanceLadder that can host a sandbox of (vcpus, memoryMB). Returns
+// "" when no rung fits — callers translate that into a 400 because no
+// scale-up will help.
+func instanceTypeForResources(vcpus, memoryMB int) string {
+	for _, spec := range instanceLadder {
+		if spec.VCPUs >= vcpus && spec.MemoryMB >= memoryMB {
+			return spec.Type
+		}
+	}
+	return ""
+}
+
+// maxNodeVCPUs and maxNodeMemoryMB are the ceiling of instanceLadder.
+// Used by handlers to short-circuit oversize requests before they hit
+// the queue. Kept as functions so the values track the slice if anyone
+// edits the ladder.
+func maxNodeVCPUs() int {
+	out := 0
+	for _, s := range instanceLadder {
+		if s.VCPUs > out {
+			out = s.VCPUs
+		}
+	}
+	return out
+}
+
+func maxNodeMemoryMB() int {
+	out := 0
+	for _, s := range instanceLadder {
+		if s.MemoryMB > out {
+			out = s.MemoryMB
+		}
+	}
+	return out
+}
+
+// ExceedsAnyNodeCapacity reports whether (vcpus, memoryMB) is larger
+// than any instance the autoscaler can launch. Exported so handlers can
+// classify the request as "too big to ever fit" vs "wait for capacity".
+func ExceedsAnyNodeCapacity(vcpus, memoryMB int) bool {
+	return vcpus > maxNodeVCPUs() || memoryMB > maxNodeMemoryMB()
 }
 
 // Autoscaler owns the pending-request queue and the EC2 client. Single
@@ -163,6 +242,10 @@ func (a *Autoscaler) HandleNoCapacity(ctx context.Context, req createSandboxRequ
 	}
 	a.mu.Unlock()
 	if startScale {
+		// scaleUp inspects the queue under its own lock to pick a type
+		// large enough for the biggest waiter; we don't pass it through
+		// the channel so a late-arriving big request can still upgrade
+		// the launch decision if it lands before scaleUp starts.
 		go a.scaleUp(context.Background())
 	}
 
@@ -174,6 +257,36 @@ func (a *Autoscaler) HandleNoCapacity(ctx context.Context, req createSandboxRequ
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// pickInstanceType decides which EC2 type to launch. Config.InstanceType
+// (the operator override) wins when set; otherwise we look at the
+// largest queued request and pick the smallest ladder rung that fits
+// it. Picking the biggest waiter is deliberate: one too-small node
+// would leave that waiter stuck even though smaller waiters would have
+// been fine.
+func (a *Autoscaler) pickInstanceType() string {
+	if a.Config.InstanceType != "" {
+		return a.Config.InstanceType
+	}
+	a.mu.Lock()
+	maxVCPU, maxMem := 0, 0
+	for _, pc := range a.pendingQueue {
+		if pc.Request.VCPUs > maxVCPU {
+			maxVCPU = pc.Request.VCPUs
+		}
+		if pc.Request.MemoryMB > maxMem {
+			maxMem = pc.Request.MemoryMB
+		}
+	}
+	a.mu.Unlock()
+	if maxVCPU == 0 && maxMem == 0 {
+		// No queued requests (e.g. admin-triggered scale-up). Fall back
+		// to the smallest rung; operators who want a specific size set
+		// InstanceType explicitly.
+		return instanceLadder[0].Type
+	}
+	return instanceTypeForResources(maxVCPU, maxMem)
 }
 
 // scaleUp launches a single EC2 instance, waits for the agent to
@@ -197,17 +310,26 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 		return
 	}
 
+	instType := a.pickInstanceType()
+	if instType == "" {
+		a.broadcastError(fmt.Errorf("autoscale: no instance type fits queued requests"))
+		return
+	}
 	userData := a.buildUserData()
 	tagName := fmt.Sprintf("vajra-node-%d", a.now().Unix())
 	in := &ec2.RunInstancesInput{
 		ImageId:          aws.String(a.Config.AMI),
-		InstanceType:     ec2types.InstanceType(a.Config.InstanceType),
+		InstanceType:     ec2types.InstanceType(instType),
 		MinCount:         aws.Int32(1),
 		MaxCount:         aws.Int32(1),
 		KeyName:          stringOrNil(a.Config.KeyPair),
 		SecurityGroupIds: nonEmptySlice(a.Config.SecurityGroup),
 		SubnetId:         stringOrNil(a.Config.SubnetID),
 		UserData:         aws.String(base64.StdEncoding.EncodeToString([]byte(userData))),
+		CpuOptions: &ec2types.CpuOptionsRequest{
+			NestedVirtualization: ec2types.NestedVirtualizationSpecificationEnabled,
+		},
+		BlockDeviceMappings: a.rootVolumeMapping(),
 		TagSpecifications: []ec2types.TagSpecification{{
 			ResourceType: ec2types.ResourceTypeInstance,
 			Tags: []ec2types.Tag{
@@ -217,7 +339,7 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 		}},
 	}
 
-	a.logger.Info("autoscale: launching ec2 instance", "ami", a.Config.AMI, "type", a.Config.InstanceType)
+	a.logger.Info("autoscale: launching ec2 instance", "ami", a.Config.AMI, "type", instType)
 	out, err := a.ec2Client.RunInstances(ctx, in)
 	if err != nil {
 		a.broadcastError(fmt.Errorf("autoscale: run instances: %w", err))
@@ -454,40 +576,45 @@ func lastActivityForNode(n *models.Node, sandboxes []*models.Sandbox) time.Time 
 }
 
 // buildUserData assembles the cloud-init bash script that gets the
-// agent running on a freshly launched instance. We pull binaries from
-// S3 to skip building from source on the fly. Everything is plain
-// bash so it works on any ubuntu-flavoured AMI without preinstalling.
+// agent running on a freshly launched instance. Binaries are pulled
+// from master's /internal/binaries/{name} endpoint (Bearer-authed with
+// the shared agent secret) — this avoids needing public S3 or an IAM
+// instance profile on every node. CPU/MEM/DISK are computed inline
+// so the rendered systemd unit holds concrete numbers, not literal
+// $(nproc) which neither bash heredocs (single-quoted) nor systemd's
+// Environment= will expand.
 func (a *Autoscaler) buildUserData() string {
-	region := a.Config.Region
-	if region == "" {
-		region = "us-east-1"
-	}
 	return fmt.Sprintf(`#!/bin/bash
-set -e
+set -eux
 apt-get update && apt-get install -y wget
-wget -q https://%[1]s.s3.%[2]s.amazonaws.com/binaries/cloud-hypervisor -O /usr/local/bin/cloud-hypervisor
+AUTH="Authorization: Bearer %[2]s"
+wget -q --header="$AUTH" %[1]s/internal/binaries/cloud-hypervisor -O /usr/local/bin/cloud-hypervisor
 chmod +x /usr/local/bin/cloud-hypervisor
-wget -q https://%[1]s.s3.%[2]s.amazonaws.com/binaries/vajra-agent -O /usr/local/bin/vajra-agent
+wget -q --header="$AUTH" %[1]s/internal/binaries/vajra-agent -O /usr/local/bin/vajra-agent
 chmod +x /usr/local/bin/vajra-agent
 mkdir -p /var/lib/vajra/cache /var/lib/vajra/sandboxes /tmp/vajra/sockets
-cat > /etc/systemd/system/vajra-agent.service <<'SVCEOF'
+CPU=$(nproc)
+MEM=$(free -m | awk '/Mem:/{print $2}')
+DISK=$(df -BG / | awk 'NR==2{print $4}' | tr -d 'G')
+cat > /etc/systemd/system/vajra-agent.service <<SVCEOF
 [Unit]
 Description=Vajra Agent
 After=network.target
 [Service]
 ExecStart=/usr/local/bin/vajra-agent
-Environment=VAJRA_AGENT_MASTER_URL=%[3]s
-Environment=VAJRA_AGENT_API_KEY=%[4]s
-Environment=VAJRA_AGENT_CLUSTER_ID=%[5]s
-Environment=VAJRA_AGENT_TOTAL_CPU=$(nproc)
-Environment=VAJRA_AGENT_TOTAL_MEMORY_MB=$(free -m | awk '/Mem:/{print $2}')
-Environment=VAJRA_AGENT_TOTAL_DISK_GB=$(df -BG / | awk 'NR==2{print $4}' | tr -d 'G')
+Environment=VAJRA_AGENT_MASTER_URL=%[1]s
+Environment=VAJRA_AGENT_API_KEY=%[2]s
+Environment=VAJRA_AGENT_CLUSTER_ID=%[3]s
+Environment=VAJRA_AGENT_TOTAL_CPU=${CPU}
+Environment=VAJRA_AGENT_TOTAL_MEMORY_MB=${MEM}
+Environment=VAJRA_AGENT_TOTAL_DISK_GB=${DISK}
 Restart=always
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-systemctl enable vajra-agent && systemctl start vajra-agent
-`, a.Config.S3Bucket, region, a.Config.MasterURL, a.Config.AgentSecret, a.Config.ClusterID)
+systemctl daemon-reload
+systemctl enable --now vajra-agent
+`, a.Config.MasterURL, a.Config.AgentSecret, a.Config.ClusterID)
 }
 
 // AutoscaleStatus is the body of GET /v1/admin/autoscale.
@@ -539,6 +666,27 @@ func (a *Autoscaler) Trigger(ctx context.Context) error {
 	a.mu.Unlock()
 	go a.scaleUp(context.Background())
 	return nil
+}
+
+// rootVolumeMapping returns the BlockDeviceMappings RunInstances input
+// needed to resize the AMI's root device. Returns nil when RootVolumeGB
+// is zero so the AMI's default volume sizing wins. Hardcodes /dev/sda1
+// + gp3 because every Ubuntu-cloud AMI we ship from uses that device
+// name, and gp3 gives 3000 baseline IOPS at no extra cost vs gp2 — the
+// cold-snapshot read path is bandwidth-bound so this materially shrinks
+// first-restore latency.
+func (a *Autoscaler) rootVolumeMapping() []ec2types.BlockDeviceMapping {
+	if a.Config.RootVolumeGB <= 0 {
+		return nil
+	}
+	return []ec2types.BlockDeviceMapping{{
+		DeviceName: aws.String("/dev/sda1"),
+		Ebs: &ec2types.EbsBlockDevice{
+			VolumeSize:          aws.Int32(int32(a.Config.RootVolumeGB)),
+			VolumeType:          ec2types.VolumeTypeGp3,
+			DeleteOnTermination: aws.Bool(true),
+		},
+	}}
 }
 
 // stringOrNil returns nil for "" so the AWS SDK doesn't reject empty

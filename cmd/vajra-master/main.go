@@ -100,14 +100,20 @@ func loadConfig() (*config, error) {
 
 	cfg.RedisURL = os.Getenv("REDIS_URL")
 	cfg.NATSURL = os.Getenv("NATS_URL")
+	// Autoscaler env vars come in short and long flavours so operators
+	// can pick whichever they prefer. Short names (the ones in the
+	// brief) win when set; the longer forms are kept so existing .envs
+	// keep working. InstanceType defaults to empty: that lets the
+	// autoscaler size each new node from the request ladder
+	// (instanceTypeForResources). Set it explicitly only to pin a type.
 	cfg.Autoscale = master.AutoscaleConfig{
 		Enabled:       os.Getenv("VAJRA_AUTOSCALE_ENABLED") == "true",
 		AMI:           os.Getenv("VAJRA_AUTOSCALE_AMI"),
-		InstanceType:  getenvDefault("VAJRA_AUTOSCALE_INSTANCE_TYPE", "c8i.large"),
+		InstanceType:  os.Getenv("VAJRA_AUTOSCALE_INSTANCE_TYPE"),
 		Region:        getenvDefault("VAJRA_AUTOSCALE_REGION", "us-east-1"),
-		SecurityGroup: os.Getenv("VAJRA_AUTOSCALE_SECURITY_GROUP"),
-		KeyPair:       os.Getenv("VAJRA_AUTOSCALE_KEY_PAIR"),
-		SubnetID:      os.Getenv("VAJRA_AUTOSCALE_SUBNET_ID"),
+		SecurityGroup: firstNonEmpty("VAJRA_AUTOSCALE_SG", "VAJRA_AUTOSCALE_SECURITY_GROUP"),
+		KeyPair:       firstNonEmpty("VAJRA_AUTOSCALE_KEY", "VAJRA_AUTOSCALE_KEY_PAIR"),
+		SubnetID:      firstNonEmpty("VAJRA_AUTOSCALE_SUBNET", "VAJRA_AUTOSCALE_SUBNET_ID"),
 		MasterURL:     os.Getenv("VAJRA_AUTOSCALE_MASTER_URL"),
 		AgentSecret:   cfg.AgentSharedSecret,
 		ClusterID:     getenvDefault("VAJRA_AUTOSCALE_CLUSTER_ID", "cluster-1"),
@@ -123,12 +129,29 @@ func loadConfig() (*config, error) {
 			cfg.Autoscale.MaxNodes = n
 		}
 	}
-	if v := os.Getenv("VAJRA_AUTOSCALE_COOLDOWN_MINS"); v != "" {
+	if v := firstNonEmpty("VAJRA_AUTOSCALE_COOLDOWN", "VAJRA_AUTOSCALE_COOLDOWN_MINS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Autoscale.CooldownMins = n
 		}
 	}
+	if v := os.Getenv("VAJRA_AUTOSCALE_ROOT_VOLUME_GB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.RootVolumeGB = n
+		}
+	}
 	return cfg, nil
+}
+
+// firstNonEmpty returns the value of the first env var in keys whose
+// value is non-empty, or "" when all are unset. Used to support short
+// (brief-style) and long (legacy) names for the same setting.
+func firstNonEmpty(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // getenvDefault returns os.Getenv(key) or fallback when unset.
@@ -204,6 +227,7 @@ func main() {
 	handlers.Version = cfg.Version
 	handlers.AgentSharedSecret = cfg.AgentSharedSecret
 	handlers.PublicBaseDomain = cfg.PublicBaseDomain
+	handlers.BinaryDir = os.Getenv("VAJRA_BINARY_DIR")
 	handlers.Cache = c
 	handlers.Bus = bus
 

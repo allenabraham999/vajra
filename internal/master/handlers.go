@@ -91,6 +91,12 @@ type Handlers struct {
 	// empty means the master will return a token but not a URL.
 	PublicBaseDomain string
 
+	// BinaryDir is the directory whose files are served from
+	// GET /internal/binaries/{name}. Used by autoscaler-launched
+	// agents to bootstrap themselves without needing public S3 or an
+	// IAM instance profile. Empty disables the endpoint with 404.
+	BinaryDir string
+
 	// Now is overridable in tests so JWT expiry and operation timestamps
 	// are deterministic. Production wires this to time.Now.
 	Now func() time.Time
