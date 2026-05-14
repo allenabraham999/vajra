@@ -83,6 +83,15 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		WithBinary(cfg.chBinary).
 		WithSocketDir(cfg.socketDir)
 	cache := agent.NewImageCache(cfg.cacheDir, cfg.cacheMaxBytes, logger)
+	// Synchronously build the qcow2 backing for the configured pool
+	// template so the first sandbox out of the pool doesn't pay the 3-6s
+	// raw→qcow2 conversion tax. Best-effort: if the template isn't on
+	// disk yet we just warn and let the async prewarm pick it up later.
+	if cfg.poolTemplate != "" {
+		if err := cache.EnsureRootfsBacking(cfg.poolTemplate); err != nil {
+			logger.Warn("prewarm pool template", "template", cfg.poolTemplate, "err", err)
+		}
+	}
 	// Pre-warm rootfs.qcow2 backing for every template already on disk so
 	// the first sandbox doesn't pay the raw→qcow2 conversion tax (3-6s on
 	// a ~10G rootfs). Async so HTTP serving starts immediately.

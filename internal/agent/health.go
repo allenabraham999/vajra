@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 )
 
@@ -18,19 +17,19 @@ type MasterNotifier interface {
 	NotifyUnhealthy(ctx context.Context, sandboxID string, reason string)
 }
 
-// HealthChecker periodically pings every running sandbox over vsock. A
-// missed probe flips the sandbox to UNHEALTHY and fires NotifyUnhealthy
-// once per state transition (not on every subsequent failed probe).
+// HealthChecker periodically pings every running sandbox over vsock.
+// Probe failures are logged but do NOT change sandbox state — the vsock
+// guest agent can be unresponsive (or slow) while the VM itself is
+// healthy, and the reconciler must not destroy working sandboxes on the
+// strength of a missed ping.
 type HealthChecker struct {
 	sandboxes *SandboxManager
 	notifier  MasterNotifier
 	interval  time.Duration
 	logger    *slog.Logger
 
-	mu           sync.Mutex
-	lastNotified map[string]bool
-	stop         chan struct{}
-	done         chan struct{}
+	stop chan struct{}
+	done chan struct{}
 }
 
 // NewHealthChecker constructs a checker. interval <= 0 falls back to
@@ -48,13 +47,12 @@ func NewHealthChecker(
 		logger = slog.Default()
 	}
 	return &HealthChecker{
-		sandboxes:    sandboxes,
-		notifier:     notifier,
-		interval:     interval,
-		logger:       logger,
-		lastNotified: map[string]bool{},
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
+		sandboxes: sandboxes,
+		notifier:  notifier,
+		interval:  interval,
+		logger:    logger,
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -96,23 +94,12 @@ func (h *HealthChecker) probeAll(ctx context.Context) {
 		if sb.State != SandboxStateRunning {
 			continue
 		}
-		err := h.sandboxes.HealthCheck(ctx, sb.ID)
-		h.mu.Lock()
-		wasNotified := h.lastNotified[sb.ID]
-		h.mu.Unlock()
-		if err != nil && !wasNotified {
-			h.logger.Warn("sandbox unhealthy", "id", sb.ID, "err", err)
-			if h.notifier != nil {
-				h.notifier.NotifyUnhealthy(ctx, sb.ID, err.Error())
-			}
-			h.mu.Lock()
-			h.lastNotified[sb.ID] = true
-			h.mu.Unlock()
-		} else if err == nil && wasNotified {
-			h.logger.Info("sandbox recovered", "id", sb.ID)
-			h.mu.Lock()
-			delete(h.lastNotified, sb.ID)
-			h.mu.Unlock()
+		id := sb.ID
+		if err := h.sandboxes.HealthCheck(ctx, id); err != nil {
+			h.logger.Warn("health probe failed, VM may still be running", "sandbox_id", id, "err", err)
+			// Don't mark as unhealthy — just log. The vsock guest agent
+			// can stall while the VM itself is fine; flipping state here
+			// would cause the reconciler to destroy working sandboxes.
 		}
 	}
 }

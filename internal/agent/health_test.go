@@ -26,11 +26,14 @@ func (r *recordingNotifier) snap() []string {
 	return out
 }
 
-func TestHealthCheckerNotifiesOnceWhenUnhealthy(t *testing.T) {
+// TestHealthCheckerDoesNotNotifyOnProbeFailure pins the contract that a
+// failed vsock probe is only logged — the health loop never fires
+// NotifyUnhealthy. The VM may still be running fine; signalling "unhealthy"
+// here used to let the reconciler destroy working sandboxes.
+func TestHealthCheckerDoesNotNotifyOnProbeFailure(t *testing.T) {
 	mgr, _, cacheDir := newTestManager(t)
 	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
-	sb, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash})
-	if err != nil {
+	if _, err := mgr.CreateSandbox(context.Background(), CreateRequest{TemplateHash: hash}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// noopDialer always errors, so probes will fail.
@@ -40,15 +43,11 @@ func TestHealthCheckerNotifiesOnceWhenUnhealthy(t *testing.T) {
 	defer cancel()
 	hc.Start(ctx)
 
-	// Wait for at least three probe cycles.
+	// Wait for several probe cycles to elapse.
 	time.Sleep(60 * time.Millisecond)
 	hc.Stop()
 
-	events := notifier.snap()
-	if len(events) != 1 {
-		t.Fatalf("expected exactly one unhealthy notification, got %d: %v", len(events), events)
-	}
-	if got, _ := mgr.Get(sb.ID); got.Healthy {
-		t.Fatalf("expected sandbox marked unhealthy")
+	if events := notifier.snap(); len(events) != 0 {
+		t.Fatalf("expected no unhealthy notifications, got %d: %v", len(events), events)
 	}
 }
