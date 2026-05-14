@@ -159,7 +159,7 @@ export default function UsagePage() {
                 title={`${d.date}: $${d.cost.toFixed(4)}`}
               >
                 <div
-                  className="bg-emerald-500/40 group-hover:bg-emerald-400 transition-colors rounded-t-sm"
+                  className="bg-teal-500/40 group-hover:bg-teal-400 transition-colors rounded-t-sm"
                   style={{ height: `${Math.max(2, (d.cost / maxDaily) * 100)}%` }}
                 />
               </div>
@@ -192,7 +192,7 @@ export default function UsagePage() {
               </thead>
               <tbody>
                 {view.rows.map((r) => (
-                  <tr key={r.sandbox_id} className="border-b border-zinc-900/50 hover:bg-zinc-900/40">
+                  <tr key={r.sandbox_id} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td className="px-4 py-2 font-medium">{r.sandbox_name}</td>
                     <td className="px-4 py-2 text-zinc-400 text-xs font-mono">
                       {r.vcpus ?? 0} vCPU · {memMB(r.memory_mb ?? 0)} · {r.disk_gb ?? 0} GB
@@ -200,7 +200,7 @@ export default function UsagePage() {
                     <td className="px-4 py-2 text-right text-zinc-300 font-mono text-xs tabular-nums">
                       {(r.duration_hours ?? 0).toFixed(2)}
                     </td>
-                    <td className="px-4 py-2 text-right text-emerald-300 font-mono text-xs tabular-nums">
+                    <td className="px-4 py-2 text-right text-teal-300 font-mono text-xs tabular-nums">
                       ${(r.cost_usd ?? 0).toFixed(4)}
                     </td>
                   </tr>
@@ -216,7 +216,7 @@ export default function UsagePage() {
 
 function BillingTile({ label, value, subtle }: { label: string; value: string; subtle?: string }) {
   return (
-    <div className="rounded-lg border border-zinc-900 bg-zinc-900/40 p-4">
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 p-4">
       <div className="text-[11px] text-zinc-500 uppercase tracking-wider font-mono">{label}</div>
       <div className="mt-2 text-2xl font-semibold tabular-nums">{value}</div>
       {subtle && <div className="mt-1 text-[11px] text-zinc-500">{subtle}</div>}

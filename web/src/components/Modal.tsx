@@ -24,12 +24,14 @@ export default function Modal({ open, onClose, title, children, size = 'md' }: P
   const w = size === 'sm' ? 'max-w-sm' : size === 'lg' ? 'max-w-2xl' : 'max-w-md'
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-24 bg-black/70 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-start justify-center pt-24 bg-black/70 backdrop-blur-md animate-fade-in"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div className={`w-full ${w} rounded-lg border border-zinc-800 bg-zinc-900 shadow-2xl`}>
+      <div
+        className={`w-full ${w} rounded-xl border border-zinc-800 bg-zinc-900/95 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.8)] animate-slide-up`}
+      >
         <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
           <h3 className="text-sm font-medium text-zinc-100">{title}</h3>
           <button

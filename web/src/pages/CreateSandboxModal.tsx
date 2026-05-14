@@ -135,7 +135,7 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
                 onClick={() => setSource(s)}
                 className={`flex-1 py-1.5 text-xs uppercase tracking-wider font-mono ${
                   source === s
-                    ? 'bg-emerald-500/15 text-emerald-300'
+                    ? 'bg-teal-500/15 text-teal-300'
                     : 'text-zinc-500 hover:text-zinc-200'
                 }`}
               >
@@ -254,7 +254,7 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
           <button
             type="submit"
             disabled={busy}
-            className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+            className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
           >
             {busy && <Spinner size={14} />}
             Create
@@ -266,7 +266,7 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
 }
 
 const inputCls =
-  'w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/30'
+  'w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/30'
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

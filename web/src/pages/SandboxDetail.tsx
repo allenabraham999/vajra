@@ -125,7 +125,7 @@ export default function SandboxDetailPage() {
               onClick={() => setTab(t)}
               className={`px-3 py-2 text-xs uppercase tracking-wider font-mono transition-colors ${
                 tab === t
-                  ? 'text-emerald-300 border-b-2 border-emerald-500'
+                  ? 'text-teal-300 border-b-2 border-teal-500'
                   : 'text-zinc-500 hover:text-zinc-200 border-b-2 border-transparent'
               }`}
             >
@@ -263,7 +263,7 @@ function TerminalTab({ sandboxId, state }: { sandboxId: string; state: string })
       <div className="flex items-center justify-between text-xs">
         <span className="text-zinc-500">
           {connected ? (
-            <span className="text-emerald-400 font-mono">● connected</span>
+            <span className="text-teal-400 font-mono">● connected</span>
           ) : (
             <span className="text-zinc-500 font-mono">○ disconnected</span>
           )}
@@ -312,12 +312,12 @@ function ExecTab({ sandboxId }: { sandboxId: string }) {
             }
           }}
           placeholder="bash -c 'echo hello'"
-          className="flex-1 rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/30"
+          className="flex-1 rounded-md bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm font-mono focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/30"
         />
         <button
           onClick={run}
           disabled={busy || !cmd.trim()}
-          className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-4 py-2 text-sm font-medium flex items-center gap-1.5"
+          className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-4 py-2 text-sm font-medium flex items-center gap-1.5"
         >
           {busy && <Spinner size={14} />} Run
         </button>
@@ -333,7 +333,7 @@ function ExecTab({ sandboxId }: { sandboxId: string }) {
             <div key={i} className="rounded-lg border border-zinc-900 bg-zinc-950/60 overflow-hidden">
               <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-900 text-xs font-mono">
                 <div className="flex items-center gap-2">
-                  <span className="text-emerald-400">$</span>
+                  <span className="text-teal-400">$</span>
                   <span className="text-zinc-300">{h.cmd}</span>
                 </div>
                 <div className="flex items-center gap-2 text-zinc-500">
@@ -341,7 +341,7 @@ function ExecTab({ sandboxId }: { sandboxId: string }) {
                   <span
                     className={`rounded px-1.5 py-0.5 ${
                       h.res.exit_code === 0
-                        ? 'bg-emerald-500/15 text-emerald-300'
+                        ? 'bg-teal-500/15 text-teal-300'
                         : 'bg-red-500/15 text-red-300'
                     }`}
                   >
@@ -415,7 +415,7 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
           value={path}
           onChange={(e) => setPath(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && load()}
-          className="flex-1 rounded-md bg-zinc-950 border border-zinc-800 px-3 py-1.5 text-sm font-mono focus:border-emerald-600 focus:outline-none"
+          className="flex-1 rounded-md bg-zinc-950 border border-zinc-800 px-3 py-1.5 text-sm font-mono focus:border-teal-600 focus:outline-none"
         />
         <button
           onClick={() => load()}
@@ -426,7 +426,7 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
         <input ref={fileInputRef} type="file" hidden onChange={onUpload} />
         <button
           onClick={() => fileInputRef.current?.click()}
-          className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+          className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
         >
           <Upload size={14} /> Upload
         </button>
@@ -453,10 +453,10 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
               {items.map((f) => {
                 const full = (path.endsWith('/') ? path : path + '/') + f.name
                 return (
-                  <tr key={f.path} className="border-b border-zinc-900/50 hover:bg-zinc-900/40">
+                  <tr key={f.path} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td
                       className={`px-4 py-2 font-mono text-xs ${
-                        f.is_dir ? 'text-emerald-300 cursor-pointer' : 'text-zinc-200'
+                        f.is_dir ? 'text-teal-300 cursor-pointer' : 'text-zinc-200'
                       }`}
                       onClick={() => {
                         if (f.is_dir) setPath(full)
@@ -554,7 +554,7 @@ function SnapshotsTab({ sandboxId, sandboxName }: { sandboxId: string; sandboxNa
         <button
           onClick={takeSnapshot}
           disabled={busy}
-          className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+          className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium"
         >
           {busy ? <Spinner size={14} /> : <Camera size={14} />}
           New snapshot
@@ -577,7 +577,7 @@ function SnapshotsTab({ sandboxId, sandboxName }: { sandboxId: string; sandboxNa
             </thead>
             <tbody>
               {items.map((s) => (
-                <tr key={s.id} className="border-b border-zinc-900/50 hover:bg-zinc-900/40">
+                <tr key={s.id} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                   <td className="px-4 py-2 font-mono text-xs flex items-center gap-1">
                     {s.id.slice(0, 16)}
                     <button

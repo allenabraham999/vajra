@@ -152,7 +152,7 @@ export default function MetricsPage() {
 
 function Tile({ label, value, subtle }: { label: string; value: number | string; subtle?: string }) {
   return (
-    <div className="rounded-lg border border-zinc-900 bg-zinc-900/40 p-4">
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 p-4">
       <div className="text-[11px] text-zinc-500 uppercase tracking-wider font-mono">{label}</div>
       <div className="mt-2 text-2xl font-semibold tabular-nums">{value}</div>
       {subtle && <div className="mt-1 text-[11px] text-zinc-500">{subtle}</div>}

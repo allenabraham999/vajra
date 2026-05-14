@@ -65,7 +65,7 @@ export default function WebhooksPage() {
         actions={
           <button
             onClick={() => setOpenCreate(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+            className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
           >
             <Plus size={14} /> Add webhook
           </button>
@@ -92,7 +92,7 @@ export default function WebhooksPage() {
               </thead>
               <tbody>
                 {items.map((w) => (
-                  <tr key={w.id} className="border-b border-zinc-900/50 hover:bg-zinc-900/40">
+                  <tr key={w.id} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td className="px-4 py-2.5 font-mono text-xs">{w.url}</td>
                     <td className="px-4 py-2.5 text-xs text-zinc-400">
                       {w.events.join(', ')}
@@ -106,7 +106,7 @@ export default function WebhooksPage() {
                     <td className="px-4 py-2.5 text-right">
                       <button
                         onClick={() => onTest(w.id)}
-                        className="text-xs text-emerald-400 hover:underline mr-3"
+                        className="text-xs text-teal-400 hover:underline mr-3"
                       >
                         Test
                       </button>
@@ -186,7 +186,7 @@ function CreateWebhookModal({
           <p className="text-sm text-zinc-300">
             Save this signing secret — it will not be shown again:
           </p>
-          <pre className="rounded-md border border-emerald-800 bg-zinc-950 p-3 font-mono text-xs text-emerald-300 break-all whitespace-pre-wrap">
+          <pre className="rounded-md border border-teal-800 bg-zinc-950 p-3 font-mono text-xs text-teal-300 break-all whitespace-pre-wrap">
             {secret}
           </pre>
           <div className="flex justify-end">
@@ -198,7 +198,7 @@ function CreateWebhookModal({
                 setSelected(new Set(['sandbox.created', 'sandbox.error']))
                 onCreated()
               }}
-              className="rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+              className="rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
             >
               Done
             </button>
@@ -211,7 +211,7 @@ function CreateWebhookModal({
             <input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              className="w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm font-mono focus:border-emerald-600 focus:outline-none"
+              className="w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm font-mono focus:border-teal-600 focus:outline-none"
               required
             />
           </div>
@@ -244,7 +244,7 @@ function CreateWebhookModal({
             <button
               type="submit"
               disabled={busy}
-              className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+              className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
             >
               {busy && <Spinner size={14} />}
               Create

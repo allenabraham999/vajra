@@ -52,13 +52,13 @@ export default function TemplatesPage() {
             </button>
             <button
               onClick={() => setOpenBuild(true)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-emerald-700 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-900/30"
+              className="inline-flex items-center gap-1.5 rounded-md border border-teal-700 px-3 py-1.5 text-sm text-teal-300 hover:bg-teal-900/30"
             >
               Build Custom Template
             </button>
             <button
               onClick={() => setOpenCreate(true)}
-              className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+              className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
             >
               <Plus size={14} /> Register
             </button>
@@ -85,7 +85,7 @@ export default function TemplatesPage() {
               </thead>
               <tbody>
                 {items.map((t) => (
-                  <tr key={t.id} className="border-b border-zinc-900/50 hover:bg-zinc-900/40">
+                  <tr key={t.id} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td className="px-4 py-2.5 font-medium">{t.name}</td>
                     <td className="px-4 py-2.5 text-zinc-400 text-xs font-mono">
                       {t.version || '—'}
@@ -205,7 +205,7 @@ function BuildTemplateModal({
         </Field>
         {status && (
           <div className="text-xs text-zinc-400">
-            Status: <span className="font-mono text-emerald-300">{status}</span>
+            Status: <span className="font-mono text-teal-300">{status}</span>
           </div>
         )}
         <div className="flex justify-end gap-2 pt-2 border-t border-zinc-800">
@@ -219,7 +219,7 @@ function BuildTemplateModal({
           <button
             type="submit"
             disabled={busy}
-            className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+            className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
           >
             {busy && <Spinner size={14} />}
             Build
@@ -329,7 +329,7 @@ function CreateTemplateModal({
           <button
             type="submit"
             disabled={busy}
-            className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+            className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
           >
             {busy && <Spinner size={14} />}
             Register
@@ -407,7 +407,7 @@ function PromoteSnapshotModal({
           <button
             type="submit"
             disabled={busy || !snapId}
-            className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+            className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
           >
             {busy && <Spinner size={14} />}
             Promote
@@ -419,7 +419,7 @@ function PromoteSnapshotModal({
 }
 
 const inputCls =
-  'w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/30'
+  'w-full rounded-md bg-zinc-950 border border-zinc-800 px-2.5 py-1.5 text-sm focus:border-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-600/30'
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

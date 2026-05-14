@@ -59,7 +59,7 @@ export default function SandboxesPage() {
         actions={
           <button
             onClick={() => setOpenCreate(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+            className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
           >
             <Plus size={14} /> Create
           </button>
@@ -74,14 +74,14 @@ export default function SandboxesPage() {
             action={
               <button
                 onClick={() => setOpenCreate(true)}
-                className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1.5 text-sm font-medium"
+                className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
               >
                 <Plus size={14} /> Create your first sandbox
               </button>
             }
           />
         ) : (
-          <div className="rounded-lg border border-zinc-900 bg-zinc-900/40 overflow-hidden">
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 overflow-hidden">
             <table className="w-full text-sm">
               <thead className="text-[11px] text-zinc-500 uppercase tracking-wider">
                 <tr className="border-b border-zinc-900 bg-zinc-950/40">
@@ -97,7 +97,7 @@ export default function SandboxesPage() {
                 {items.map((sb) => (
                   <tr
                     key={sb.id}
-                    className="border-b border-zinc-900/60 hover:bg-zinc-900/40 cursor-pointer"
+                    className="border-b border-zinc-900/60 hover:bg-zinc-800/50 transition-colors cursor-pointer"
                     onClick={() => nav(`/sandboxes/${sb.id}`)}
                   >
                     <td className="px-4 py-2.5 font-medium">
