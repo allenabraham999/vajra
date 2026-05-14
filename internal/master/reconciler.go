@@ -229,24 +229,33 @@ func (r *Reconciler) handleMismatches(ctx context.Context, node *models.Node, ag
 		)
 		// Two transitions are safe to act on automatically:
 		//   1. DB=RUNNING, agent=STOPPED — guest stopped itself; update DB.
-		//   2. DB=ERROR,   agent=RUNNING/CREATING — DB is already terminal
-		//      (the create poller, dispatch path, or a prior tick decided
-		//      the sandbox failed) but the agent still has a live entry
-		//      reserving CPU/memory/disk in heartbeat usage. Treat the
-		//      agent's view as the orphan and ask it to destroy. Without
-		//      this backstop a stuck agent entry starves the scheduler
-		//      until the agent process restarts.
+		//   2. DB=ERROR, agent=RUNNING — the create poll timed out (cold
+		//      cache, first-restore-on-new-node) and flipped the row to
+		//      ERROR while the agent was actually mid-restore. The VM is
+		//      now healthy. Earlier we used to destroy here, which killed
+		//      working sandboxes when the autoscale path overshot the
+		//      60s poll deadline. Instead, trust the agent and promote
+		//      the row back to RUNNING. We do not record usage from the
+		//      reconciler — the original create's tracker is already
+		//      completed; this path is purely a correctness recovery,
+		//      so a small billing undercount on edge-case recoveries is
+		//      acceptable.
+		//   3. DB=ERROR, agent=CREATING — agent is still working. Leave
+		//      it alone; a future tick will catch the RUNNING transition
+		//      via case 2 above.
 		switch {
 		case sb.State == models.SandboxStateRunning && mapped == models.SandboxStateStopped:
 			if err := r.store.Sandboxes().UpdateState(ctx, sb.AccountID, id, models.SandboxStateStopped); err != nil {
 				r.logger.Error("reconcile: mismatch update failed",
 					"op", "state_mismatch", "node_id", node.ID, "sandbox_id", id, "err", err)
 			}
-		case sb.State == models.SandboxStateError &&
-			(mapped == models.SandboxStateRunning || mapped == models.SandboxStateCreating):
-			if err := r.agents.DestroySandbox(ctx, node, id); err != nil {
-				r.logger.Error("reconcile: destroy stale agent entry failed",
+		case sb.State == models.SandboxStateError && mapped == models.SandboxStateRunning:
+			if err := r.store.Sandboxes().UpdateState(ctx, sb.AccountID, id, models.SandboxStateRunning); err != nil {
+				r.logger.Error("reconcile: recover update failed",
 					"op", "state_mismatch", "node_id", node.ID, "sandbox_id", id, "err", err)
+			} else {
+				r.logger.Info("reconcile: sandbox recovered, agent reports RUNNING",
+					"op", "recover", "node_id", node.ID, "sandbox_id", id)
 			}
 		}
 	}

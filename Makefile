@@ -1,4 +1,4 @@
-.PHONY: build test lint clean benchmark vet fmt tidy run-master run-agent run-proxy db-up db-down all
+.PHONY: build test lint clean benchmark vet fmt tidy run-master run-agent run-proxy db-up db-down all stage-ch
 
 BIN_DIR := bin
 GO := go
@@ -9,11 +9,19 @@ BINARIES := vajra-agent vajra-master vajra-proxy vajra
 
 all: build
 
-build: $(BINARIES:%=$(BIN_DIR)/%)
+build: $(BINARIES:%=$(BIN_DIR)/%) stage-ch
 
 $(BIN_DIR)/%:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $@ ./cmd/$*
+
+# stage-ch copies the locally-installed cloud-hypervisor binary into bin/
+# so master can serve it from /internal/binaries/cloud-hypervisor to
+# autoscaled nodes. Silent no-op when the binary isn't installed (dev
+# laptops, CI without KVM).
+stage-ch:
+	@mkdir -p $(BIN_DIR)
+	@cp /usr/local/bin/cloud-hypervisor $(BIN_DIR)/cloud-hypervisor 2>/dev/null || true
 
 test:
 	$(GO) test ./...

@@ -37,10 +37,22 @@ const dispatchReconcileTimeout = 5 * time.Second
 // async and returns 202 immediately with state=CREATING; the poller
 // drives the DB row to RUNNING (or ERROR) when the agent's goroutine
 // finishes. 1s ticks keep the user-visible latency low; the 60s ceiling
-// matches the pessimistic restore time on cold paths.
+// matches the pessimistic restore time on a warm node.
+//
+// autoscaleCreatePollTimeout is the longer ceiling we use after the
+// autoscaler has launched a fresh node. The first sandbox on a brand
+// new node pays the full cold-cache cost (template pull + qcow2 backing
+// warm-up + first snapshot restore), which routinely exceeds 60s.
+// Firing the short timeout there used to mark the row ERROR while the
+// agent was actually mid-restore; the reconciler then saw DB=ERROR /
+// agent=RUNNING, classified the VM as a ghost, and destroyed working
+// sandboxes. We use this longer cap on the autoscale path and rely on
+// reconcilerRecoverRunningSandbox in the reconciler to defend against
+// any remaining races.
 const (
-	createPollInterval = 1 * time.Second
-	createPollTimeout  = 60 * time.Second
+	createPollInterval         = 1 * time.Second
+	createPollTimeout          = 60 * time.Second
+	autoscaleCreatePollTimeout = 5 * time.Minute
 )
 
 // createSandboxRequest is the body of POST /v1/sandboxes.
@@ -252,7 +264,7 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	} else {
 		// Happy path: agent accepted the create asynchronously. Leave
 		// the DB row in CREATING and let the poller drive it forward.
-		go h.pollAgentCreate(accountID, sandboxID, opID, agent)
+		go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout)
 	}
 
 	out, err := h.Store.Sandboxes().GetByID(r.Context(), accountID, sandboxID)
@@ -394,7 +406,7 @@ func (h *Handlers) driveAsyncCreate(
 					_ = h.Tracker.Complete(ctx, opID, nil)
 					return
 				case models.SandboxStateCreating:
-					h.pollAgentCreate(accountID, sandboxID, opID, agent)
+					h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout)
 					return
 				}
 			}
@@ -402,7 +414,7 @@ func (h *Handlers) driveAsyncCreate(
 		fail(fmt.Errorf("agent dispatch: %w", dispatchErr))
 		return
 	}
-	h.pollAgentCreate(accountID, sandboxID, opID, agent)
+	h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout)
 }
 
 // handleDispatchError resolves the four cases that can land us here when
@@ -445,7 +457,7 @@ func (h *Handlers) handleDispatchError(
 			// poller and let it drive the DB row to RUNNING.
 			h.log().Warn("createSandbox: dispatch reported error but agent still creating",
 				"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
-			go h.pollAgentCreate(accountID, sandboxID, opID, agent)
+			go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout)
 			return true
 		}
 	}
@@ -474,18 +486,20 @@ func (h *Handlers) handleDispatchError(
 // pollAgentCreate drives a CREATING sandbox to its terminal state
 // (RUNNING or ERROR) by polling the agent. Called as a goroutine from
 // executeCreate, so it owns its own context and never returns to the
-// HTTP handler. createPollTimeout caps how long we'll wait before
-// declaring failure ourselves; if the agent never finishes we mark
-// ERROR rather than letting the row hang in CREATING forever.
-func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *AgentClient) {
-	ctx, cancel := context.WithTimeout(context.Background(), createPollTimeout)
+// HTTP handler. timeout caps how long we'll wait before declaring
+// failure ourselves; if the agent never finishes we mark ERROR rather
+// than letting the row hang in CREATING forever. Synchronous-path
+// callers pass createPollTimeout (60s, warm node); the autoscale path
+// passes autoscaleCreatePollTimeout (5min, cold cache).
+func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *AgentClient, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	ticker := time.NewTicker(createPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			err := fmt.Errorf("create poll timeout after %s", createPollTimeout)
+			err := fmt.Errorf("create poll timeout after %s", timeout)
 			if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
 				h.log().Error("createSandbox: poll timeout update", "err", uerr, "sandbox_id", sandboxID)
 			}

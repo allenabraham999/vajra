@@ -432,16 +432,34 @@ func (a *Autoscaler) broadcastError(err error) {
 	}
 }
 
-// managedNodeCount returns the count of nodes the autoscaler is willing
-// to scale down (vajra:managed). For the launch path we only care
-// about total node count; the scaledown path reads node tags via EC2
-// before ever touching a node.
+// staleHeartbeatThreshold is how long a node can go without a heartbeat
+// before the autoscaler stops counting it toward MaxNodes. Stale rows
+// linger after EC2 terminations or agent crashes, so without this filter
+// a few zombie rows can pin the autoscaler at capacity and silently
+// block legitimate scale-ups.
+const staleHeartbeatThreshold = 5 * time.Minute
+
+// managedNodeCount returns the count of live nodes against which the
+// MaxNodes cap is enforced. "Live" means state=ACTIVE and a heartbeat
+// within staleHeartbeatThreshold; anything older is treated as a
+// zombie row that should not be allowed to block scale-up.
 func (a *Autoscaler) managedNodeCount(ctx context.Context) (int, error) {
 	nodes, err := a.store.Nodes().List(ctx, store.ListOpts{Limit: 1000})
 	if err != nil {
 		return 0, err
 	}
-	return len(nodes), nil
+	cutoff := a.now().Add(-staleHeartbeatThreshold)
+	count := 0
+	for _, n := range nodes {
+		if n.State != models.NodeStateActive {
+			continue
+		}
+		if n.LastHeartbeat.Before(cutoff) {
+			continue
+		}
+		count++
+	}
+	return count, nil
 }
 
 // RunScaleDown is the long-running goroutine — call once from main and
