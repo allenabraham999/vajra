@@ -11,11 +11,11 @@ import (
 
 type pgSandboxStore struct{ ext sqlx.ExtContext }
 
-const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, created_at, updated_at`
+const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, auto_stop_minutes, auto_archive_minutes, last_activity, created_at, updated_at`
 
 func (s *pgSandboxStore) Create(ctx context.Context, sb *models.Sandbox) error {
 	const q = `INSERT INTO sandboxes (` + sandboxColumns + `)
-	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :created_at, :updated_at)`
+	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :auto_stop_minutes, :auto_archive_minutes, :last_activity, :created_at, :updated_at)`
 	_, err := sqlx.NamedExecContext(ctx, s.ext, q, sb)
 	return translate(err)
 }
@@ -92,6 +92,33 @@ func (s *pgSandboxStore) UpdatePlacement(ctx context.Context, id string, cluster
 		`UPDATE sandboxes SET cluster_id = $1, node_id = $2, updated_at = NOW()
 		 WHERE id = $3`, nilIfEmpty(clusterID), nilIfEmpty(nodeID), id)
 	return expectAffected(res, err)
+}
+
+func (s *pgSandboxStore) UpdateLastActivity(ctx context.Context, id string, ts time.Time) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE sandboxes SET last_activity = $1 WHERE id = $2`, ts, id)
+	return expectAffected(res, err)
+}
+
+// ListIdle returns rows in `state` whose last_activity is older than the
+// per-row threshold column (`auto_stop_minutes` or `auto_archive_minutes`).
+// The column name is validated against a small allow-list so callers
+// can't smuggle SQL through; anything else returns an empty slice.
+func (s *pgSandboxStore) ListIdle(ctx context.Context, state models.SandboxState, thresholdColumn string, now time.Time) ([]*models.Sandbox, error) {
+	switch thresholdColumn {
+	case "auto_stop_minutes", "auto_archive_minutes":
+	default:
+		return nil, nil
+	}
+	out := []*models.Sandbox{}
+	q := `SELECT ` + sandboxColumns + ` FROM sandboxes
+	      WHERE state = $1 AND ` + thresholdColumn + ` > 0
+	        AND last_activity < ($2::timestamptz - (` + thresholdColumn + ` || ' minutes')::interval)
+	      ORDER BY last_activity ASC LIMIT 200`
+	if err := sqlx.SelectContext(ctx, s.ext, &out, q, string(state), now); err != nil {
+		return nil, translate(err)
+	}
+	return out, nil
 }
 
 func (s *pgSandboxStore) Delete(ctx context.Context, accountID, id string) error {

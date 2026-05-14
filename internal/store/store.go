@@ -45,6 +45,8 @@ type Store interface {
 	Operations() OperationStore
 	ShareLinks() ShareLinkStore
 	Usage() UsageStore
+	Builds() BuildStore
+	Webhooks() WebhookStore
 
 	// Ping verifies a working database connection.
 	Ping(ctx context.Context) error
@@ -125,6 +127,17 @@ type SandboxStore interface {
 	ListByState(ctx context.Context, state models.SandboxState, opts ListOpts) ([]*models.Sandbox, error)
 	UpdateState(ctx context.Context, accountID, id string, state models.SandboxState) error
 	UpdatePlacement(ctx context.Context, id string, clusterID, nodeID string) error
+	// UpdateLastActivity stamps the activity column without touching
+	// updated_at — driven by exec / file upload / terminal connect
+	// signals from agents. Unscoped because internal lifecycle callers
+	// (the LifecycleManager) act on behalf of every account.
+	UpdateLastActivity(ctx context.Context, id string, ts time.Time) error
+	// ListIdle returns sandboxes in the given state whose last_activity
+	// is older than the per-row threshold (auto_stop_minutes or
+	// auto_archive_minutes). The threshold column is implementation-
+	// defined; callers should not assume column names. Used only by
+	// the LifecycleManager.
+	ListIdle(ctx context.Context, state models.SandboxState, thresholdColumn string, now time.Time) ([]*models.Sandbox, error)
 	Delete(ctx context.Context, accountID, id string) error
 }
 
@@ -171,4 +184,25 @@ type OperationStore interface {
 	ListBySandbox(ctx context.Context, accountID, sandboxID string, opts ListOpts) ([]*models.Operation, error)
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Operation, error)
 	UpdateStatus(ctx context.Context, id string, status models.OperationStatus, errMsg *string, completedAt *time.Time) error
+}
+
+// BuildStore persists custom-image build jobs. UpdateStatus is unscoped
+// because it is called by the background builder which already proved
+// authorization at enqueue time.
+type BuildStore interface {
+	Create(ctx context.Context, b *models.Build) error
+	GetByID(ctx context.Context, accountID, id string) (*models.Build, error)
+	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Build, error)
+	UpdateStatus(ctx context.Context, id string, status models.BuildStatus, templateID *string, errMsg *string, completedAt *time.Time) error
+}
+
+// WebhookStore manages per-account outbound notification targets.
+// ListActiveByEvent is the dispatch hot path — implementations should
+// keep it cheap (indexed scan over active rows).
+type WebhookStore interface {
+	Create(ctx context.Context, w *models.Webhook) error
+	GetByID(ctx context.Context, accountID, id string) (*models.Webhook, error)
+	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Webhook, error)
+	ListActiveByEvent(ctx context.Context, accountID, event string) ([]*models.Webhook, error)
+	Delete(ctx context.Context, accountID, id string) error
 }

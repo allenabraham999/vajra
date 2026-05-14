@@ -136,8 +136,18 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"POST /v1/snapshots/{id}/promote": h.promoteSnapshot,
 
 		// Templates
-		"GET /v1/templates":  h.listTemplates,
-		"POST /v1/templates": h.createTemplate,
+		"GET /v1/templates":               h.listTemplates,
+		"POST /v1/templates":              h.createTemplate,
+		"POST /v1/templates/build":        h.buildTemplate,
+		"GET /v1/templates/builds":        h.listBuilds,
+		"GET /v1/templates/builds/{id}":   h.getBuild,
+
+		// Webhooks
+		"POST /v1/webhooks":          h.createWebhook,
+		"GET /v1/webhooks":           h.listWebhooks,
+		"GET /v1/webhooks/{id}":      h.getWebhook,
+		"DELETE /v1/webhooks/{id}":   h.deleteWebhook,
+		"POST /v1/webhooks/{id}/test": h.testWebhook,
 
 		// Admin
 		"GET /v1/clusters":           h.listClusters,

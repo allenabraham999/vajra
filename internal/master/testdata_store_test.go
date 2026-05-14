@@ -67,6 +67,8 @@ func (f *fakeStore) Templates() store.TemplateStore   { return nil }
 func (f *fakeStore) Operations() store.OperationStore { return nil }
 func (f *fakeStore) ShareLinks() store.ShareLinkStore { return nil }
 func (f *fakeStore) Usage() store.UsageStore          { return nil }
+func (f *fakeStore) Builds() store.BuildStore         { return nil }
+func (f *fakeStore) Webhooks() store.WebhookStore     { return nil }
 func (f *fakeStore) Ping(context.Context) error       { return nil }
 func (f *fakeStore) WithTx(context.Context, func(store.Store) error) error {
 	return errUnimplemented
@@ -194,5 +196,11 @@ func (f *fakeSandboxStore) UpdateState(_ context.Context, accountID, id string, 
 }
 func (f *fakeSandboxStore) UpdatePlacement(context.Context, string, string, string) error {
 	return errUnimplemented
+}
+func (f *fakeSandboxStore) UpdateLastActivity(context.Context, string, time.Time) error {
+	return errUnimplemented
+}
+func (f *fakeSandboxStore) ListIdle(context.Context, models.SandboxState, string, time.Time) ([]*models.Sandbox, error) {
+	return nil, errUnimplemented
 }
 func (f *fakeSandboxStore) Delete(context.Context, string, string) error { return errUnimplemented }

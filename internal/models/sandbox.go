@@ -66,21 +66,39 @@ func (c *SandboxConfig) Scan(src any) error {
 	return scanJSON(src, c)
 }
 
+// DefaultAutoStopMinutes is the idle window before a RUNNING sandbox is
+// automatically stopped by the LifecycleManager. 15 minutes mirrors the
+// Daytona / E2B default and keeps unattended sandboxes from leaking cost.
+const DefaultAutoStopMinutes = 15
+
+// DefaultAutoArchiveMinutes is the idle window before a STOPPED sandbox is
+// archived to cold storage. 24h (1440 min) is generous enough that a
+// developer who leaves a sandbox stopped overnight does not lose it.
+const DefaultAutoArchiveMinutes = 1440
+
 // Sandbox represents a managed microVM owned by an account and scheduled
 // onto a node within a cluster. NodeID and ClusterID are nullable: a
 // PENDING sandbox has not yet been scheduled, and both fields may also be
 // cleared after archival.
+//
+// AutoStopMinutes and AutoArchiveMinutes drive the LifecycleManager: a
+// RUNNING sandbox idle for AutoStopMinutes is stopped, a STOPPED sandbox
+// idle for AutoArchiveMinutes is archived. A value of 0 disables the
+// corresponding policy.
 type Sandbox struct {
-	ID         string        `db:"id" json:"id"`
-	Name       string        `db:"name" json:"name"`
-	AccountID  string        `db:"account_id" json:"account_id"`
-	NodeID     *string       `db:"node_id" json:"node_id,omitempty"`
-	ClusterID  *string       `db:"cluster_id" json:"cluster_id,omitempty"`
-	TemplateID string        `db:"template_id" json:"template_id"`
-	State      SandboxState  `db:"state" json:"state"`
-	Config     SandboxConfig `db:"config" json:"config"`
-	CreatedAt  time.Time     `db:"created_at" json:"created_at"`
-	UpdatedAt  time.Time     `db:"updated_at" json:"updated_at"`
+	ID                 string        `db:"id" json:"id"`
+	Name               string        `db:"name" json:"name"`
+	AccountID          string        `db:"account_id" json:"account_id"`
+	NodeID             *string       `db:"node_id" json:"node_id,omitempty"`
+	ClusterID          *string       `db:"cluster_id" json:"cluster_id,omitempty"`
+	TemplateID         string        `db:"template_id" json:"template_id"`
+	State              SandboxState  `db:"state" json:"state"`
+	Config             SandboxConfig `db:"config" json:"config"`
+	AutoStopMinutes    int           `db:"auto_stop_minutes" json:"auto_stop_minutes"`
+	AutoArchiveMinutes int           `db:"auto_archive_minutes" json:"auto_archive_minutes"`
+	LastActivity       time.Time     `db:"last_activity" json:"last_activity"`
+	CreatedAt          time.Time     `db:"created_at" json:"created_at"`
+	UpdatedAt          time.Time     `db:"updated_at" json:"updated_at"`
 }
 
 // validSandboxTransitions defines the allowed forward transitions. The

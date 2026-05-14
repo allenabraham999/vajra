@@ -32,6 +32,8 @@ type handlerStore struct {
 	operations  map[string]*models.Operation
 	shareLinks  map[string]*models.ShareLink
 	tokenIdx    map[string]string // token_hash → share id
+	builds      map[string]*models.Build
+	webhooks    map[string]*models.Webhook
 
 	pingErr error
 }
@@ -51,6 +53,8 @@ func newHandlerStore() *handlerStore {
 		operations: map[string]*models.Operation{},
 		shareLinks: map[string]*models.ShareLink{},
 		tokenIdx:   map[string]string{},
+		builds:     map[string]*models.Build{},
+		webhooks:   map[string]*models.Webhook{},
 	}
 }
 
@@ -64,6 +68,8 @@ func (h *handlerStore) Templates() store.TemplateStore   { return &hsTemplate{h:
 func (h *handlerStore) Operations() store.OperationStore { return &hsOperation{h: h} }
 func (h *handlerStore) ShareLinks() store.ShareLinkStore { return &hsShareLink{h: h} }
 func (h *handlerStore) Usage() store.UsageStore          { return &hsUsage{h: h} }
+func (h *handlerStore) Builds() store.BuildStore         { return &hsBuild{h: h} }
+func (h *handlerStore) Webhooks() store.WebhookStore     { return &hsWebhook{h: h} }
 func (h *handlerStore) Ping(context.Context) error       { return h.pingErr }
 func (h *handlerStore) Close() error                     { return nil }
 
@@ -395,6 +401,42 @@ func (s *hsSandbox) Delete(_ context.Context, accountID, id string) error {
 	}
 	return store.ErrNotFound
 }
+func (s *hsSandbox) UpdateLastActivity(_ context.Context, id string, ts time.Time) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sb, ok := s.h.sandboxes[id]; ok {
+		sb.LastActivity = ts
+		return nil
+	}
+	return store.ErrNotFound
+}
+func (s *hsSandbox) ListIdle(_ context.Context, state models.SandboxState, col string, now time.Time) ([]*models.Sandbox, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Sandbox{}
+	for _, sb := range s.h.sandboxes {
+		if sb.State != state {
+			continue
+		}
+		var mins int
+		switch col {
+		case "auto_stop_minutes":
+			mins = sb.AutoStopMinutes
+		case "auto_archive_minutes":
+			mins = sb.AutoArchiveMinutes
+		default:
+			continue
+		}
+		if mins <= 0 {
+			continue
+		}
+		if now.Sub(sb.LastActivity) >= time.Duration(mins)*time.Minute {
+			cp := *sb
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
 
 type hsSnapshot struct{ h *handlerStore }
 
@@ -580,6 +622,101 @@ func (s *hsShareLink) Revoke(_ context.Context, accountID, id string, at time.Ti
 	if sl, ok := s.h.shareLinks[id]; ok && sl.AccountID == accountID {
 		t := at
 		sl.RevokedAt = &t
+		return nil
+	}
+	return store.ErrNotFound
+}
+
+type hsBuild struct{ h *handlerStore }
+
+func (s *hsBuild) Create(_ context.Context, b *models.Build) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	cp := *b
+	s.h.builds[b.ID] = &cp
+	return nil
+}
+func (s *hsBuild) GetByID(_ context.Context, accountID, id string) (*models.Build, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if b, ok := s.h.builds[id]; ok && b.AccountID == accountID {
+		cp := *b
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (s *hsBuild) ListByAccount(_ context.Context, accountID string, _ store.ListOpts) ([]*models.Build, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Build{}
+	for _, b := range s.h.builds {
+		if b.AccountID == accountID {
+			cp := *b
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+func (s *hsBuild) UpdateStatus(_ context.Context, id string, status models.BuildStatus, templateID, errMsg *string, completedAt *time.Time) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if b, ok := s.h.builds[id]; ok {
+		b.Status = status
+		b.TemplateID = templateID
+		b.Error = errMsg
+		b.CompletedAt = completedAt
+		return nil
+	}
+	return store.ErrNotFound
+}
+
+type hsWebhook struct{ h *handlerStore }
+
+func (s *hsWebhook) Create(_ context.Context, w *models.Webhook) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	cp := *w
+	s.h.webhooks[w.ID] = &cp
+	return nil
+}
+func (s *hsWebhook) GetByID(_ context.Context, accountID, id string) (*models.Webhook, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if w, ok := s.h.webhooks[id]; ok && w.AccountID == accountID {
+		cp := *w
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
+func (s *hsWebhook) ListByAccount(_ context.Context, accountID string, _ store.ListOpts) ([]*models.Webhook, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Webhook{}
+	for _, w := range s.h.webhooks {
+		if w.AccountID == accountID {
+			cp := *w
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+func (s *hsWebhook) ListActiveByEvent(_ context.Context, accountID, event string) ([]*models.Webhook, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Webhook{}
+	for _, w := range s.h.webhooks {
+		if w.AccountID == accountID && w.Active && w.Events.Has(event) {
+			cp := *w
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+func (s *hsWebhook) Delete(_ context.Context, accountID, id string) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if w, ok := s.h.webhooks[id]; ok && w.AccountID == accountID {
+		delete(s.h.webhooks, id)
 		return nil
 	}
 	return store.ErrNotFound

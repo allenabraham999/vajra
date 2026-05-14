@@ -70,6 +70,16 @@ type Handlers struct {
 	// agent's CONNECT endpoints.
 	AgentSharedSecret string
 
+	// Builder owns the async "Dockerfile → Template" pipeline. Nil
+	// disables POST /v1/templates/build with a 503; main wires this in
+	// production.
+	Builder *BuildManager
+
+	// Webhooks is the outbound webhook dispatcher. Nil → no webhooks
+	// are fired; the create/list/delete endpoints still work against
+	// the store, they just never deliver.
+	Webhooks *WebhookManager
+
 	// PublicBaseDomain is the apex domain the proxy is reachable on
 	// (e.g. "vajra.dev"). Used to suggest user-friendly share URLs;
 	// empty means the master will return a token but not a URL.
