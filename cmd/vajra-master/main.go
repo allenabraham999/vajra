@@ -47,6 +47,7 @@ type config struct {
 	RedisURL          string
 	NATSURL           string
 	Autoscale         master.AutoscaleConfig
+	GoogleOAuth       master.GoogleOAuthConfig
 }
 
 // loadConfig reads the runtime config from process env. Required vars
@@ -100,6 +101,17 @@ func loadConfig() (*config, error) {
 
 	cfg.RedisURL = os.Getenv("REDIS_URL")
 	cfg.NATSURL = os.Getenv("NATS_URL")
+
+	// Google OAuth is fully optional. ClientID + ClientSecret + RedirectURL
+	// must all be present for the /v1/auth/google* endpoints to do
+	// anything; DashboardURL is where the callback bounces the browser
+	// after a successful exchange (defaults to "/" if unset).
+	cfg.GoogleOAuth = master.GoogleOAuthConfig{
+		ClientID:     os.Getenv("VAJRA_GOOGLE_CLIENT_ID"),
+		ClientSecret: os.Getenv("VAJRA_GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("VAJRA_GOOGLE_REDIRECT_URL"),
+		DashboardURL: os.Getenv("VAJRA_DASHBOARD_URL"),
+	}
 	// Autoscaler env vars come in short and long flavours so operators
 	// can pick whichever they prefer. Short names (the ones in the
 	// brief) win when set; the longer forms are kept so existing .envs
@@ -230,6 +242,10 @@ func main() {
 	handlers.BinaryDir = os.Getenv("VAJRA_BINARY_DIR")
 	handlers.Cache = c
 	handlers.Bus = bus
+	handlers.GoogleOAuth = cfg.GoogleOAuth
+	if cfg.GoogleOAuth.Enabled() {
+		logger.Info("google oauth enabled", "redirect_url", cfg.GoogleOAuth.RedirectURL)
+	}
 
 	// Optional autoscaler. Disabled by default — handler check
 	// (Autoscaler != nil && Config.Enabled) keeps existing 503 path

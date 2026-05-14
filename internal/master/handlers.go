@@ -97,6 +97,11 @@ type Handlers struct {
 	// IAM instance profile. Empty disables the endpoint with 404.
 	BinaryDir string
 
+	// GoogleOAuth is the optional Google-login config consumed by the
+	// /v1/auth/google* endpoints. Zero value → endpoints respond 404
+	// and GET /v1/auth/config reports google_oauth_enabled=false.
+	GoogleOAuth GoogleOAuthConfig
+
 	// Now is overridable in tests so JWT expiry and operation timestamps
 	// are deterministic. Production wires this to time.Now.
 	Now func() time.Time

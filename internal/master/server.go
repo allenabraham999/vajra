@@ -78,6 +78,12 @@ func (s *Server) Routes() http.Handler {
 	// brute-force login loop can't outpace a single tenant's quota.
 	mux.Handle("POST /v1/auth/register", s.limiter.Middleware(http.HandlerFunc(h.register)))
 	mux.Handle("POST /v1/auth/login", s.limiter.Middleware(http.HandlerFunc(h.login)))
+	// Google OAuth surface. /config is unauthenticated probe used by the
+	// dashboard; /google starts the handshake; /google/callback finishes
+	// it and 302s the browser back with a JWT in the URL fragment.
+	mux.HandleFunc("GET /v1/auth/config", h.authConfig)
+	mux.Handle("GET /v1/auth/google", s.limiter.Middleware(http.HandlerFunc(h.googleInitiate)))
+	mux.Handle("GET /v1/auth/google/callback", s.limiter.Middleware(http.HandlerFunc(h.googleCallback)))
 
 	// Authed routes — wrap each with AuthMiddleware + the per-account
 	// rate limiter. The limiter is applied AFTER auth so the bucket is
