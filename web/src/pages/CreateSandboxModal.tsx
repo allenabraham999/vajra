@@ -21,6 +21,22 @@ const MEM_OPTS = [
   { label: '8 GB', value: 8192 },
 ]
 const DISK_OPTS = [1, 3, 5, 10]
+const AUTO_STOP_OPTS = [
+  { label: 'Never', value: 0 },
+  { label: '5 minutes', value: 5 },
+  { label: '15 minutes (default)', value: 15 },
+  { label: '30 minutes', value: 30 },
+  { label: '1 hour', value: 60 },
+  { label: '4 hours', value: 240 },
+]
+const AUTO_ARCHIVE_OPTS = [
+  { label: 'Never', value: 0 },
+  { label: '1 hour', value: 60 },
+  { label: '6 hours', value: 360 },
+  { label: '24 hours (default)', value: 1440 },
+  { label: '3 days', value: 4320 },
+  { label: '7 days', value: 10080 },
+]
 
 export default function CreateSandboxModal({ open, onClose, onCreated, prefillSnapshot }: Props) {
   const toast = useToast()
@@ -35,6 +51,8 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
   const [vcpus, setVcpus] = useState(2)
   const [memoryMB, setMemoryMB] = useState(1024)
   const [diskGB, setDiskGB] = useState(3)
+  const [autoStop, setAutoStop] = useState(15)
+  const [autoArchive, setAutoArchive] = useState(1440)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -83,6 +101,8 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
         vcpus,
         memory_mb: memoryMB,
         disk_gb: diskGB,
+        auto_stop_minutes: autoStop,
+        auto_archive_minutes: autoArchive,
       })
       toast.success(`Sandbox "${sb.name}" created`)
       onCreated(sb)
@@ -188,6 +208,35 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
               {DISK_OPTS.map((v) => (
                 <option key={v} value={v}>
                   {v} GB
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Auto-stop (idle)">
+            <select
+              value={autoStop}
+              onChange={(e) => setAutoStop(+e.target.value)}
+              className={inputCls}
+            >
+              {AUTO_STOP_OPTS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Auto-archive (stopped)">
+            <select
+              value={autoArchive}
+              onChange={(e) => setAutoArchive(+e.target.value)}
+              className={inputCls}
+            >
+              {AUTO_ARCHIVE_OPTS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
                 </option>
               ))}
             </select>

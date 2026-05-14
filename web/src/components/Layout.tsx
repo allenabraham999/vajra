@@ -9,6 +9,8 @@ import {
   ShieldCheck,
   Activity,
   LogOut,
+  Webhook,
+  BookOpen,
 } from 'lucide-react'
 import { useAuth } from '../auth/AuthContext'
 
@@ -17,16 +19,19 @@ interface NavItem {
   label: string
   icon: typeof Boxes
   admin?: boolean
+  external?: boolean
 }
 
 const items: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard },
   { to: '/sandboxes', label: 'Sandboxes', icon: Boxes },
   { to: '/templates', label: 'Templates', icon: PackageSearch },
+  { to: '/webhooks', label: 'Webhooks', icon: Webhook },
   { to: '/nodes', label: 'Nodes', icon: Server, admin: true },
   { to: '/api-keys', label: 'API Keys', icon: KeyRound },
   { to: '/usage', label: 'Usage', icon: Receipt },
   { to: '/metrics', label: 'Metrics', icon: Activity },
+  { to: '/v1/docs', label: 'API Docs', icon: BookOpen, external: true },
   { to: '/admin', label: 'Admin', icon: ShieldCheck, admin: true },
 ]
 
@@ -53,23 +58,36 @@ export default function Layout() {
           </div>
         </div>
         <nav className="flex-1 px-2 py-3 space-y-0.5">
-          {navItems.map(({ to, label, icon: Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === '/'}
-              className={({ isActive }) =>
-                `flex items-center gap-2.5 px-2.5 py-2 rounded-md text-sm transition-colors ${
-                  isActive
-                    ? 'bg-zinc-800 text-zinc-50'
-                    : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900'
-                }`
-              }
-            >
-              <Icon size={15} />
-              <span>{label}</span>
-            </NavLink>
-          ))}
+          {navItems.map(({ to, label, icon: Icon, external }) =>
+            external ? (
+              <a
+                key={to}
+                href={to}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-2.5 px-2.5 py-2 rounded-md text-sm text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900 transition-colors"
+              >
+                <Icon size={15} />
+                <span>{label}</span>
+              </a>
+            ) : (
+              <NavLink
+                key={to}
+                to={to}
+                end={to === '/'}
+                className={({ isActive }) =>
+                  `flex items-center gap-2.5 px-2.5 py-2 rounded-md text-sm transition-colors ${
+                    isActive
+                      ? 'bg-zinc-800 text-zinc-50'
+                      : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900'
+                  }`
+                }
+              >
+                <Icon size={15} />
+                <span>{label}</span>
+              </NavLink>
+            ),
+          )}
         </nav>
         <div className="px-2 py-3 border-t border-zinc-900">
           <button

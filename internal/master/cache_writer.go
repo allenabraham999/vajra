@@ -79,6 +79,11 @@ func (h *Handlers) decrAccountSandboxCount(ctx context.Context, accountID string
 // publishStateChange fires a SubjectSandboxStateChanged event. Best-
 // effort; the bus's NoopBus implementation makes this a no-op when
 // NATS isn't configured.
+//
+// Also fans the change out to subscribed webhooks. The mapping from
+// SandboxState → webhook event is best-effort: terminal states
+// (RUNNING, STOPPED, DESTROYED, ARCHIVED, ERROR) emit a corresponding
+// webhook; transient states (CREATING, STOPPING, etc.) do not.
 func (h *Handlers) publishStateChange(ctx context.Context, sb *models.Sandbox, oldState, newState models.SandboxState) {
 	if sb == nil {
 		return
@@ -91,16 +96,39 @@ func (h *Handlers) publishStateChange(ctx context.Context, sb *models.Sandbox, o
 		Timestamp: time.Now().UTC().Unix(),
 	}
 	raw, err := json.Marshal(payload)
-	if err != nil {
-		return
+	if err == nil {
+		if err := h.getBus().Publish(ctx, events.SubjectSandboxStateChanged, raw); err != nil {
+			h.log().Debug("bus: publish state change", "id", sb.ID, "err", err)
+		}
 	}
-	if err := h.getBus().Publish(ctx, events.SubjectSandboxStateChanged, raw); err != nil {
-		h.log().Debug("bus: publish state change", "id", sb.ID, "err", err)
+	if h.Webhooks != nil {
+		if ev := sandboxStateToWebhookEvent(newState); ev != "" {
+			h.Webhooks.Dispatch(ctx, sb.AccountID, ev, sb)
+		}
 	}
 }
 
+// sandboxStateToWebhookEvent maps a sandbox state into the webhook
+// event name customers subscribe to. Returns "" for transitions that
+// do not fire a webhook (intermediate / pausing states).
+func sandboxStateToWebhookEvent(s models.SandboxState) string {
+	switch s {
+	case models.SandboxStateRunning:
+		return string(models.WebhookEventSandboxRunning)
+	case models.SandboxStateStopped:
+		return string(models.WebhookEventSandboxStopped)
+	case models.SandboxStateArchived:
+		return string(models.WebhookEventSandboxArchived)
+	case models.SandboxStateDestroyed:
+		return string(models.WebhookEventSandboxDestroyed)
+	case models.SandboxStateError:
+		return string(models.WebhookEventSandboxError)
+	}
+	return ""
+}
+
 // publishSandboxCreated fires a SubjectSandboxCreated event after a
-// sandbox reaches RUNNING.
+// sandbox reaches RUNNING and dispatches the sandbox.created webhook.
 func (h *Handlers) publishSandboxCreated(ctx context.Context, sb *models.Sandbox) {
 	if sb == nil || sb.NodeID == nil {
 		return
@@ -113,11 +141,13 @@ func (h *Handlers) publishSandboxCreated(ctx context.Context, sb *models.Sandbox
 		Timestamp:  time.Now().UTC().Unix(),
 	}
 	raw, err := json.Marshal(payload)
-	if err != nil {
-		return
+	if err == nil {
+		if err := h.getBus().Publish(ctx, events.SubjectSandboxCreated, raw); err != nil {
+			h.log().Debug("bus: publish sandbox created", "id", sb.ID, "err", err)
+		}
 	}
-	if err := h.getBus().Publish(ctx, events.SubjectSandboxCreated, raw); err != nil {
-		h.log().Debug("bus: publish sandbox created", "id", sb.ID, "err", err)
+	if h.Webhooks != nil {
+		h.Webhooks.Dispatch(ctx, sb.AccountID, string(models.WebhookEventSandboxCreated), sb)
 	}
 }
 

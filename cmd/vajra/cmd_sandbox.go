@@ -195,11 +195,12 @@ func newSandboxCreateCmd() *cobra.Command {
 	var (
 		name, template, snapshot, region string
 		vcpus, memoryMB, diskGB          int
+		autoStop, autoArchive            int
 	)
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a new sandbox",
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			if name == "" {
 				return fmt.Errorf("--name is required")
 			}
@@ -222,6 +223,12 @@ func newSandboxCreateCmd() *cobra.Command {
 			body["source"] = source
 			if region != "" {
 				body["region"] = region
+			}
+			if cmd.Flags().Changed("auto-stop") {
+				body["auto_stop_minutes"] = autoStop
+			}
+			if cmd.Flags().Changed("auto-archive") {
+				body["auto_archive_minutes"] = autoArchive
 			}
 
 			c, _, err := resolveClient()
@@ -251,6 +258,8 @@ func newSandboxCreateCmd() *cobra.Command {
 	cmd.Flags().IntVar(&memoryMB, "memory", 512, "memory in MB")
 	cmd.Flags().IntVar(&diskGB, "disk", 5, "disk in GB")
 	cmd.Flags().StringVar(&region, "region", "", "region (optional)")
+	cmd.Flags().IntVar(&autoStop, "auto-stop", 15, "idle minutes before auto-stop (0 to disable)")
+	cmd.Flags().IntVar(&autoArchive, "auto-archive", 1440, "idle minutes before auto-archive (0 to disable)")
 	return cmd
 }
 

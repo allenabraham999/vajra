@@ -17,12 +17,14 @@ import requests
 
 from .models import (
     APIKey,
+    Build,
     ExecResult,
     FileEntry,
     Node,
     Sandbox,
     Snapshot,
     Template,
+    Webhook,
 )
 
 # DEFAULT_TIMEOUT bounds a single control-plane HTTP call. Long
@@ -59,12 +61,18 @@ class _SandboxResource(_Resource):
         memory_mb: int = 512,
         disk_gb: int = 5,
         region: Optional[str] = None,
+        auto_stop_minutes: Optional[int] = None,
+        auto_archive_minutes: Optional[int] = None,
     ) -> Sandbox:
         """Create a new sandbox.
 
         Pass exactly one of ``template`` (a template ID) or ``snapshot``
         (a snapshot ID). The master accepts either as the source artifact;
         the SDK encodes the right ``source`` field for you.
+
+        ``auto_stop_minutes`` / ``auto_archive_minutes`` are optional;
+        omitting them defaults to 15 / 1440 minutes on the master side.
+        Pass 0 to disable the corresponding policy.
         """
         if (template is None) == (snapshot is None):
             raise ValueError("exactly one of template or snapshot must be set")
@@ -82,6 +90,10 @@ class _SandboxResource(_Resource):
             body["snapshot_id"] = snapshot
         if region:
             body["region"] = region
+        if auto_stop_minutes is not None:
+            body["auto_stop_minutes"] = auto_stop_minutes
+        if auto_archive_minutes is not None:
+            body["auto_archive_minutes"] = auto_archive_minutes
         data = self._client._request("POST", "/v1/sandboxes", json=body)
         return Sandbox.from_dict(data)
 
@@ -282,11 +294,90 @@ class _SnapshotResource(_Resource):
 
 
 class _TemplateResource(_Resource):
-    """``client.template`` — template metadata reads."""
+    """``client.template`` — template metadata reads + async Dockerfile builds."""
 
     def list(self) -> list[Template]:
         data = self._client._request("GET", "/v1/templates")
         return [Template.from_dict(d) for d in (data or [])]
+
+    def build(
+        self,
+        dockerfile: str,
+        name: str,
+        version: str,
+        wait: bool = False,
+        poll_interval: float = 2.0,
+        timeout: float = 600.0,
+    ) -> Build:
+        """Kick off an async Dockerfile → Template build.
+
+        ``dockerfile`` is the raw text. Pass ``wait=True`` to block until
+        the build reaches COMPLETED or FAILED; otherwise the call returns
+        as soon as the master accepts the build (status=PENDING).
+        """
+        accepted = self._client._request(
+            "POST", "/v1/templates/build",
+            json={"name": name, "version": version, "dockerfile": dockerfile},
+        )
+        build_id = (accepted or {}).get("build_id")
+        if not build_id:
+            raise VajraAPIError(500, "master did not return a build_id")
+        b = Build.from_dict(accepted)
+        if not wait:
+            return b
+        return self._poll_build(build_id, poll_interval=poll_interval, timeout=timeout)
+
+    def build_status(self, build_id: str) -> Build:
+        """Fetch the current state of a build."""
+        data = self._client._request("GET", f"/v1/templates/builds/{build_id}")
+        return Build.from_dict(data)
+
+    def builds(self) -> list[Build]:
+        """List builds for the calling account."""
+        data = self._client._request("GET", "/v1/templates/builds")
+        return [Build.from_dict(d) for d in (data or [])]
+
+    def _poll_build(self, build_id: str, poll_interval: float, timeout: float) -> Build:
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            b = self.build_status(build_id)
+            if b.status in ("COMPLETED", "FAILED"):
+                return b
+            time.sleep(poll_interval)
+        raise VajraAPIError(504, f"build {build_id} did not complete within {timeout}s")
+
+
+class _WebhookResource(_Resource):
+    """``client.webhook`` — outbound notification subscriptions."""
+
+    def create(self, url: str, events: list[str]) -> Webhook:
+        """Subscribe to one or more events.
+
+        The HMAC secret on the returned ``Webhook`` is only populated on
+        this call; persist it now or you'll have to delete and recreate.
+        """
+        data = self._client._request(
+            "POST", "/v1/webhooks", json={"url": url, "events": list(events)}
+        )
+        return Webhook.from_dict(data)
+
+    def list(self) -> list[Webhook]:
+        data = self._client._request("GET", "/v1/webhooks")
+        return [Webhook.from_dict(d) for d in (data or [])]
+
+    def get(self, webhook_id: str) -> Webhook:
+        data = self._client._request("GET", f"/v1/webhooks/{webhook_id}")
+        return Webhook.from_dict(data)
+
+    def delete(self, webhook_id: str) -> None:
+        self._client._request("DELETE", f"/v1/webhooks/{webhook_id}")
+
+    def test(self, webhook_id: str) -> bool:
+        """Fire a synthetic delivery at the receiver. Returns the delivered flag."""
+        data = self._client._request("POST", f"/v1/webhooks/{webhook_id}/test")
+        return bool((data or {}).get("delivered", False))
 
 
 class _NodeResource(_Resource):
@@ -343,6 +434,7 @@ class VajraClient:
         self.template = _TemplateResource(self)
         self.node = _NodeResource(self)
         self.api_keys = _APIKeyResource(self)
+        self.webhook = _WebhookResource(self)
 
     # Internals -----------------------------------------------------------
 

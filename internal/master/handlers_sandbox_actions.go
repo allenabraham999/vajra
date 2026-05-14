@@ -53,6 +53,7 @@ func (h *Handlers) execSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	h.touchActivity(r.Context(), sb.ID)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -98,6 +99,7 @@ func (h *Handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
 		h.log().Error("startSandbox: state", "err", err)
 	}
 	h.recordUsageStart(r.Context(), accountID, sb.ID, sb.Config)
+	h.touchActivity(r.Context(), sb.ID)
 	_ = h.Tracker.Complete(r.Context(), opID, nil)
 
 	out, _ := h.Store.Sandboxes().GetByID(r.Context(), accountID, sb.ID)

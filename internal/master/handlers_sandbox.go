@@ -44,15 +44,22 @@ const (
 )
 
 // createSandboxRequest is the body of POST /v1/sandboxes.
+//
+// AutoStopMinutes / AutoArchiveMinutes are optional. Omitting them or
+// passing zero falls back to models.DefaultAutoStopMinutes /
+// DefaultAutoArchiveMinutes. Passing a negative number disables the
+// corresponding policy (encoded as 0 in the DB row).
 type createSandboxRequest struct {
-	Name       string `json:"name"`
-	Source     string `json:"source"` // "image" | "snapshot"
-	TemplateID string `json:"template_id,omitempty"`
-	SnapshotID string `json:"snapshot_id,omitempty"`
-	VCPUs      int    `json:"vcpus"`
-	MemoryMB   int    `json:"memory_mb"`
-	DiskGB     int    `json:"disk_gb"`
-	Region     string `json:"region,omitempty"`
+	Name               string `json:"name"`
+	Source             string `json:"source"` // "image" | "snapshot"
+	TemplateID         string `json:"template_id,omitempty"`
+	SnapshotID         string `json:"snapshot_id,omitempty"`
+	VCPUs              int    `json:"vcpus"`
+	MemoryMB           int    `json:"memory_mb"`
+	DiskGB             int    `json:"disk_gb"`
+	Region             string `json:"region,omitempty"`
+	AutoStopMinutes    *int   `json:"auto_stop_minutes,omitempty"`
+	AutoArchiveMinutes *int   `json:"auto_archive_minutes,omitempty"`
 }
 
 // validate returns a user-facing error for malformed input.
@@ -164,6 +171,20 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		return
 	}
 	now := h.now().UTC()
+	autoStop := models.DefaultAutoStopMinutes
+	if body.AutoStopMinutes != nil {
+		autoStop = *body.AutoStopMinutes
+		if autoStop < 0 {
+			autoStop = 0
+		}
+	}
+	autoArchive := models.DefaultAutoArchiveMinutes
+	if body.AutoArchiveMinutes != nil {
+		autoArchive = *body.AutoArchiveMinutes
+		if autoArchive < 0 {
+			autoArchive = 0
+		}
+	}
 	sb := &models.Sandbox{
 		ID: sandboxID, Name: body.Name, AccountID: accountID,
 		NodeID: &node.ID, ClusterID: &cluster.ID,
@@ -172,7 +193,10 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		Config: models.SandboxConfig{
 			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
 		},
-		CreatedAt: now, UpdatedAt: now,
+		AutoStopMinutes:    autoStop,
+		AutoArchiveMinutes: autoArchive,
+		LastActivity:       now,
+		CreatedAt:          now, UpdatedAt: now,
 	}
 	if err := h.Store.Sandboxes().Create(r.Context(), sb); err != nil {
 		h.log().Error("createSandbox: insert", "err", err)

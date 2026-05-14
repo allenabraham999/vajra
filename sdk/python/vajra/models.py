@@ -57,6 +57,9 @@ class Sandbox:
     template_id: str = ""
     state: str = ""
     config: SandboxConfig = field(default_factory=SandboxConfig)
+    auto_stop_minutes: int = 0
+    auto_archive_minutes: int = 0
+    last_activity: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     operation_id: str = ""
@@ -67,6 +70,7 @@ class Sandbox:
         d["config"] = SandboxConfig.from_dict(d.get("config") or {})
         d["created_at"] = _parse_dt(d.get("created_at"))
         d["updated_at"] = _parse_dt(d.get("updated_at"))
+        d["last_activity"] = _parse_dt(d.get("last_activity"))
         return cls(**_filter_known(cls, d))
 
 
@@ -184,6 +188,48 @@ class APIKey:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "APIKey":
+        d = dict(data or {})
+        d["created_at"] = _parse_dt(d.get("created_at"))
+        return cls(**_filter_known(cls, d))
+
+
+@dataclass
+class Build:
+    """Async Dockerfile → Template build job."""
+
+    id: str = ""
+    account_id: str = ""
+    template_name: str = ""
+    template_version: str = ""
+    status: str = ""
+    template_id: Optional[str] = None
+    error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Build":
+        d = dict(data or {})
+        d["created_at"] = _parse_dt(d.get("created_at"))
+        d["completed_at"] = _parse_dt(d.get("completed_at"))
+        return cls(**_filter_known(cls, d))
+
+
+@dataclass
+class Webhook:
+    """Per-account outbound notification target."""
+
+    id: str = ""
+    account_id: str = ""
+    url: str = ""
+    # Only populated on the create response.
+    secret: str = ""
+    events: list[str] = field(default_factory=list)
+    active: bool = True
+    created_at: Optional[datetime] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Webhook":
         d = dict(data or {})
         d["created_at"] = _parse_dt(d.get("created_at"))
         return cls(**_filter_known(cls, d))

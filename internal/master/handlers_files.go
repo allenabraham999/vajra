@@ -53,6 +53,7 @@ func (h *Handlers) uploadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	h.touchActivity(r.Context(), sb.ID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -87,6 +88,7 @@ func (h *Handlers) downloadFile(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, res.Body); err != nil {
 		h.log().Warn("downloadFile: copy", "err", err)
 	}
+	h.touchActivity(r.Context(), sb.ID)
 }
 
 // listFiles returns the JSON entries the agent emits.

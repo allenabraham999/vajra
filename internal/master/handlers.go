@@ -80,6 +80,12 @@ type Handlers struct {
 	// the store, they just never deliver.
 	Webhooks *WebhookManager
 
+	// Lifecycle owns the auto-stop / auto-archive sweep loop AND the
+	// per-call TouchActivity hook fired by exec / file upload /
+	// terminal connect. Nil → no idle enforcement and no activity
+	// tracking (legacy behaviour).
+	Lifecycle *LifecycleManager
+
 	// PublicBaseDomain is the apex domain the proxy is reachable on
 	// (e.g. "vajra.dev"). Used to suggest user-friendly share URLs;
 	// empty means the master will return a token but not a URL.
@@ -278,4 +284,16 @@ func requestIDFromContext(ctx context.Context) string {
 // full client deadline.
 func requestContextWithTimeout(r *http.Request, d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), d)
+}
+
+// touchActivity records "the user just interacted with this sandbox"
+// for the LifecycleManager's idle-detection logic. Nil-safe so handler
+// callsites don't need a guard on every path. Detached from r.Context()
+// so a slow background write doesn't outlive the request — the write
+// is meant to happen quickly and best-effort.
+func (h *Handlers) touchActivity(_ context.Context, sandboxID string) {
+	if h.Lifecycle == nil || sandboxID == "" {
+		return
+	}
+	go h.Lifecycle.TouchActivity(context.Background(), sandboxID)
 }

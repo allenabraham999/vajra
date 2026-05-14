@@ -72,6 +72,8 @@ func (s *Server) Routes() http.Handler {
 	// Public routes — no auth.
 	mux.HandleFunc("GET /health", h.getHealth)
 	mux.HandleFunc("GET /version", h.getVersion)
+	mux.HandleFunc("GET /v1/docs", h.docsSwaggerUI)
+	mux.HandleFunc("GET /v1/docs/openapi.yaml", h.docsOpenAPISpec)
 	// Rate-limit auth endpoints under the shared "anonymous" bucket so a
 	// brute-force login loop can't outpace a single tenant's quota.
 	mux.Handle("POST /v1/auth/register", s.limiter.Middleware(http.HandlerFunc(h.register)))

@@ -12,6 +12,7 @@ import ApiKeysPage from './pages/ApiKeys'
 import UsagePage from './pages/Usage'
 import AdminPage from './pages/Admin'
 import MetricsPage from './pages/Metrics'
+import WebhooksPage from './pages/Webhooks'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { token } = useAuth()
@@ -37,6 +38,7 @@ function AppRoutes() {
         <Route path="templates" element={<TemplatesPage />} />
         <Route path="nodes" element={<NodesPage />} />
         <Route path="api-keys" element={<ApiKeysPage />} />
+        <Route path="webhooks" element={<WebhooksPage />} />
         <Route path="usage" element={<UsagePage />} />
         <Route path="metrics" element={<MetricsPage />} />
         <Route path="admin" element={<AdminPage />} />

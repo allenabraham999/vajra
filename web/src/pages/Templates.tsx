@@ -15,6 +15,7 @@ export default function TemplatesPage() {
   const [snaps, setSnaps] = useState<Snapshot[]>([])
   const [openCreate, setOpenCreate] = useState(false)
   const [openPromote, setOpenPromote] = useState(false)
+  const [openBuild, setOpenBuild] = useState(false)
 
   async function load() {
     try {
@@ -48,6 +49,12 @@ export default function TemplatesPage() {
               className="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-800"
             >
               From snapshot
+            </button>
+            <button
+              onClick={() => setOpenBuild(true)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-emerald-700 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-900/30"
+            >
+              Build Custom Template
             </button>
             <button
               onClick={() => setOpenCreate(true)}
@@ -115,7 +122,111 @@ export default function TemplatesPage() {
           load()
         }}
       />
+
+      <BuildTemplateModal
+        open={openBuild}
+        onClose={() => setOpenBuild(false)}
+        onCompleted={() => {
+          setOpenBuild(false)
+          load()
+        }}
+      />
     </>
+  )
+}
+
+function BuildTemplateModal({
+  open,
+  onClose,
+  onCompleted,
+}: {
+  open: boolean
+  onClose: () => void
+  onCompleted: () => void
+}) {
+  const toast = useToast()
+  const [name, setName] = useState('')
+  const [version, setVersion] = useState('1.0.0')
+  const [dockerfile, setDockerfile] = useState(
+    'FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y python3\n',
+  )
+  const [status, setStatus] = useState<string>('')
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (busy) return
+    setBusy(true)
+    setStatus('Queuing…')
+    try {
+      const accepted = await api.templates.build({ name, version, dockerfile })
+      setStatus('PENDING')
+      // Poll until terminal state.
+      const deadline = Date.now() + 10 * 60 * 1000
+      while (Date.now() < deadline) {
+        const b = await api.templates.buildStatus(accepted.build_id)
+        setStatus(b.status)
+        if (b.status === 'COMPLETED') {
+          toast.success(`Template ${name}@${version} built`)
+          onCompleted()
+          return
+        }
+        if (b.status === 'FAILED') {
+          toast.error(b.error || 'Build failed')
+          return
+        }
+        await new Promise((r) => setTimeout(r, 2000))
+      }
+      toast.error('Build timed out')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Build failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="Build custom template" size="lg">
+      <form onSubmit={submit} className="space-y-3">
+        <Field label="Name">
+          <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required />
+        </Field>
+        <Field label="Version">
+          <input value={version} onChange={(e) => setVersion(e.target.value)} className={inputCls} required />
+        </Field>
+        <Field label="Dockerfile">
+          <textarea
+            value={dockerfile}
+            onChange={(e) => setDockerfile(e.target.value)}
+            rows={10}
+            className={`${inputCls} font-mono text-xs`}
+            required
+          />
+        </Field>
+        {status && (
+          <div className="text-xs text-zinc-400">
+            Status: <span className="font-mono text-emerald-300">{status}</span>
+          </div>
+        )}
+        <div className="flex justify-end gap-2 pt-2 border-t border-zinc-800">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-800"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy}
+            className="rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
+          >
+            {busy && <Spinner size={14} />}
+            Build
+          </button>
+        </div>
+      </form>
+    </Modal>
   )
 }
 

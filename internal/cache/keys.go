@@ -29,6 +29,13 @@ const AccountSandboxCountTTL = 60 * time.Second
 // invalidation a problem.
 const TemplateTTL = 5 * time.Minute
 
+// SandboxLastActivityTTL covers two full LifecycleManager sweeps so a
+// brief Redis outage doesn't fall through to "row never touched" and
+// trip an auto-stop on a sandbox the user is actively using. The
+// Postgres column is the source of truth for the sweep query; Redis
+// is a soft mirror for hot-path activity writes.
+const SandboxLastActivityTTL = 2 * time.Minute
+
 // SandboxStateKey returns the cache key holding a sandbox's state.
 func SandboxStateKey(sandboxID string) string {
 	return fmt.Sprintf("sandbox:%s:state", sandboxID)
@@ -49,4 +56,11 @@ func AccountSandboxCountKey(accountID string) string {
 // TemplateKey returns the cache key holding a template's JSON metadata.
 func TemplateKey(templateID string) string {
 	return fmt.Sprintf("template:%s", templateID)
+}
+
+// SandboxLastActivityKey returns the cache key holding the unix
+// timestamp of the sandbox's most recent activity (exec, file upload,
+// terminal connect).
+func SandboxLastActivityKey(sandboxID string) string {
+	return fmt.Sprintf("sandbox:%s:last_activity", sandboxID)
 }

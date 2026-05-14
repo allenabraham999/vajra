@@ -4,6 +4,7 @@ import type {
   APIKey,
   AuthLoginResponse,
   AuthRegisterResponse,
+  Build,
   Cluster,
   CreateAPIKeyResponse,
   ExecResult,
@@ -14,6 +15,8 @@ import type {
   Snapshot,
   Template,
   UsageResponse,
+  Webhook,
+  WebhookEventName,
 } from './types'
 
 // JWT lives in module-private memory. Reload = logout, by design.
@@ -104,6 +107,8 @@ export const sandboxes = {
     memory_mb: number
     disk_gb: number
     region?: string
+    auto_stop_minutes?: number
+    auto_archive_minutes?: number
   }) =>
     request<Sandbox>({ method: 'POST', url: '/v1/sandboxes', data: body }),
   exec: (id: string, command: string, timeout_ms = 30_000) =>
@@ -184,6 +189,33 @@ export const templates = {
     snapshot_path?: string
   }) =>
     request<Template>({ method: 'POST', url: '/v1/templates', data: body }),
+  build: (body: { name: string; version: string; dockerfile: string }) =>
+    request<{ build_id: string; status: string; template_name: string; template_version: string; created_at: string }>({
+      method: 'POST',
+      url: '/v1/templates/build',
+      data: body,
+    }),
+  buildStatus: (id: string) =>
+    request<Build>({ method: 'GET', url: `/v1/templates/builds/${id}` }),
+  listBuilds: () => request<Build[]>({ method: 'GET', url: '/v1/templates/builds' }),
+}
+
+// --- Webhooks ---
+export const webhooks = {
+  list: () => request<Webhook[]>({ method: 'GET', url: '/v1/webhooks' }),
+  create: (url: string, events: WebhookEventName[]) =>
+    request<Webhook>({
+      method: 'POST',
+      url: '/v1/webhooks',
+      data: { url, events },
+    }),
+  delete: (id: string) =>
+    request<void>({ method: 'DELETE', url: `/v1/webhooks/${id}` }),
+  test: (id: string) =>
+    request<{ webhook_id: string; delivered: boolean }>({
+      method: 'POST',
+      url: `/v1/webhooks/${id}/test`,
+    }),
 }
 
 // --- Admin (clusters, nodes) ---
@@ -225,6 +257,7 @@ export default {
   sandboxes,
   snapshots: snapshotsApi,
   templates,
+  webhooks,
   clusters,
   nodes,
   apiKeys,

@@ -235,6 +235,14 @@ func main() {
 	reconciler := master.NewReconciler(st, pool.AsAgentLister(), logger, cfg.ReconcileInterval)
 	go reconciler.Run(ctx)
 
+	// Builder, webhooks, and lifecycle sweeps. All three are optional
+	// — they default to no-op behaviour when their backing store rows
+	// are empty.
+	handlers.Builder = master.NewBuildManager(st, nil, logger)
+	handlers.Webhooks = master.NewWebhookManager(st, logger)
+	handlers.Lifecycle = master.NewLifecycleManager(st, pool, c, handlers, logger)
+	go handlers.Lifecycle.Run(ctx)
+
 	srv := master.NewServer(master.ServerConfig{
 		Addr:           cfg.ListenAddr,
 		Logger:         logger,

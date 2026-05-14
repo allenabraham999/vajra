@@ -58,9 +58,44 @@ export interface Sandbox {
   template_id: string
   state: SandboxState
   config: SandboxConfig
+  auto_stop_minutes?: number
+  auto_archive_minutes?: number
+  last_activity?: string
   created_at: string
   updated_at: string
   operation_id?: string
+}
+
+export type BuildStatus = 'PENDING' | 'BUILDING' | 'COMPLETED' | 'FAILED'
+
+export interface Build {
+  id: string
+  account_id: string
+  template_name: string
+  template_version: string
+  status: BuildStatus
+  template_id?: string | null
+  error?: string | null
+  created_at: string
+  completed_at?: string | null
+}
+
+export type WebhookEventName =
+  | 'sandbox.created'
+  | 'sandbox.running'
+  | 'sandbox.stopped'
+  | 'sandbox.destroyed'
+  | 'sandbox.error'
+  | 'sandbox.archived'
+
+export interface Webhook {
+  id: string
+  account_id: string
+  url: string
+  secret?: string
+  events: WebhookEventName[]
+  active: boolean
+  created_at: string
 }
 
 export interface NodeCapacity {

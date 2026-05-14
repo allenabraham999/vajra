@@ -51,6 +51,7 @@ func newRootCmd() *cobra.Command {
 		newPoolCmd(),
 		newFileCmd(),
 		newAPIKeyCmd(),
+		newWebhookCmd(),
 		newAdminCmd(),
 	)
 	return root

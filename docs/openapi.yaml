@@ -1,0 +1,922 @@
+openapi: 3.0.3
+info:
+  title: Vajra API
+  description: |
+    Vajra is a self-hosted sandbox cloud platform for AI agents. It
+    provisions isolated Linux microVMs on bare metal via Cloud Hypervisor
+    with sub-200ms boot via snapshot restore.
+
+    All endpoints below are served by `vajra-master`. Authentication is
+    either an API key (`Authorization: Bearer vj_live_<32 hex>`) or a
+    short-lived JWT obtained via `POST /v1/auth/login`.
+  version: "1.0.0"
+  contact:
+    name: Vajra
+    url: https://github.com/allenabraham999/vajra
+servers:
+  - url: http://localhost:8080
+    description: Local dev master
+  - url: https://api.vajra.dev
+    description: Production
+tags:
+  - name: Auth
+  - name: Sandboxes
+  - name: Snapshots
+  - name: Templates
+  - name: Builds
+  - name: Webhooks
+  - name: API Keys
+  - name: Files
+  - name: Nodes
+  - name: Usage
+
+security:
+  - BearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      tags: [Meta]
+      security: []
+      responses:
+        "200":
+          description: Master is running
+
+  /version:
+    get:
+      summary: Build provenance
+      tags: [Meta]
+      security: []
+      responses:
+        "200":
+          description: Version + commit + built-at
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Create a new account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Exchange email + password for a JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/api-keys:
+    get:
+      tags: [API Keys]
+      summary: List API keys for the calling account
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/APIKey" }
+    post:
+      tags: [API Keys]
+      summary: Create a new API key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created. The raw key is returned exactly once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyCreated"
+
+  /v1/api-keys/{id}:
+    delete:
+      tags: [API Keys]
+      summary: Revoke an API key
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sandboxes:
+    get:
+      tags: [Sandboxes]
+      summary: List the calling account's sandboxes
+      parameters:
+        - { in: query, name: limit, schema: { type: integer } }
+        - { in: query, name: offset, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Sandbox" }
+    post:
+      tags: [Sandboxes]
+      summary: Create a sandbox
+      description: |
+        Source is either `image` (require `template_id`) or `snapshot`
+        (require `snapshot_id`). Auto-stop / auto-archive minutes default
+        to 15 / 1440 if omitted; pass 0 (or a negative number) to disable
+        the corresponding policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSandboxRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429":
+          description: Account quota exceeded
+        "503":
+          description: No node has capacity
+
+  /v1/sandboxes/{id}:
+    get:
+      tags: [Sandboxes]
+      summary: Get one sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Sandboxes]
+      summary: Destroy a sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Accepted; row transitions to DESTROYED }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sandboxes/{id}/exec:
+    post:
+      tags: [Sandboxes]
+      summary: Run a command inside the sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command: { type: string }
+                timeout_ms: { type: integer, default: 30000 }
+      responses:
+        "200":
+          description: Exec result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExecResult" }
+
+  /v1/sandboxes/{id}/stop:
+    post:
+      tags: [Sandboxes]
+      summary: Stop a running sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Accepted; row transitions to STOPPED }
+
+  /v1/sandboxes/{id}/start:
+    post:
+      tags: [Sandboxes]
+      summary: Start a stopped sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Accepted; row transitions to RUNNING }
+
+  /v1/sandboxes/{id}/snapshot:
+    post:
+      tags: [Snapshots]
+      summary: Snapshot the sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Snapshot" }
+
+  /v1/sandboxes/{id}/snapshots:
+    get:
+      tags: [Snapshots]
+      summary: List snapshots for a sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Snapshot" }
+
+  /v1/sandboxes/{id}/archive:
+    post:
+      tags: [Sandboxes]
+      summary: Archive a stopped sandbox to cold storage
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Accepted }
+
+  /v1/sandboxes/{id}/rehydrate:
+    post:
+      tags: [Sandboxes]
+      summary: Restore an archived sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Sandbox restored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+
+  /v1/sandboxes/{id}/files/upload:
+    post:
+      tags: [Files]
+      summary: Upload a file into the sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: header, name: X-Vajra-Path, required: true, schema: { type: string } }
+        - { in: header, name: X-Vajra-Mode, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200": { description: Uploaded }
+
+  /v1/sandboxes/{id}/files/download:
+    get:
+      tags: [Files]
+      summary: Download a file from the sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: query, name: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+
+  /v1/sandboxes/{id}/files/list:
+    get:
+      tags: [Files]
+      summary: List entries in a directory inside the sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: query, name: dir, schema: { type: string, default: "/" } }
+      responses:
+        "200":
+          description: OK
+
+  /v1/snapshots/{id}/restore:
+    post:
+      tags: [Snapshots]
+      summary: Restore a snapshot into a fresh sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                vcpus: { type: integer }
+                memory_mb: { type: integer }
+                disk_gb: { type: integer }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+
+  /v1/snapshots/{id}/clone:
+    post:
+      tags: [Snapshots]
+      summary: Clone a snapshot into a fresh sandbox
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+
+  /v1/snapshots/{id}/promote:
+    post:
+      tags: [Templates]
+      summary: Promote a snapshot to a named template
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, version]
+              properties:
+                name: { type: string }
+                version: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+
+  /v1/templates:
+    get:
+      tags: [Templates]
+      summary: List templates owned by the calling account
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Template" }
+    post:
+      tags: [Templates]
+      summary: Register a pre-built template
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTemplateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+
+  /v1/templates/build:
+    post:
+      tags: [Builds]
+      summary: Build a template asynchronously from a Dockerfile
+      description: |
+        Accepts either `application/json` (`{name, version, dockerfile}`)
+        or `multipart/form-data` with fields `name`, `version`, and
+        `dockerfile` (text or file). The build runs in the background;
+        poll `GET /v1/templates/builds/{id}` until status is COMPLETED
+        or FAILED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, version, dockerfile]
+              properties:
+                name: { type: string }
+                version: { type: string }
+                dockerfile: { type: string }
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, version, dockerfile]
+              properties:
+                name: { type: string }
+                version: { type: string }
+                dockerfile:
+                  type: string
+                  format: binary
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BuildAccepted" }
+
+  /v1/templates/builds:
+    get:
+      tags: [Builds]
+      summary: List builds for the calling account
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Build" }
+
+  /v1/templates/builds/{id}:
+    get:
+      tags: [Builds]
+      summary: Get build status
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Build" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhooks
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Webhook" }
+    post:
+      tags: [Webhooks]
+      summary: Create a webhook
+      description: |
+        The HMAC secret returned in the response body is shown exactly
+        once. Subsequent reads omit it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWebhookRequest" }
+      responses:
+        "201":
+          description: Created (secret included)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+
+  /v1/webhooks/{id}:
+    get:
+      tags: [Webhooks]
+      summary: Get a webhook
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+    delete:
+      tags: [Webhooks]
+      summary: Delete a webhook
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+
+  /v1/webhooks/{id}/test:
+    post:
+      tags: [Webhooks]
+      summary: Fire a synthetic payload to the webhook URL
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Delivery attempted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook_id: { type: string }
+                  delivered: { type: boolean }
+
+  /v1/clusters:
+    get:
+      tags: [Admin]
+      summary: List clusters
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Cluster" }
+
+  /v1/nodes:
+    get:
+      tags: [Nodes]
+      summary: List nodes (admin only)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Node" }
+
+  /v1/nodes/{id}/drain:
+    post:
+      tags: [Nodes]
+      summary: Mark a node as draining (admin only)
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Draining }
+
+  /v1/usage:
+    get:
+      tags: [Usage]
+      summary: Per-account billing rollup
+      parameters:
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageResponse" }
+
+  /v1/docs:
+    get:
+      tags: [Meta]
+      summary: Swagger UI (HTML)
+      security: []
+      responses:
+        "200":
+          description: Swagger UI page
+          content:
+            text/html:
+              schema: { type: string }
+
+  /v1/docs/openapi.yaml:
+    get:
+      tags: [Meta]
+      summary: The OpenAPI 3.0 spec (YAML)
+      security: []
+      responses:
+        "200":
+          description: Spec
+          content:
+            application/yaml:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: vj_live_<hex> or JWT
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        status: { type: string }
+
+    Version:
+      type: object
+      properties:
+        version: { type: string }
+        commit: { type: string }
+        built_at: { type: string }
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+
+    RegisterResponse:
+      type: object
+      properties:
+        account_id: { type: string }
+        api_key: { type: string, description: "Shown exactly once." }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string }
+        password: { type: string }
+
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    APIKey:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    APIKeyCreated:
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - type: object
+          properties:
+            key: { type: string }
+
+    Sandbox:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        account_id: { type: string }
+        node_id: { type: string, nullable: true }
+        cluster_id: { type: string, nullable: true }
+        template_id: { type: string }
+        state:
+          type: string
+          enum:
+            [PENDING, CREATING, RUNNING, PAUSING, PAUSED, STOPPING,
+             STOPPED, ARCHIVING, ARCHIVED, DESTROYING, DESTROYED, ERROR]
+        config:
+          type: object
+          properties:
+            vcpus: { type: integer }
+            memory_mb: { type: integer }
+            disk_gb: { type: integer }
+        auto_stop_minutes: { type: integer }
+        auto_archive_minutes: { type: integer }
+        last_activity: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateSandboxRequest:
+      type: object
+      required: [name, source, vcpus, memory_mb, disk_gb]
+      properties:
+        name: { type: string }
+        source:
+          type: string
+          enum: [image, snapshot]
+        template_id: { type: string }
+        snapshot_id: { type: string }
+        vcpus: { type: integer }
+        memory_mb: { type: integer }
+        disk_gb: { type: integer }
+        region: { type: string }
+        auto_stop_minutes: { type: integer, nullable: true }
+        auto_archive_minutes: { type: integer, nullable: true }
+
+    ExecResult:
+      type: object
+      properties:
+        exit_code: { type: integer }
+        stdout: { type: string }
+        stderr: { type: string }
+
+    Snapshot:
+      type: object
+      properties:
+        id: { type: string }
+        sandbox_id: { type: string }
+        account_id: { type: string }
+        node_id: { type: string }
+        storage_path: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+
+    Template:
+      type: object
+      properties:
+        id: { type: string }
+        account_id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        hash: { type: string }
+        rootfs_path: { type: string }
+        kernel_path: { type: string }
+        snapshot_path: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateTemplateRequest:
+      type: object
+      required: [name, version, hash]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        hash: { type: string }
+        rootfs_path: { type: string }
+        kernel_path: { type: string }
+        snapshot_path: { type: string }
+
+    Build:
+      type: object
+      properties:
+        id: { type: string }
+        account_id: { type: string }
+        template_name: { type: string }
+        template_version: { type: string }
+        status:
+          type: string
+          enum: [PENDING, BUILDING, COMPLETED, FAILED]
+        template_id: { type: string, nullable: true }
+        error: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+
+    BuildAccepted:
+      type: object
+      properties:
+        build_id: { type: string }
+        status: { type: string }
+        template_name: { type: string }
+        template_version: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Webhook:
+      type: object
+      properties:
+        id: { type: string }
+        account_id: { type: string }
+        url: { type: string }
+        secret:
+          type: string
+          description: HMAC-SHA256 key. Only present in the response of POST /v1/webhooks.
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+              [sandbox.created, sandbox.running, sandbox.stopped,
+               sandbox.destroyed, sandbox.error, sandbox.archived]
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, events]
+      properties:
+        url: { type: string, format: uri }
+        events:
+          type: array
+          items: { type: string }
+
+    Cluster:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        region: { type: string }
+        state: { type: string, enum: [ACTIVE, DRAINING, OFFLINE] }
+        created_at: { type: string, format: date-time }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string }
+        cluster_id: { type: string }
+        hostname: { type: string }
+        ip: { type: string }
+        state:
+          type: string
+          enum: [REGISTERING, ACTIVE, DRAINING, QUARANTINED, OFFLINE, DECOMMISSIONED]
+        capacity:
+          type: object
+          properties:
+            total_cpu: { type: integer }
+            total_memory_mb: { type: integer }
+            total_disk_gb: { type: integer }
+        used_resources:
+          type: object
+          properties:
+            used_cpu: { type: integer }
+            used_memory_mb: { type: integer }
+            used_disk_gb: { type: integer }
+        last_heartbeat: { type: string, format: date-time }
+
+    UsageResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              sandbox_id: { type: string }
+              sandbox_name: { type: string }
+              vcpus: { type: integer }
+              memory_mb: { type: integer }
+              disk_gb: { type: integer }
+              duration_hours: { type: number }
+              cost_usd: { type: number }
+        total_cost_usd: { type: number }
+        vcpu_hours: { type: number }
+        memory_gb_hours: { type: number }
+        storage_gb_hours: { type: number }
