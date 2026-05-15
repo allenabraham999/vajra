@@ -182,6 +182,11 @@ export interface AuthRegisterResponse {
   api_key: string
 }
 
+export interface AuthConfigResponse {
+  google_oauth_enabled: boolean
+  email_auth_enabled: boolean
+}
+
 export interface ExecResult {
   exit_code: number
   stdout: string

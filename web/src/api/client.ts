@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios'
 import type { AxiosInstance, AxiosRequestConfig } from 'axios'
 import type {
   APIKey,
+  AuthConfigResponse,
   AuthLoginResponse,
   AuthRegisterResponse,
   Build,
@@ -91,7 +92,15 @@ export const auth = {
       url: '/v1/auth/register',
       data: { email, password },
     }),
+  config: () =>
+    request<AuthConfigResponse>({ method: 'GET', url: '/v1/auth/config' }),
 }
+
+// apiBase is the absolute URL prefix for full-page navigations to master
+// endpoints (the OAuth initiate redirect, mainly). Empty string keeps
+// same-origin behavior, matching the axios `baseURL` default.
+export const apiBase: string =
+  (import.meta.env.VITE_API_URL as string | undefined) ?? ''
 
 // --- Sandboxes ---
 export const sandboxes = {
