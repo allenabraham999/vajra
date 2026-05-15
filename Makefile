@@ -9,11 +9,16 @@ BINARIES := vajra-agent vajra-master vajra-proxy vajra
 
 all: build
 
-build: $(BINARIES:%=$(BIN_DIR)/%) stage-ch
-
-$(BIN_DIR)/%:
+# build is .PHONY so it always invokes go build; the Go toolchain has its
+# own per-package cache, so a no-op rebuild is cheap. The previous
+# pattern-rule version skipped rebuilds whenever bin/<name> existed,
+# which silently shipped stale binaries on deploy.
+build: stage-ch
 	@mkdir -p $(BIN_DIR)
-	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $@ ./cmd/$*
+	@for b in $(BINARIES); do \
+	    echo "  building $$b..."; \
+	    $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$$b ./cmd/$$b; \
+	done
 
 # stage-ch copies the locally-installed cloud-hypervisor binary into bin/
 # so master can serve it from /internal/binaries/cloud-hypervisor to
