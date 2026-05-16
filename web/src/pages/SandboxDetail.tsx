@@ -381,18 +381,21 @@ function ExecTab({ sandboxId }: { sandboxId: string }) {
 
 function FilesTab({ sandboxId }: { sandboxId: string }) {
   const toast = useToast()
-  const [path, setPath] = useState('/')
+  const [path, setPath] = useState('/tmp')
   const [items, setItems] = useState<FileEntry[]>([])
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   async function load(p = path) {
     setLoading(true)
+    setError(null)
     try {
       const r = await api.sandboxes.listFiles(sandboxId, p)
       setItems(r ?? [])
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'list failed')
+      setItems([])
+      setError(err instanceof Error ? err.message : 'failed to list files')
     } finally {
       setLoading(false)
     }
@@ -415,6 +418,17 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
       toast.error(err instanceof Error ? err.message : 'upload failed')
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  async function onDelete(full: string, name: string) {
+    if (!window.confirm(`Delete ${name}? This cannot be undone.`)) return
+    try {
+      await api.sandboxes.deleteFile(sandboxId, full)
+      toast.success(`Deleted ${name}`)
+      load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'delete failed')
     }
   }
 
@@ -448,8 +462,14 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
           <div className="p-8 text-center text-zinc-500">
             <Spinner size={16} />
           </div>
+        ) : error ? (
+          <div className="p-8 text-center text-xs text-red-400 font-mono">
+            {error}
+          </div>
         ) : items.length === 0 ? (
-          <div className="p-8 text-center text-xs text-zinc-500">No files yet</div>
+          <div className="p-8 text-center text-xs text-zinc-500">
+            No files in {path}
+          </div>
         ) : (
           <table className="w-full text-sm">
             <thead className="text-[11px] text-zinc-500 uppercase tracking-wider">
@@ -481,15 +501,23 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
                     <td className="px-4 py-2 text-zinc-500 text-xs">
                       {formatRelative(f.mod_time)}
                     </td>
-                    <td className="px-4 py-2 text-right">
+                    <td className="px-4 py-2 text-right whitespace-nowrap space-x-1.5">
                       {!f.is_dir && (
-                        <a
-                          href={api.sandboxes.downloadFileURL(sandboxId, full)}
-                          download
-                          className="inline-flex items-center gap-1 rounded border border-zinc-800 px-2 py-0.5 text-[11px] hover:bg-zinc-800"
-                        >
-                          <Download size={11} /> Download
-                        </a>
+                        <>
+                          <a
+                            href={api.sandboxes.downloadFileURL(sandboxId, full)}
+                            download
+                            className="inline-flex items-center gap-1 rounded border border-zinc-800 px-2 py-0.5 text-[11px] hover:bg-zinc-800"
+                          >
+                            <Download size={11} /> Download
+                          </a>
+                          <button
+                            onClick={() => onDelete(full, f.name)}
+                            className="inline-flex items-center gap-1 rounded border border-red-900 text-red-300 px-2 py-0.5 text-[11px] hover:bg-red-950/50"
+                          >
+                            <Trash2 size={11} /> Delete
+                          </button>
+                        </>
                       )}
                     </td>
                   </tr>

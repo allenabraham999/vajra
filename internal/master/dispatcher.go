@@ -212,6 +212,16 @@ func (c *AgentClient) CreateSandbox(ctx context.Context, req CreateSandboxReques
 	return out, nil
 }
 
+// PoolStats issues GET /pool/stats on the agent and returns the node's
+// pre-warm pool snapshot.
+func (c *AgentClient) PoolStats(ctx context.Context) (*AgentPoolStats, error) {
+	out := &AgentPoolStats{}
+	if err := c.do(ctx, http.MethodGet, "/pool/stats", nil, out); err != nil {
+		return nil, fmt.Errorf("agent PoolStats: %w", err)
+	}
+	return out, nil
+}
+
 // GetSandbox issues GET /sandbox/{id} and returns a minimal view.
 func (c *AgentClient) GetSandbox(ctx context.Context, id string) (*SandboxView, error) {
 	out := &SandboxView{}

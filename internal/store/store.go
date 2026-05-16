@@ -126,6 +126,9 @@ type SandboxStore interface {
 	ListByNode(ctx context.Context, nodeID string, opts ListOpts) ([]*models.Sandbox, error)
 	ListByState(ctx context.Context, state models.SandboxState, opts ListOpts) ([]*models.Sandbox, error)
 	UpdateState(ctx context.Context, accountID, id string, state models.SandboxState) error
+	// RecordBootMetrics stamps time_to_running_ms + pool_hit, called once
+	// when a sandbox first reaches RUNNING. Account-scoped.
+	RecordBootMetrics(ctx context.Context, accountID, id string, timeToRunningMs int64, poolHit bool) error
 	UpdatePlacement(ctx context.Context, id string, clusterID, nodeID string) error
 	// UpdateLastActivity stamps the activity column without touching
 	// updated_at — driven by exec / file upload / terminal connect

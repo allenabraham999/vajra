@@ -136,3 +136,31 @@ func (c *AgentClient) ListFiles(ctx context.Context, sandboxID, dir string) ([]F
 	}
 	return out.Entries, nil
 }
+
+// DeleteFile issues DELETE /sandbox/{id}/files?path=… against the agent,
+// removing a single file inside the guest VM.
+func (c *AgentClient) DeleteFile(ctx context.Context, sandboxID, path string) error {
+	if path == "" {
+		return errors.New("path is required")
+	}
+	q := url.Values{}
+	q.Set("path", path)
+	u := c.baseURL + "/sandbox/" + url.PathEscape(sandboxID) + "/files?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return fmt.Errorf("build delete: %w", err)
+	}
+	if c.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.secret)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("agent delete: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &httpError{Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
+	}
+	return nil
+}

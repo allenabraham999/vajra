@@ -1,54 +1,35 @@
 import { useEffect, useMemo, useState } from 'react'
+import { Zap } from 'lucide-react'
 import api from '../api/client'
-import type { Node, Sandbox } from '../api/types'
+import type { BootTime, PoolStats } from '../api/types'
 import PageHeader from '../components/PageHeader'
-import ProgressBar from '../components/ProgressBar'
-import { memMB } from '../utils/format'
+import { formatRelative } from '../utils/format'
 
-// PoolStats mirrors agent.PoolStats. The dashboard reads it from the
-// first node it can discover via the local nginx proxy at /pool/stats;
-// when no proxy is configured, the section degrades gracefully.
-type PoolStats = {
-  min_size: number
-  max_size: number
-  target_size: number
-  available: number
-  warming: number
-  total_hits: number
-  total_misses: number
-  total_created: number
-  hit_rate_pct: number
-  template: string
-}
-
-// Boot-time numbers from bible.md, surfaced for the demo.
-const BOOT_STATS = {
-  ec2_avg_ms: 161,
-  ec2_p50_ms: 158,
-  ec2_p95_ms: 176,
-  ec2_p99_ms: 176,
-  baremetal_target_ms: 100,
+// formatMs renders a boot duration: milliseconds under a second, seconds
+// with one or two decimals above it.
+function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  const s = ms / 1000
+  return `${s.toFixed(s < 10 ? 2 : 1)} s`
 }
 
 export default function MetricsPage() {
-  const [sandboxes, setSandboxes] = useState<Sandbox[]>([])
-  const [nodes, setNodes] = useState<Node[]>([])
   const [pool, setPool] = useState<PoolStats | null>(null)
+  const [boots, setBoots] = useState<BootTime[]>([])
+  const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
     let alive = true
     async function load() {
-      const [s, n, p] = await Promise.all([
-        api.sandboxes.list().catch(() => []),
-        api.nodes.list().catch(() => []),
-        fetch('/pool/stats')
-          .then((r) => (r.ok ? (r.json() as Promise<PoolStats>) : null))
-          .catch(() => null),
+      const [p, b] = await Promise.all([
+        api.pool.stats().catch(() => null),
+        api.sandboxes.bootTimes().catch(() => [] as BootTime[]),
       ])
       if (!alive) return
-      setSandboxes(s)
-      setNodes(n)
       setPool(p)
+      setBoots(b)
+      setLoaded(true)
     }
     load()
     const t = setInterval(load, 5000)
@@ -58,128 +39,154 @@ export default function MetricsPage() {
     }
   }, [])
 
-  const active = useMemo(
-    () => sandboxes.filter((s) => s.state === 'RUNNING').length,
-    [sandboxes],
-  )
+  const avgBootMs = useMemo(() => {
+    if (boots.length === 0) return null
+    const sum = boots.reduce((acc, b) => acc + b.time_to_running_ms, 0)
+    return sum / boots.length
+  }, [boots])
+
+  const hasPool = pool != null && pool.template !== ''
 
   return (
     <>
       <PageHeader
         title="Metrics"
-        description="Boot-time benchmarks and live cluster utilization."
+        description="Pre-warm pool performance and sandbox boot times."
       />
-      <div className="p-6 space-y-6">
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <Tile label="Active sandboxes" value={active} />
-          <Tile label="Snapshot restore (p50)" value={`${BOOT_STATS.ec2_p50_ms} ms`} subtle="EC2 nested virt" />
-          <Tile label="Snapshot restore (p95)" value={`${BOOT_STATS.ec2_p95_ms} ms`} subtle="EC2 nested virt" />
-          <Tile label="Bare-metal target" value={`${BOOT_STATS.baremetal_target_ms} ms`} subtle="no nested overhead" />
-        </div>
-
-        <div className="rounded-lg border border-zinc-900 bg-zinc-900/30 p-4">
-          <h2 className="text-sm font-medium mb-1">Boot time distribution</h2>
-          <p className="text-[11px] text-zinc-500 mb-3">
-            10 consecutive Cloud Hypervisor restore + destroy cycles, EC2 c8i.large with nested
-            virtualization. From bible.md.
-          </p>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-2 text-sm">
-            <Metric label="min" value="152.75 ms" />
-            <Metric label="avg" value={`${BOOT_STATS.ec2_avg_ms} ms`} />
-            <Metric label="p50" value={`${BOOT_STATS.ec2_p50_ms} ms`} />
-            <Metric label="p95" value={`${BOOT_STATS.ec2_p95_ms} ms`} />
-            <Metric label="p99" value={`${BOOT_STATS.ec2_p99_ms} ms`} />
-            <Metric label="max" value={`${BOOT_STATS.ec2_p99_ms} ms`} />
+      <div className="p-6 space-y-8">
+        {/* Pool Performance */}
+        <section>
+          <h2 className="text-sm font-medium mb-3">Pool Performance</h2>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <StatCard
+              label="Pool Size"
+              value={hasPool ? pool!.target_size : '—'}
+              hint={hasPool ? `${pool!.min_size}–${pool!.max_size} range` : 'no pool configured'}
+            />
+            <StatCard
+              label="Available"
+              value={hasPool ? pool!.available : '—'}
+              hint={
+                hasPool
+                  ? pool!.warming > 0
+                    ? `${pool!.warming} warming`
+                    : 'ready now'
+                  : undefined
+              }
+            />
+            <StatCard
+              label="Hit Rate"
+              value={hasPool ? `${pool!.hit_rate_pct.toFixed(0)}%` : '—'}
+              hint={
+                hasPool
+                  ? `${pool!.total_hits} hits · ${pool!.total_misses} misses`
+                  : undefined
+              }
+            />
+            <StatCard
+              label="Avg Boot Time"
+              value={avgBootMs != null ? formatMs(avgBootMs) : '—'}
+              hint={
+                boots.length > 0
+                  ? `last ${boots.length} ${boots.length === 1 ? 'sandbox' : 'sandboxes'}`
+                  : 'no recent boots'
+              }
+            />
           </div>
-          <p className="text-[11px] text-zinc-500 mt-4">
-            6× faster than the legacy Incus container baseline (~1000 ms).
-          </p>
-        </div>
+        </section>
 
-        {pool && pool.template && (
-          <div className="rounded-lg border border-zinc-900 bg-zinc-900/30 p-4">
-            <h2 className="text-sm font-medium mb-1">Pre-warm Pool</h2>
-            <p className="text-[11px] text-zinc-500 mb-3">
-              Paused, fully-restored sandboxes ready for sub-30 ms hand-off. Target size
-              auto-adjusts every 30 s based on observed hit/miss rate.
-            </p>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-              <Tile label="Available" value={pool.available} />
-              <Tile label="Target" value={`${pool.target_size}`} subtle={`min ${pool.min_size} / max ${pool.max_size}`} />
-              <Tile label="Warming" value={pool.warming} />
-              <Tile label="Hit rate" value={`${pool.hit_rate_pct.toFixed(1)}%`} subtle={hitRateLabel(pool.hit_rate_pct)} />
-            </div>
-            <HitRateBar pct={pool.hit_rate_pct} />
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-x-8 gap-y-1 text-sm mt-4">
-              <Metric label="hits" value={String(pool.total_hits)} />
-              <Metric label="misses" value={String(pool.total_misses)} />
-              <Metric label="created" value={String(pool.total_created)} />
-            </div>
+        {/* Recent Sandbox Boot Times */}
+        <section>
+          <h2 className="text-sm font-medium mb-3">Recent Sandbox Boot Times</h2>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20">
+            {!loaded ? (
+              <div className="p-8 text-center text-sm text-zinc-500">Loading…</div>
+            ) : boots.length === 0 ? (
+              <div className="p-8 text-center text-sm text-zinc-500">
+                No sandbox boots recorded yet. Create a sandbox to see its boot time here.
+              </div>
+            ) : (
+              <table className="w-full text-sm">
+                <thead className="text-[11px] text-zinc-500 uppercase tracking-wider">
+                  <tr className="border-b border-zinc-900">
+                    <th className="text-left font-medium px-4 py-2">Name</th>
+                    <th className="text-left font-medium px-4 py-2">Created</th>
+                    <th className="text-right font-medium px-4 py-2">Boot time</th>
+                    <th className="text-right font-medium px-4 py-2">Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {boots.map((b) => (
+                    <tr
+                      key={b.id}
+                      className="border-b border-zinc-900/60 hover:bg-zinc-800/50 transition-colors"
+                    >
+                      <td className="px-4 py-2.5 font-medium">{b.name}</td>
+                      <td className="px-4 py-2.5 text-zinc-500 text-xs">
+                        {formatRelative(b.created_at)}
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-mono tabular-nums text-teal-300">
+                        {formatMs(b.time_to_running_ms)}
+                      </td>
+                      <td className="px-4 py-2.5 text-right">
+                        <SourceBadge poolHit={b.pool_hit} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
-        )}
+        </section>
 
-        <div className="rounded-lg border border-zinc-900 bg-zinc-900/30 p-4">
-          <h2 className="text-sm font-medium mb-3">Node capacity utilization</h2>
-          {nodes.length === 0 ? (
-            <p className="text-xs text-zinc-500">No node visibility (admin-only endpoint).</p>
-          ) : (
-            <div className="space-y-3">
-              {nodes.map((n) => (
-                <div key={n.id} className="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
-                  <div>
-                    <div className="text-sm font-medium">{n.hostname}</div>
-                    <div className="text-[11px] text-zinc-500 font-mono">{n.ip}</div>
-                  </div>
-                  <ProgressBar
-                    value={n.used_resources.used_cpu}
-                    max={n.capacity.total_cpu}
-                    label={`CPU ${n.used_resources.used_cpu}/${n.capacity.total_cpu}`}
-                  />
-                  <ProgressBar
-                    value={n.used_resources.used_memory_mb}
-                    max={n.capacity.total_memory_mb}
-                    label={`Mem ${memMB(n.used_resources.used_memory_mb)}/${memMB(n.capacity.total_memory_mb)}`}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        {/* System Performance */}
+        <section>
+          <h2 className="text-sm font-medium mb-2">System Performance</h2>
+          <div className="flex items-center gap-2 text-xs text-zinc-500">
+            <Zap size={13} className="text-teal-400 shrink-0" />
+            <span>
+              Cloud Hypervisor restore: ~160 ms p50 on EC2, ~115 ms on bare metal —
+              6× faster than container-based sandbox baselines.
+            </span>
+          </div>
+        </section>
       </div>
     </>
   )
 }
 
-function Tile({ label, value, subtle }: { label: string; value: number | string; subtle?: string }) {
+// StatCard is a clean metric tile with a large teal number.
+function StatCard({
+  label,
+  value,
+  hint,
+}: {
+  label: string
+  value: number | string
+  hint?: string
+}) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 p-4">
-      <div className="text-[11px] text-zinc-500 uppercase tracking-wider font-mono">{label}</div>
-      <div className="mt-2 text-2xl font-semibold tabular-nums">{value}</div>
-      {subtle && <div className="mt-1 text-[11px] text-zinc-500">{subtle}</div>}
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 p-4 hover:border-teal-500/30 transition-colors">
+      <div className="text-[11px] text-zinc-500 uppercase tracking-wider font-mono">
+        {label}
+      </div>
+      <div className="mt-2 text-3xl font-semibold tabular-nums text-teal-300">
+        {value}
+      </div>
+      {hint && <div className="mt-1 text-[11px] text-zinc-500">{hint}</div>}
     </div>
   )
 }
 
-function hitRateLabel(pct: number): string {
-  if (pct >= 80) return 'healthy'
-  if (pct >= 50) return 'warming up'
-  return 'cold path dominant'
-}
-
-function HitRateBar({ pct }: { pct: number }) {
-  const colour = pct >= 80 ? 'bg-emerald-500' : pct >= 50 ? 'bg-yellow-500' : 'bg-rose-500'
-  return (
-    <div className="h-2 w-full overflow-hidden rounded bg-zinc-800">
-      <div className={`h-full ${colour}`} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
-    </div>
-  )
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-center justify-between border-b border-zinc-900/60 py-1">
-      <span className="text-[11px] text-zinc-500 uppercase tracking-wider font-mono">{label}</span>
-      <span className="font-mono text-zinc-200 tabular-nums">{value}</span>
-    </div>
+// SourceBadge marks whether a create was served from the warm pool.
+function SourceBadge({ poolHit }: { poolHit: boolean }) {
+  return poolHit ? (
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium bg-teal-500/10 text-teal-300 border border-teal-500/20">
+      Pool
+    </span>
+  ) : (
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium bg-zinc-800 text-zinc-400 border border-zinc-700">
+      Cold
+    </span>
   )
 }

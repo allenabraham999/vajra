@@ -11,11 +11,11 @@ import (
 
 type pgSandboxStore struct{ ext sqlx.ExtContext }
 
-const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, auto_stop_minutes, auto_archive_minutes, last_activity, created_at, updated_at`
+const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, auto_stop_minutes, auto_archive_minutes, last_activity, created_at, updated_at, time_to_running_ms, pool_hit`
 
 func (s *pgSandboxStore) Create(ctx context.Context, sb *models.Sandbox) error {
 	const q = `INSERT INTO sandboxes (` + sandboxColumns + `)
-	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :auto_stop_minutes, :auto_archive_minutes, :last_activity, :created_at, :updated_at)`
+	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :auto_stop_minutes, :auto_archive_minutes, :last_activity, :created_at, :updated_at, :time_to_running_ms, :pool_hit)`
 	_, err := sqlx.NamedExecContext(ctx, s.ext, q, sb)
 	return translate(err)
 }
@@ -84,6 +84,17 @@ func (s *pgSandboxStore) UpdateState(ctx context.Context, accountID, id string, 
 	res, err := s.ext.ExecContext(ctx,
 		`UPDATE sandboxes SET state = $1, updated_at = NOW()
 		 WHERE account_id = $2 AND id = $3`, string(state), accountID, id)
+	return expectAffected(res, err)
+}
+
+// RecordBootMetrics stamps how long a sandbox took to reach RUNNING and
+// whether the create was served from the pre-warm pool. Account-scoped;
+// called once per sandbox when it first transitions to RUNNING.
+func (s *pgSandboxStore) RecordBootMetrics(ctx context.Context, accountID, id string, timeToRunningMs int64, poolHit bool) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE sandboxes SET time_to_running_ms = $1, pool_hit = $2
+		 WHERE account_id = $3 AND id = $4`,
+		timeToRunningMs, poolHit, accountID, id)
 	return expectAffected(res, err)
 }
 

@@ -380,6 +380,16 @@ func (s *hsSandbox) UpdateState(_ context.Context, accountID, id string, state m
 	}
 	return store.ErrNotFound
 }
+func (s *hsSandbox) RecordBootMetrics(_ context.Context, accountID, id string, ms int64, poolHit bool) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sb, ok := s.h.sandboxes[id]; ok && sb.AccountID == accountID {
+		sb.TimeToRunningMS = &ms
+		sb.PoolHit = &poolHit
+		return nil
+	}
+	return store.ErrNotFound
+}
 func (s *hsSandbox) UpdatePlacement(_ context.Context, id string, clusterID, nodeID string) error {
 	s.h.mu.Lock()
 	defer s.h.mu.Unlock()

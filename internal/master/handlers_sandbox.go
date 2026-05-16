@@ -247,7 +247,7 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	agent := h.Pool.ClientFor(node)
 	dispatchCtx, cancel := context.WithTimeout(r.Context(), dispatchTimeout)
 	defer cancel()
-	_, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
+	createResp, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
 		ID:           sandboxID,
 		TemplateHash: templateHash,
 		Config: SandboxConfig{
@@ -264,7 +264,11 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	} else {
 		// Happy path: agent accepted the create asynchronously. Leave
 		// the DB row in CREATING and let the poller drive it forward.
-		go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout)
+		// fromPool reflects whether the agent served this create from a
+		// warm pre-warm pool member; the poller stamps it on the row
+		// once the sandbox reaches RUNNING.
+		fromPool := createResp != nil && createResp.FromPool
+		go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout, fromPool)
 	}
 
 	out, err := h.Store.Sandboxes().GetByID(r.Context(), accountID, sandboxID)
@@ -383,13 +387,14 @@ func (h *Handlers) driveAsyncCreate(
 	agent := h.Pool.ClientFor(node)
 	dispatchCtx, cancel := context.WithTimeout(ctx, dispatchTimeout)
 	defer cancel()
-	_, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
+	createResp, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
 		ID:           sandboxID,
 		TemplateHash: templateHash,
 		Config: SandboxConfig{
 			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
 		},
 	})
+	fromPool := createResp != nil && createResp.FromPool
 	if dispatchErr != nil {
 		// Run the same probe-then-reconcile dance as the sync path. We
 		// have no HTTP response to write, so on a hard failure we just
@@ -403,10 +408,13 @@ func (h *Handlers) driveAsyncCreate(
 				case models.SandboxStateRunning:
 					_ = h.Store.Sandboxes().UpdateState(ctx, accountID, sandboxID, models.SandboxStateRunning)
 					h.writeSandboxStateCache(ctx, sandboxID, models.SandboxStateRunning)
+					if sb, _ := h.Store.Sandboxes().GetByID(ctx, accountID, sandboxID); sb != nil {
+						h.recordBootMetrics(ctx, accountID, sandboxID, sb.CreatedAt, false)
+					}
 					_ = h.Tracker.Complete(ctx, opID, nil)
 					return
 				case models.SandboxStateCreating:
-					h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout)
+					h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout, false)
 					return
 				}
 			}
@@ -414,7 +422,7 @@ func (h *Handlers) driveAsyncCreate(
 		fail(fmt.Errorf("agent dispatch: %w", dispatchErr))
 		return
 	}
-	h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout)
+	h.pollAgentCreate(accountID, sandboxID, opID, agent, autoscaleCreatePollTimeout, fromPool)
 }
 
 // handleDispatchError resolves the four cases that can land us here when
@@ -446,6 +454,10 @@ func (h *Handlers) handleDispatchError(
 				h.log().Error("createSandbox: reconcile-after-dispatch update", "err", err, "sandbox_id", sandboxID)
 			}
 			if sb, _ := h.Store.Sandboxes().GetByID(probeCtx, accountID, sandboxID); sb != nil {
+				// The dispatch errored, so we never saw the agent's
+				// from_pool flag — record the boot conservatively as a
+				// cold (non-pool) create.
+				h.recordBootMetrics(probeCtx, accountID, sandboxID, sb.CreatedAt, false)
 				h.recordUsageStart(probeCtx, accountID, sandboxID, sb.Config)
 			}
 			_ = h.Tracker.Complete(probeCtx, opID, nil)
@@ -457,7 +469,7 @@ func (h *Handlers) handleDispatchError(
 			// poller and let it drive the DB row to RUNNING.
 			h.log().Warn("createSandbox: dispatch reported error but agent still creating",
 				"sandbox_id", sandboxID, "dispatch_err", dispatchErr)
-			go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout)
+			go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout, false)
 			return true
 		}
 	}
@@ -491,7 +503,11 @@ func (h *Handlers) handleDispatchError(
 // than letting the row hang in CREATING forever. Synchronous-path
 // callers pass createPollTimeout (60s, warm node); the autoscale path
 // passes autoscaleCreatePollTimeout (5min, cold cache).
-func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *AgentClient, timeout time.Duration) {
+//
+// fromPool carries the agent's from_pool flag from the create dispatch
+// so the RUNNING transition can stamp it on the row alongside the boot
+// time.
+func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *AgentClient, timeout time.Duration, fromPool bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	ticker := time.NewTicker(createPollInterval)
@@ -537,6 +553,7 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 				}
 				h.writeSandboxStateCache(context.Background(), sandboxID, models.SandboxStateRunning)
 				if sb, _ := h.Store.Sandboxes().GetByID(context.Background(), accountID, sandboxID); sb != nil {
+					h.recordBootMetrics(context.Background(), accountID, sandboxID, sb.CreatedAt, fromPool)
 					h.recordUsageStart(context.Background(), accountID, sandboxID, sb.Config)
 					h.publishSandboxCreated(context.Background(), sb)
 					h.publishStateChange(context.Background(), sb, models.SandboxStateCreating, models.SandboxStateRunning)
@@ -578,6 +595,21 @@ func (h *Handlers) recordUsageStart(ctx context.Context, accountID, sandboxID st
 	}
 	if err := usage.RecordStart(ctx, accountID, sandboxID, cfg, h.now().UTC()); err != nil {
 		h.log().Warn("usage RecordStart failed", "err", err, "sandbox_id", sandboxID)
+	}
+}
+
+// recordBootMetrics stamps how long a create took to reach RUNNING and
+// whether the agent served it from the pre-warm pool. The boot duration
+// is wall-clock from createdAt (when master accepted the create) to now.
+// Best-effort: a failed write never blocks the lifecycle, and the metric
+// is purely for the dashboard's boot-times view.
+func (h *Handlers) recordBootMetrics(ctx context.Context, accountID, sandboxID string, createdAt time.Time, poolHit bool) {
+	ms := h.now().UTC().Sub(createdAt).Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	if err := h.Store.Sandboxes().RecordBootMetrics(ctx, accountID, sandboxID, ms, poolHit); err != nil {
+		h.log().Warn("RecordBootMetrics failed", "err", err, "sandbox_id", sandboxID)
 	}
 }
 
@@ -638,6 +670,60 @@ func (h *Handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		h.log().Error("listSandboxes", "err", err)
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// bootTimeRow is one entry in the GET /v1/sandboxes/boot-times response:
+// a recent sandbox create with how long it took to reach RUNNING and
+// whether the pre-warm pool served it.
+type bootTimeRow struct {
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	CreatedAt       time.Time `json:"created_at"`
+	TimeToRunningMS int64     `json:"time_to_running_ms"`
+	PoolHit         bool      `json:"pool_hit"`
+}
+
+// bootTimesMaxRows caps the boot-times response. The dashboard renders a
+// "last 20 creates" table; anything older is noise for that view.
+const bootTimesMaxRows = 20
+
+// bootTimes returns the account's most recent sandbox creates that have a
+// recorded boot time, newest first. Sandboxes still creating — or created
+// before boot metrics were tracked — are skipped. Powers the Metrics
+// page's recent-boot-times table.
+func (h *Handlers) bootTimes(w http.ResponseWriter, r *http.Request) {
+	accountID, ok := RequireAccount(w, r)
+	if !ok {
+		return
+	}
+	// ListByAccount already orders by created_at DESC; pull a generous
+	// window and keep the first bootTimesMaxRows that have a boot time.
+	all, err := h.Store.Sandboxes().ListByAccount(r.Context(), accountID, store.ListOpts{Limit: 200})
+	if err != nil {
+		h.log().Error("bootTimes", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]bootTimeRow, 0, bootTimesMaxRows)
+	for _, sb := range all {
+		if sb.TimeToRunningMS == nil {
+			continue
+		}
+		row := bootTimeRow{
+			ID:              sb.ID,
+			Name:            sb.Name,
+			CreatedAt:       sb.CreatedAt,
+			TimeToRunningMS: *sb.TimeToRunningMS,
+		}
+		if sb.PoolHit != nil {
+			row.PoolHit = *sb.PoolHit
+		}
+		out = append(out, row)
+		if len(out) >= bootTimesMaxRows {
+			break
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }

@@ -91,6 +91,24 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
 }
 
+// handleFileDelete removes a single file inside the guest VM. The
+// `path` query parameter is the absolute path; the guest rejects
+// directories so a stray DELETE can't wipe a subtree.
+func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeErr(w, http.StatusBadRequest, "path query is required")
+		return
+	}
+	if err := s.sandboxes.FileDelete(r.Context(), id, path, 0); err != nil {
+		s.logger.Warn("file delete failed", "sandbox", id, "err", err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // handleSandboxList returns every sandbox the agent currently tracks.
 // Master's reconciler relies on this to detect drift between the DB and
 // the actual on-host state. The shape matches dispatcher.AgentSandbox.

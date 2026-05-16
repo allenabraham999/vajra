@@ -125,6 +125,7 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		// Sandboxes
 		"POST /v1/sandboxes":                    h.createSandbox,
 		"GET /v1/sandboxes":                     h.listSandboxes,
+		"GET /v1/sandboxes/boot-times":          h.bootTimes,
 		"GET /v1/sandboxes/{id}":                h.getSandbox,
 		"POST /v1/sandboxes/{id}/exec":          h.execSandbox,
 		"POST /v1/sandboxes/{id}/stop":          h.stopSandbox,
@@ -140,6 +141,7 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"POST /v1/sandboxes/{id}/files/upload":   h.uploadFile,
 		"GET /v1/sandboxes/{id}/files/download":  h.downloadFile,
 		"GET /v1/sandboxes/{id}/files/list":      h.listFiles,
+		"DELETE /v1/sandboxes/{id}/files":        h.deleteFile,
 
 		// Shares
 		"POST /v1/sandboxes/{id}/share":                  h.createShare,
@@ -177,6 +179,9 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 
 		// Usage
 		"GET /v1/usage": h.getUsage,
+
+		// Pre-warm pool
+		"GET /v1/pool/stats": h.getPoolStats,
 	}
 }
 

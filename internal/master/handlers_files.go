@@ -120,3 +120,27 @@ func (h *Handlers) listFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
 }
+
+// deleteFile removes a single file inside the sandbox. The target path
+// is carried in the ?path= query string; the agent rejects directories
+// and non-existent paths with a 4xx the proxy surfaces verbatim.
+func (h *Handlers) deleteFile(w http.ResponseWriter, r *http.Request) {
+	_, sb, node, ok := h.resolveSandboxAndNode(w, r)
+	if !ok {
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeErr(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	dispatchCtx, cancel := requestContextWithTimeout(r, dispatchTimeout)
+	defer cancel()
+	if err := h.Pool.ClientFor(node).DeleteFile(dispatchCtx, sb.ID, path); err != nil {
+		h.log().Error("deleteFile: dispatch", "err", err, "sandbox_id", sb.ID)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	h.touchActivity(r.Context(), sb.ID)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

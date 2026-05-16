@@ -99,6 +99,15 @@ type Sandbox struct {
 	LastActivity       time.Time     `db:"last_activity" json:"last_activity"`
 	CreatedAt          time.Time     `db:"created_at" json:"created_at"`
 	UpdatedAt          time.Time     `db:"updated_at" json:"updated_at"`
+	// TimeToRunningMS is the wall-clock milliseconds from create accepted
+	// to RUNNING, stamped once when the sandbox first reaches RUNNING.
+	// Nil until then, and on rows created before the boot-metrics
+	// migration.
+	TimeToRunningMS *int64 `db:"time_to_running_ms" json:"time_to_running_ms,omitempty"`
+	// PoolHit is true when the create was served from a warm pre-warm
+	// pool member rather than a cold snapshot restore. Nil until the
+	// sandbox reaches RUNNING.
+	PoolHit *bool `db:"pool_hit" json:"pool_hit,omitempty"`
 }
 
 // validSandboxTransitions defines the allowed forward transitions. The

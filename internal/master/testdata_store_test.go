@@ -194,6 +194,13 @@ func (f *fakeSandboxStore) UpdateState(_ context.Context, accountID, id string, 
 	}
 	return nil
 }
+func (f *fakeSandboxStore) RecordBootMetrics(_ context.Context, _, id string, ms int64, poolHit bool) error {
+	if sb, ok := f.byID[id]; ok {
+		sb.TimeToRunningMS = &ms
+		sb.PoolHit = &poolHit
+	}
+	return nil
+}
 func (f *fakeSandboxStore) UpdatePlacement(context.Context, string, string, string) error {
 	return errUnimplemented
 }

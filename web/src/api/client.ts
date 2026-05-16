@@ -5,6 +5,7 @@ import type {
   AuthConfigResponse,
   AuthLoginResponse,
   AuthRegisterResponse,
+  BootTime,
   Build,
   Cluster,
   CreateAPIKeyResponse,
@@ -12,6 +13,7 @@ import type {
   FileEntry,
   Node,
   Operation,
+  PoolStats,
   Sandbox,
   Snapshot,
   Template,
@@ -105,6 +107,8 @@ export const apiBase: string =
 // --- Sandboxes ---
 export const sandboxes = {
   list: () => request<Sandbox[]>({ method: 'GET', url: '/v1/sandboxes' }),
+  bootTimes: () =>
+    request<BootTime[]>({ method: 'GET', url: '/v1/sandboxes/boot-times' }),
   get: (id: string) =>
     request<Sandbox>({ method: 'GET', url: `/v1/sandboxes/${id}` }),
   create: (body: {
@@ -166,6 +170,12 @@ export const sandboxes = {
   },
   downloadFileURL: (id: string, path: string) =>
     `${baseURL}/v1/sandboxes/${id}/files/download?path=${encodeURIComponent(path)}`,
+  deleteFile: (id: string, path: string) =>
+    request<{ ok: boolean }>({
+      method: 'DELETE',
+      url: `/v1/sandboxes/${id}/files`,
+      params: { path },
+    }),
 }
 
 // --- Snapshots ---
@@ -261,6 +271,11 @@ export const usage = {
     request<UsageResponse>({ method: 'GET', url: '/v1/usage', params }),
 }
 
+// --- Pre-warm pool ---
+export const pool = {
+  stats: () => request<PoolStats>({ method: 'GET', url: '/v1/pool/stats' }),
+}
+
 // --- Operations (synthesised from sandbox responses; no direct list endpoint
 // exists yet, so callers fall back to deriving from sandboxes). ---
 export type { Operation }
@@ -275,4 +290,5 @@ export default {
   nodes,
   apiKeys,
   usage,
+  pool,
 }

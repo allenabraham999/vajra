@@ -183,6 +183,35 @@ func (m *SandboxManager) FileList(ctx context.Context, sandboxID, dir string, ti
 	return resp.Entries, nil
 }
 
+// FileDelete removes a single file inside the guest VM. The guest
+// rejects directories, so a non-empty tree is never destroyed by
+// accident.
+func (m *SandboxManager) FileDelete(ctx context.Context, sandboxID, path string, timeout time.Duration) error {
+	if path == "" {
+		return errors.New("file: path is required")
+	}
+	conn, cleanup, err := m.dialFiles(ctx, sandboxID, timeout)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := writeJSONLine(conn, fileWireRequest{Op: "delete", Path: path}); err != nil {
+		return fmt.Errorf("file: send request: %w", err)
+	}
+	var resp fileWireResponse
+	if err := readJSONLine(conn, &resp); err != nil {
+		return fmt.Errorf("file: read response: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("file: guest error: %s", resp.Error)
+	}
+	if !resp.OK {
+		return errors.New("file: guest reported not OK")
+	}
+	return nil
+}
+
 // dialFiles is the shared setup: lookup sandbox, validate state, dial
 // vsock with the appropriate deadline. Returns the connection and a
 // cleanup that the caller must run (typically as a defer).

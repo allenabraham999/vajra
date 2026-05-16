@@ -18,8 +18,8 @@ import (
 // fileRequest is the typed envelope read on the files port. Op selects
 // which sub-handler runs; the remaining fields are interpreted per-op.
 type fileRequest struct {
-	Op   string `json:"op"`             // "upload" | "download" | "list"
-	Path string `json:"path,omitempty"` // for upload/download
+	Op   string `json:"op"`             // "upload" | "download" | "list" | "delete"
+	Path string `json:"path,omitempty"` // for upload/download/delete
 	Dir  string `json:"dir,omitempty"`  // for list
 	Size int64  `json:"size,omitempty"` // upload only — total bytes following the JSON line
 	Mode uint32 `json:"mode,omitempty"` // upload only — POSIX mode bits
@@ -73,9 +73,26 @@ func serveFiles(c net.Conn, l *prefixLogger) {
 		handleDownload(c, req, l)
 	case "list":
 		handleList(c, req, l)
+	case "delete":
+		handleDelete(c, req, l)
 	default:
 		writeJSON(c, fileResponse{Error: "unknown op: " + req.Op})
 	}
+}
+
+// handleDelete removes a single file at req.Path. We use os.Remove
+// rather than os.RemoveAll so a non-empty directory is reported as an
+// error instead of being recursively destroyed.
+func handleDelete(c net.Conn, req fileRequest, l *prefixLogger) {
+	if req.Path == "" {
+		writeJSON(c, fileResponse{Error: "path is required"})
+		return
+	}
+	if err := os.Remove(req.Path); err != nil {
+		writeJSON(c, fileResponse{Error: "remove: " + err.Error()})
+		return
+	}
+	writeJSON(c, fileResponse{OK: true})
 }
 
 // handleUpload reads exactly req.Size bytes from the connection (after

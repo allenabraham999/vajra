@@ -229,3 +229,26 @@ export interface UsageResponse {
   memory_gb_hours: number
   storage_gb_hours: number
 }
+
+// PoolStats is the pre-warm pool snapshot from GET /v1/pool/stats.
+export interface PoolStats {
+  min_size: number
+  max_size: number
+  target_size: number
+  available: number
+  warming: number
+  total_hits: number
+  total_misses: number
+  total_created: number
+  hit_rate_pct: number
+  template: string
+}
+
+// BootTime is one recent sandbox create from GET /v1/sandboxes/boot-times.
+export interface BootTime {
+  id: string
+  name: string
+  created_at: string
+  time_to_running_ms: number
+  pool_hit: boolean
+}

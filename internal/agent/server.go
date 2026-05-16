@@ -107,6 +107,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandbox/{id}/files/upload", s.handleFileUpload)
 	mux.HandleFunc("GET /sandbox/{id}/files/download", s.handleFileDownload)
 	mux.HandleFunc("GET /sandbox/{id}/files/list", s.handleFileList)
+	mux.HandleFunc("DELETE /sandbox/{id}/files", s.handleFileDelete)
 	mux.HandleFunc("POST /sandbox/{id}/forward/{port}", s.handleForward)
 	mux.HandleFunc("GET /sandbox/{id}/terminal", s.handleTerminal)
 	mux.HandleFunc("GET /pool/stats", s.handlePoolStats)
