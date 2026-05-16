@@ -18,8 +18,8 @@ import (
 // Pool tunables. Min/max are upper/lower bounds on the dynamic target —
 // the loop oscillates inside that band based on observed hit/miss rate.
 const (
-	DefaultPoolMinSize        = 2
-	DefaultPoolMaxSize        = 20
+	DefaultPoolMinSize        = 5
+	DefaultPoolMaxSize        = 15
 	DefaultPoolFirstCID       = uint32(100)
 	DefaultPoolReplenishEvery = 1 * time.Second
 	DefaultPoolAdjustEvery    = 30 * time.Second
