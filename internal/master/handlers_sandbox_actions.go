@@ -198,14 +198,17 @@ func (h *Handlers) snapshotSandbox(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The dashboard's "New snapshot" button posts no JSON body, so the
+	// body is optional here; an empty one just means "use a default
+	// name". decodeBody would otherwise fail the request with
+	// "decode body: EOF".
 	var body snapshotRequest
-	if err := decodeBody(r, &body); err != nil {
+	if err := decodeBodyOptional(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if body.Name == "" {
-		writeErr(w, http.StatusBadRequest, "name is required")
-		return
+		body.Name = "snapshot-" + h.now().UTC().Format("20060102-150405")
 	}
 	if sb.State != models.SandboxStateRunning && sb.State != models.SandboxStatePaused && sb.State != models.SandboxStateStopped {
 		writeErr(w, http.StatusConflict, "sandbox state "+string(sb.State)+" not eligible")

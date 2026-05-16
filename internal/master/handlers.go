@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -189,6 +190,17 @@ func decodeBody(r *http.Request, dst any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("decode body: %w", err)
+	}
+	return nil
+}
+
+// decodeBodyOptional behaves like decodeBody but treats a completely
+// empty request body as success, leaving dst at its zero value. Use it
+// for POST endpoints where every field is optional — e.g. an action
+// whose request body the dashboard may legitimately omit entirely.
+func decodeBodyOptional(r *http.Request, dst any) error {
+	if err := decodeBody(r, dst); err != nil && !errors.Is(err, io.EOF) {
+		return err
 	}
 	return nil
 }
