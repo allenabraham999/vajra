@@ -97,7 +97,12 @@ func (h *Handlers) listFiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dir := r.URL.Query().Get("dir")
+	// The dashboard sends ?path=; the Python SDK sends ?dir=. Accept
+	// either, defaulting to the filesystem root.
+	dir := r.URL.Query().Get("path")
+	if dir == "" {
+		dir = r.URL.Query().Get("dir")
+	}
 	if dir == "" {
 		dir = "/"
 	}

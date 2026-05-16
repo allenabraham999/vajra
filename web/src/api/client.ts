@@ -142,12 +142,16 @@ export const sandboxes = {
       method: 'GET',
       url: `/v1/sandboxes/${id}/snapshots`,
     }),
-  listFiles: (id: string, path = '/') =>
-    request<FileEntry[]>({
+  // The master wraps the listing in {"entries": [...]}; unwrap it here
+  // so callers get a plain array.
+  listFiles: async (id: string, path = '/'): Promise<FileEntry[]> => {
+    const r = await request<{ entries: FileEntry[] | null }>({
       method: 'GET',
       url: `/v1/sandboxes/${id}/files/list`,
       params: { path },
-    }),
+    })
+    return r.entries ?? []
+  },
   uploadFile: async (id: string, path: string, file: File) => {
     const buf = await file.arrayBuffer()
     return request<{ ok: boolean }>({
