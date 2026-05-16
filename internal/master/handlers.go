@@ -103,6 +103,15 @@ type Handlers struct {
 	// Empty falls back to DefaultTemplatesDir.
 	TemplatesDir string
 
+	// TemplateSourceDirs are additional parent directories searched, in
+	// order, after TemplatesDir when serving a template bundle. On a host
+	// where master is co-located with a node agent, wiring the agent's
+	// image cache in here lets on-demand distribution serve
+	// bootstrap/default templates the builder never staged. Each entry is
+	// a parent directory holding <hash>/ subdirectories. Empty (the
+	// zero value used by tests) restricts the search to TemplatesDir.
+	TemplateSourceDirs []string
+
 	// GoogleOAuth is the optional Google-login config consumed by the
 	// /v1/auth/google* endpoints. Zero value → endpoints respond 404
 	// and GET /v1/auth/config reports google_oauth_enabled=false.

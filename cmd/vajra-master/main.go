@@ -166,6 +166,26 @@ func firstNonEmpty(keys ...string) string {
 	return ""
 }
 
+// templateSourceDirs returns the fallback directories master searches
+// for template bundles that its own builder never staged — chiefly the
+// stock ubuntu-noble template, which the host build script writes only
+// into the node agent's image cache. A comma-separated
+// VAJRA_TEMPLATE_SOURCE_DIRS overrides the default; the default is the
+// co-located node agent's cache directory, harmlessly skipped on a
+// master-only host where it does not exist.
+func templateSourceDirs() []string {
+	if v := os.Getenv("VAJRA_TEMPLATE_SOURCE_DIRS"); v != "" {
+		var dirs []string
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				dirs = append(dirs, p)
+			}
+		}
+		return dirs
+	}
+	return []string{"/var/lib/vajra/cache"}
+}
+
 // getenvDefault returns os.Getenv(key) or fallback when unset.
 func getenvDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -240,6 +260,7 @@ func main() {
 	handlers.AgentSharedSecret = cfg.AgentSharedSecret
 	handlers.PublicBaseDomain = cfg.PublicBaseDomain
 	handlers.BinaryDir = os.Getenv("VAJRA_BINARY_DIR")
+	handlers.TemplateSourceDirs = templateSourceDirs()
 	handlers.Cache = c
 	handlers.Bus = bus
 	handlers.GoogleOAuth = cfg.GoogleOAuth

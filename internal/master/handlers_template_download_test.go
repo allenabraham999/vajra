@@ -178,6 +178,79 @@ func TestDownloadTemplateEndpoint(t *testing.T) {
 	}
 }
 
+// TestDownloadTemplateFromSourceDir covers the co-located deployment:
+// the template was never staged into TemplatesDir (master's builder did
+// not produce it) but exists in a TemplateSourceDirs fallback — the
+// node agent's image cache — so the download still succeeds.
+func TestDownloadTemplateFromSourceDir(t *testing.T) {
+	h := newTestHarness(t)
+	const hash = "fallbackhash123"
+	cacheRoot, _ := stageTemplateDir(t, hash)
+	h.server.handlers.TemplatesDir = t.TempDir() // empty: builder staged nothing
+	h.server.handlers.TemplateSourceDirs = []string{cacheRoot}
+
+	tmpl := &models.Template{
+		ID: "tmpl-fallback-1", AccountID: "acct-1", Name: "ubuntu-noble",
+		Version: "1.0", Hash: hash, CreatedAt: time.Now().UTC(),
+	}
+	if err := h.store.Templates().Create(context.Background(), tmpl); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet,
+		h.httpSrv.URL+"/internal/templates/tmpl-fallback-1/download", nil)
+	req.Header.Set("Authorization", "Bearer internal-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	got := readBundle(t, resp.Body)
+	for name, body := range templateDirFiles() {
+		if got[name] != body {
+			t.Fatalf("entry %s = %q, want %q", name, got[name], body)
+		}
+	}
+}
+
+// TestResolveTemplateBundleForHashSearchOrder confirms the primary
+// templates directory wins over a fallback when both hold the bundle,
+// and that a fallback is used when the primary does not.
+func TestResolveTemplateBundleForHashSearchOrder(t *testing.T) {
+	const hash = "ordered-hash"
+	primary, primaryDir := stageTemplateDir(t, hash)
+	fallback, _ := stageTemplateDir(t, hash)
+	// Mark the primary rootfs so we can tell which directory was served.
+	if err := os.WriteFile(filepath.Join(primaryDir, "rootfs.raw"), []byte("PRIMARY"), 0o644); err != nil {
+		t.Fatalf("write primary rootfs: %v", err)
+	}
+
+	h := &Handlers{TemplatesDir: primary, TemplateSourceDirs: []string{fallback}}
+	files, err := h.resolveTemplateBundleForHash(hash)
+	if err != nil {
+		t.Fatalf("resolve with both dirs: %v", err)
+	}
+	if got, err := os.ReadFile(files[0].diskPath); err != nil || string(got) != "PRIMARY" {
+		t.Fatalf("expected bundle from primary dir, got %q (err %v)", got, err)
+	}
+
+	// Primary missing the hash → falls back to the source dir.
+	h.TemplatesDir = t.TempDir()
+	if _, err := h.resolveTemplateBundleForHash(hash); err != nil {
+		t.Fatalf("resolve via fallback: %v", err)
+	}
+
+	// Neither dir has it → error from the primary directory.
+	h.TemplateSourceDirs = []string{t.TempDir()}
+	if _, err := h.resolveTemplateBundleForHash(hash); err == nil {
+		t.Fatalf("expected error when no directory holds the bundle")
+	}
+}
+
 func TestDownloadTemplateUnknownID(t *testing.T) {
 	h := newTestHarness(t)
 	h.server.handlers.TemplatesDir = t.TempDir()

@@ -47,6 +47,38 @@ func (h *Handlers) templatesRoot() string {
 	return DefaultTemplatesDir
 }
 
+// templateSearchDirs returns the parent directories downloadTemplate
+// searches, in priority order, for a template's <hash>/ bundle: the
+// primary templates directory first (where master's builder stages
+// images), then any TemplateSourceDirs fallbacks. A co-located
+// deployment wires the node agent's image cache in as a fallback so
+// bootstrap/default templates the builder never produced (e.g. the
+// stock ubuntu-noble) can still be distributed on demand.
+func (h *Handlers) templateSearchDirs() []string {
+	dirs := make([]string, 0, 1+len(h.TemplateSourceDirs))
+	dirs = append(dirs, h.templatesRoot())
+	return append(dirs, h.TemplateSourceDirs...)
+}
+
+// resolveTemplateBundleForHash locates a complete template bundle for
+// hash by checking each search directory in order, returning the bundle
+// from the first directory that holds every required file. When none
+// do, it returns the error from the primary (templates) directory — the
+// most actionable reason for the agent to surface.
+func (h *Handlers) resolveTemplateBundleForHash(hash string) ([]bundleFile, error) {
+	var primaryErr error
+	for i, root := range h.templateSearchDirs() {
+		files, err := resolveTemplateBundle(filepath.Join(root, hash))
+		if err == nil {
+			return files, nil
+		}
+		if i == 0 {
+			primaryErr = err
+		}
+	}
+	return nil, primaryErr
+}
+
 // downloadTemplate streams a built template's image files to a node
 // agent as a zstd-compressed tar (application/x-tar-zst). The {id} is a
 // template registry ID; it is resolved to a content hash, which names
@@ -71,8 +103,7 @@ func (h *Handlers) downloadTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dir := filepath.Join(h.templatesRoot(), tmpl.Hash)
-	files, err := resolveTemplateBundle(dir)
+	files, err := h.resolveTemplateBundleForHash(tmpl.Hash)
 	if err != nil {
 		h.log().Warn("downloadTemplate: bundle incomplete",
 			"template", tmpl.Name, "hash", tmpl.Hash, "err", err)
