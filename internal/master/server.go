@@ -197,6 +197,7 @@ func (s *Server) internalRoutes() map[string]http.HandlerFunc {
 		"GET /internal/proxy/route":               h.proxyRoute,
 		"GET /internal/proxy/validate-share":      h.validateShare,
 		"GET /internal/binaries/{name}":           h.serveBinary,
+		"GET /internal/templates/{id}/download":   h.downloadTemplate,
 	}
 }
 

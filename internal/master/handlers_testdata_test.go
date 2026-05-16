@@ -521,6 +521,15 @@ func (s *hsTemplate) GetByID(_ context.Context, accountID, id string) (*models.T
 	}
 	return nil, store.ErrNotFound
 }
+func (s *hsTemplate) GetByIDUnscoped(_ context.Context, id string) (*models.Template, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if t, ok := s.h.templates[id]; ok {
+		cp := *t
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
 func (s *hsTemplate) GetByHash(_ context.Context, hash string) (*models.Template, error) {
 	s.h.mu.Lock()
 	defer s.h.mu.Unlock()

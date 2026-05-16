@@ -162,6 +162,7 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 type CreateRequestBody struct {
 	ID           string        `json:"id,omitempty"`
 	TemplateHash string        `json:"template_hash"`
+	TemplateID   string        `json:"template_id,omitempty"`
 	Config       SandboxConfig `json:"config"`
 	FromPool     bool          `json:"from_pool,omitempty"`
 }
@@ -200,6 +201,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	sb, err := s.sandboxes.BeginCreate(CreateRequest{
 		ID:           body.ID,
 		TemplateHash: body.TemplateHash,
+		TemplateID:   body.TemplateID,
 		Config:       body.Config,
 	})
 	if err != nil {

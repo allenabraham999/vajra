@@ -250,6 +250,7 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	createResp, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
 		ID:           sandboxID,
 		TemplateHash: templateHash,
+		TemplateID:   templateID,
 		Config: SandboxConfig{
 			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
 		},
@@ -390,6 +391,7 @@ func (h *Handlers) driveAsyncCreate(
 	createResp, dispatchErr := agent.CreateSandbox(dispatchCtx, CreateSandboxRequest{
 		ID:           sandboxID,
 		TemplateHash: templateHash,
+		TemplateID:   body.TemplateID,
 		Config: SandboxConfig{
 			VCPUs: body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
 		},
@@ -564,7 +566,15 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
 					h.log().Error("createSandbox: poll error update", "err", uerr, "sandbox_id", sandboxID)
 				}
-				_ = h.Tracker.Complete(context.Background(), opID, fmt.Errorf("agent reported ERROR"))
+				// Prefer the agent's own failure reason (e.g. a template
+				// that could not be distributed) over a generic message.
+				reason := "agent reported ERROR"
+				if sbView.Error != "" {
+					reason = sbView.Error
+				}
+				h.log().Error("createSandbox: agent reported sandbox ERROR",
+					"sandbox_id", sandboxID, "reason", reason)
+				_ = h.Tracker.Complete(context.Background(), opID, errors.New(reason))
 				return
 			}
 			// CREATING (or any other intermediate) — keep waiting.

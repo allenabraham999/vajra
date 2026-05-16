@@ -20,6 +20,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -212,6 +214,12 @@ func (m *BuildManager) run(ctx context.Context, b *models.Build) {
 		return
 	}
 
+	// Stage the freshly built image files into the master's template
+	// directory so GET /internal/templates/{id}/download can serve them
+	// to agents on demand. The template row records the staged paths.
+	templateDir := filepath.Join(DefaultTemplatesDir, artifact.Hash)
+	staged := m.stageTemplateArtifact(artifact, templateDir)
+
 	tmplID, err := randomHex(16)
 	if err != nil {
 		m.fail(ctx, b.ID, fmt.Errorf("alloc template id: %w", err))
@@ -221,9 +229,9 @@ func (m *BuildManager) run(ctx context.Context, b *models.Build) {
 		ID: tmplID, AccountID: b.AccountID,
 		Name: b.TemplateName, Version: b.TemplateVer,
 		Hash:         artifact.Hash,
-		RootfsPath:   artifact.RootfsPath,
-		KernelPath:   artifact.KernelPath,
-		SnapshotPath: artifact.SnapshotPath,
+		RootfsPath:   filepath.Join(templateDir, "rootfs.raw"),
+		KernelPath:   filepath.Join(templateDir, "vmlinux"),
+		SnapshotPath: filepath.Join(templateDir, "snapshot"),
 		CreatedAt:    m.now().UTC(),
 	}
 	if err := m.store.Templates().Create(ctx, tmpl); err != nil {
@@ -234,7 +242,75 @@ func (m *BuildManager) run(ctx context.Context, b *models.Build) {
 	if err := m.store.Builds().UpdateStatus(ctx, b.ID, models.BuildStatusCompleted, &tmpl.ID, nil, &completed); err != nil {
 		m.log("update build to COMPLETED failed", "err", err, "build_id", b.ID)
 	}
-	m.log("build completed", "build_id", b.ID, "template_id", tmpl.ID, "hash", tmpl.Hash[:12])
+	m.log("build completed", "build_id", b.ID, "template_id", tmpl.ID, "hash", tmpl.Hash[:12], "staged", staged)
+}
+
+// stageTemplateArtifact copies a finished build's image files into
+// destDir (<templates>/<hash>/) so the master can serve them to agents
+// via the template-download endpoint. It returns whether anything was
+// staged.
+//
+// Staging is best-effort and never fails the build: a stub build runner
+// fabricates artifact paths without writing any files, so when the
+// source rootfs is absent we skip staging and leave the template
+// undistributable — sandbox creation then surfaces a clear "failed to
+// distribute" error rather than a silent "not in cache".
+//
+// Only rootfs.raw is staged (not a qcow2 backing): the raw form is the
+// SHA256 source of truth the agent verifies the download against, and
+// the agent builds its own qcow2 backing locally after the pull.
+func (m *BuildManager) stageTemplateArtifact(a *BuildArtifact, destDir string) bool {
+	if a == nil || !fileExists(a.RootfsPath) {
+		m.log("build artifact has no rootfs on disk; skipping template staging",
+			"hash", artifactHash(a))
+		return false
+	}
+	if err := os.MkdirAll(filepath.Join(destDir, "snapshot"), 0o755); err != nil {
+		m.log("stage template: mkdir failed", "err", err, "dir", destDir)
+		return false
+	}
+	copies := []struct{ src, dst string }{
+		{a.RootfsPath, filepath.Join(destDir, "rootfs.raw")},
+		{a.KernelPath, filepath.Join(destDir, "vmlinux")},
+		{filepath.Join(a.SnapshotPath, "config.json"), filepath.Join(destDir, "snapshot", "config.json")},
+		{filepath.Join(a.SnapshotPath, "memory-ranges"), filepath.Join(destDir, "snapshot", "memory-ranges")},
+		{filepath.Join(a.SnapshotPath, "state.json"), filepath.Join(destDir, "snapshot", "state.json")},
+	}
+	for _, c := range copies {
+		if err := copyFile(c.src, c.dst); err != nil {
+			m.log("stage template: copy failed", "err", err, "src", c.src, "dst", c.dst)
+			return false
+		}
+	}
+	m.log("template staged for distribution", "hash", a.Hash, "dir", destDir)
+	return true
+}
+
+// artifactHash returns a.Hash, or "" for a nil artifact — keeps the log
+// call in stageTemplateArtifact nil-safe.
+func artifactHash(a *BuildArtifact) string {
+	if a == nil {
+		return ""
+	}
+	return a.Hash
+}
+
+// copyFile copies src to dst, creating or truncating dst.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // fail stamps a failed status and best-effort logs.

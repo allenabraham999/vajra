@@ -98,6 +98,11 @@ type Handlers struct {
 	// IAM instance profile. Empty disables the endpoint with 404.
 	BinaryDir string
 
+	// TemplatesDir is the directory built template image files are
+	// staged into and served from by GET /internal/templates/{id}/download.
+	// Empty falls back to DefaultTemplatesDir.
+	TemplatesDir string
+
 	// GoogleOAuth is the optional Google-login config consumed by the
 	// /v1/auth/google* endpoints. Zero value → endpoints respond 404
 	// and GET /v1/auth/config reports google_oauth_enabled=false.

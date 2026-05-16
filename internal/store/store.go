@@ -167,6 +167,10 @@ type SnapshotStore interface {
 type TemplateStore interface {
 	Create(ctx context.Context, t *models.Template) error
 	GetByID(ctx context.Context, accountID, id string) (*models.Template, error)
+	// GetByIDUnscoped looks up a template by ID with no ownership check.
+	// The internal template-download endpoint serves node agents, which
+	// authenticate by shared secret and carry no account context.
+	GetByIDUnscoped(ctx context.Context, id string) (*models.Template, error)
 	GetByHash(ctx context.Context, hash string) (*models.Template, error)
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Template, error)
 	SetPublic(ctx context.Context, id string, public bool) error

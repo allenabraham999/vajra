@@ -68,6 +68,7 @@ type Sandbox struct {
 	ID              string        `json:"id"`
 	State           SandboxState  `json:"state"`
 	TemplateHash    string        `json:"template_hash"`
+	TemplateID      string        `json:"template_id,omitempty"`
 	VsockCID        uint32        `json:"vsock_cid"`
 	APISocket       string        `json:"api_socket"`
 	VsockSocketPath string        `json:"vsock_socket"`
@@ -88,9 +89,14 @@ type Sandbox struct {
 // CreateRequest captures what callers (master, pool) supply to
 // SandboxManager.CreateSandbox. ID is optional; if empty the manager
 // generates a random one.
+//
+// TemplateID is the template's registry ID. It is only needed when the
+// template is not yet in the local cache: the manager uses it to pull
+// the image from master on demand (see SetTemplateSource).
 type CreateRequest struct {
 	ID           string
 	TemplateHash string
+	TemplateID   string
 	Config       SandboxConfig
 }
 
@@ -132,10 +138,33 @@ type SandboxManager struct {
 	logger   *slog.Logger
 	socketDir string
 
+	// masterURL and internalSecret configure on-demand template pulls:
+	// when a create references a template missing from the local cache,
+	// the manager fetches it from master. Both empty → a cache miss is a
+	// hard failure (no endpoint to pull from). Set via SetTemplateSource.
+	masterURL      string
+	internalSecret string
+
 	nextCID atomic.Uint32
 
 	mu        sync.RWMutex
 	sandboxes map[string]*Sandbox
+}
+
+// SetTemplateSource configures where the manager fetches templates that
+// are missing from the local cache. masterURL is vajra-master's base URL
+// and secret is the shared internal token. When unset, a cache miss is a
+// hard create failure rather than an on-demand pull.
+func (m *SandboxManager) SetTemplateSource(masterURL, secret string) {
+	m.masterURL = masterURL
+	m.internalSecret = secret
+}
+
+// canPullTemplate reports whether the manager is configured to fetch a
+// missing template from master on demand. A master URL, the internal
+// secret, and the template's registry ID are all required.
+func (m *SandboxManager) canPullTemplate(templateID string) bool {
+	return m.masterURL != "" && m.internalSecret != "" && templateID != ""
 }
 
 // NewSandboxManager constructs a manager. root is the per-host directory
@@ -190,7 +219,10 @@ func (m *SandboxManager) BeginCreate(req CreateRequest) (*Sandbox, error) {
 	if req.TemplateHash == "" {
 		return nil, errors.New("sandbox: template hash required")
 	}
-	if !m.cache.HasTemplate(req.TemplateHash) {
+	// A missing template is only fatal here when there is no way to pull
+	// it: an agent configured for on-demand distribution accepts the
+	// create and lets FinishCreate fetch the image from master.
+	if !m.cache.HasTemplate(req.TemplateHash) && !m.canPullTemplate(req.TemplateID) {
 		return nil, fmt.Errorf("sandbox: template %s not in cache", req.TemplateHash)
 	}
 	id := req.ID
@@ -202,6 +234,7 @@ func (m *SandboxManager) BeginCreate(req CreateRequest) (*Sandbox, error) {
 		ID:           id,
 		State:        SandboxStateCreating,
 		TemplateHash: req.TemplateHash,
+		TemplateID:   req.TemplateID,
 		VsockCID:     m.AllocateCID(),
 		Config:       req.Config,
 		CreatedAt:    now,
@@ -242,6 +275,18 @@ func (m *SandboxManager) FinishCreate(ctx context.Context, id string) error {
 	}
 	templateHash := sb.TemplateHash
 	layout := m.cache.Layout(templateHash)
+	// On-demand distribution: if this host has never cached the template,
+	// pull it from master before doing anything else. A pull failure is
+	// terminal — surface it as a clear "failed to distribute" reason
+	// rather than letting a later step fail with an opaque missing-file
+	// error. The sandbox dir does not exist yet, so pass "" for cleanup.
+	if !m.cache.HasTemplate(templateHash) {
+		if err := m.cache.PullTemplateBundle(ctx, templateHash, m.masterURL, sb.TemplateID, m.internalSecret); err != nil {
+			cause := fmt.Errorf("template %s failed to distribute to agent: %w", templateHash, err)
+			m.markCreateFailed(id, "", cause)
+			return fmt.Errorf("sandbox: %w", cause)
+		}
+	}
 	if err := m.cache.EnsureRootfsBacking(templateHash); err != nil {
 		return fmt.Errorf("sandbox: ensure rootfs backing: %w", err)
 	}

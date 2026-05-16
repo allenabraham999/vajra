@@ -108,9 +108,14 @@ type SandboxConfig struct {
 }
 
 // CreateSandboxRequest is the JSON body of POST /sandbox/create.
+//
+// TemplateID is the template's registry ID. The agent needs it to pull
+// the image on demand from master's /internal/templates/{id}/download
+// endpoint when the template is missing from its local cache.
 type CreateSandboxRequest struct {
 	ID           string        `json:"id,omitempty"`
 	TemplateHash string        `json:"template_hash"`
+	TemplateID   string        `json:"template_id,omitempty"`
 	Config       SandboxConfig `json:"config"`
 	FromPool     bool          `json:"from_pool,omitempty"`
 }
@@ -132,9 +137,14 @@ type CreateSandboxResponse struct {
 // SandboxView is the minimal slice of a Sandbox the reconciler needs.
 // Keeping this small avoids leaking transient fields like socket paths into
 // master's reconciliation logic.
+//
+// Error carries the agent's failure reason when State is ERROR — e.g. a
+// template that could not be distributed — so the create poller can
+// report something more useful than a bare "agent reported ERROR".
 type SandboxView struct {
 	ID    string `json:"id"`
 	State string `json:"state"`
+	Error string `json:"error,omitempty"`
 }
 
 // AgentSandboxView is the per-row shape ListSandboxes returns. Same shape

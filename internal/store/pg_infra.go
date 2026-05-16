@@ -155,6 +155,20 @@ func (s *pgTemplateStore) GetByID(ctx context.Context, accountID, id string) (*m
 	return &t, nil
 }
 
+// GetByIDUnscoped resolves a template by ID with no account filter. Only
+// the internal /internal/templates/{id}/download endpoint uses it: that
+// route is gated by the agent shared secret and has no account context,
+// so the account-scoped GetByID is not usable there.
+func (s *pgTemplateStore) GetByIDUnscoped(ctx context.Context, id string) (*models.Template, error) {
+	var t models.Template
+	err := sqlx.GetContext(ctx, s.ext, &t,
+		`SELECT `+templateColumns+` FROM templates WHERE id = $1`, id)
+	if err != nil {
+		return nil, translate(err)
+	}
+	return &t, nil
+}
+
 func (s *pgTemplateStore) GetByHash(ctx context.Context, hash string) (*models.Template, error) {
 	var t models.Template
 	err := sqlx.GetContext(ctx, s.ext, &t,

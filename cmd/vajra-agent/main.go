@@ -102,6 +102,12 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 	// a ~10G rootfs). Async so HTTP serving starts immediately.
 	go prewarmCache(cache, cfg.cacheDir, logger)
 	sandboxes := agent.NewSandboxManager(cfg.sandboxRoot, cfg.socketDir, cache, vm, nil, logger)
+	// Configure on-demand template distribution: when master schedules a
+	// sandbox from a template this host has never cached, the manager
+	// pulls the image from master over the internal (shared-secret)
+	// channel. masterURL/apiKey are the same values used for register +
+	// heartbeat; when unset, a cache miss stays a hard create failure.
+	sandboxes.SetTemplateSource(cfg.masterURL, cfg.apiKey)
 	archives := agent.NewArchiveManager(sandboxes, agent.ArchiveOptions{
 		ArchiveDir: cfg.archiveDir,
 	}, logger)
