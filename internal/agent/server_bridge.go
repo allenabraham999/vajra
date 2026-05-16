@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // bridgeUpgradeProto is the value vajra-proxy sends in `Upgrade:` so the
@@ -110,6 +111,10 @@ func hijackConn(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("hijack: %w", err)
 	}
+	// A bridged session (forward / terminal) outlives the server's
+	// ReadTimeout/WriteTimeout; clear the accept-time deadlines so the
+	// copy loops aren't killed mid-session.
+	_ = conn.SetDeadline(time.Time{})
 	return conn, brw, nil
 }
 

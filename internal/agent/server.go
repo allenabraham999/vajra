@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -138,6 +140,18 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack passes through to the underlying ResponseWriter so the bridge
+// handlers (forward / terminal) can take over the raw connection.
+// Without this the statusRecorder wrapper hides the http.Hijacker
+// interface and every hijack attempt fails with a 500.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter is not a Hijacker")
+	}
+	return hj.Hijack()
 }
 
 // CreateRequestBody is the JSON shape accepted by POST /sandbox/create.

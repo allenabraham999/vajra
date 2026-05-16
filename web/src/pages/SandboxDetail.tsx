@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, Play, Square, Trash2, Camera, Upload, Download, Copy } from 'lucide-react'
-import api, { ApiError } from '../api/client'
+import api, { ApiError, getAuthToken } from '../api/client'
 import type { ExecResult, FileEntry, Sandbox, Snapshot } from '../api/types'
 import StateBadge from '../components/StateBadge'
 import Spinner from '../components/Spinner'
@@ -214,11 +214,18 @@ function TerminalTab({ sandboxId, state }: { sandboxId: string; state: string })
       }
     }
 
+    // The terminal route lives outside the Authorization-header auth
+    // middleware (a browser WebSocket can't set headers), so the JWT
+    // rides in the query string. cols/rows seed the guest PTY size.
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const url = `${proto}://${window.location.host}/v1/sandboxes/${sandboxId}/terminal`
+    const token = getAuthToken() ?? ''
+    const url =
+      `${proto}://${window.location.host}/v1/sandboxes/${sandboxId}/terminal` +
+      `?token=${encodeURIComponent(token)}&cols=${term.cols}&rows=${term.rows}`
     const ws = new WebSocket(url)
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
+    const encoder = new TextEncoder()
 
     ws.onopen = () => {
       setConnected(true)
@@ -240,8 +247,11 @@ function TerminalTab({ sandboxId, state }: { sandboxId: string; state: string })
       term.writeln('\r\n\x1b[31m[disconnected]\x1b[0m')
     }
 
+    // Keystrokes go out as binary frames; master treats binary frames
+    // as raw PTY input and reserves text frames for control messages
+    // (resize). Sending input as text would let it be mistaken for one.
     const dataDisp = term.onData((d) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(d)
+      if (ws.readyState === WebSocket.OPEN) ws.send(encoder.encode(d))
     })
     const resizeDisp = term.onResize(({ rows, cols }) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -410,6 +420,7 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
 
   return (
     <div className="space-y-3">
+      <FileBreadcrumb path={path} onNavigate={setPath} />
       <div className="flex items-center gap-2">
         <input
           value={path}
@@ -438,7 +449,7 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
             <Spinner size={16} />
           </div>
         ) : items.length === 0 ? (
-          <div className="p-8 text-center text-xs text-zinc-500">No entries.</div>
+          <div className="p-8 text-center text-xs text-zinc-500">No files yet</div>
         ) : (
           <table className="w-full text-sm">
             <thead className="text-[11px] text-zinc-500 uppercase tracking-wider">
@@ -453,7 +464,7 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
               {items.map((f) => {
                 const full = (path.endsWith('/') ? path : path + '/') + f.name
                 return (
-                  <tr key={f.path} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
+                  <tr key={f.name} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td
                       className={`px-4 py-2 font-mono text-xs ${
                         f.is_dir ? 'text-teal-300 cursor-pointer' : 'text-zinc-200'
@@ -488,6 +499,39 @@ function FilesTab({ sandboxId }: { sandboxId: string }) {
           </table>
         )}
       </div>
+    </div>
+  )
+}
+
+// FileBreadcrumb renders the current directory as clickable path
+// segments so the user can jump back up the tree.
+function FileBreadcrumb({
+  path,
+  onNavigate,
+}: {
+  path: string
+  onNavigate: (p: string) => void
+}) {
+  const parts = path.split('/').filter(Boolean)
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-xs font-mono text-zinc-500">
+      <button onClick={() => onNavigate('/')} className="hover:text-teal-300">
+        root
+      </button>
+      {parts.map((part, i) => {
+        const sub = '/' + parts.slice(0, i + 1).join('/')
+        return (
+          <span key={sub} className="flex items-center gap-1">
+            <span className="text-zinc-700">/</span>
+            <button
+              onClick={() => onNavigate(sub)}
+              className={i === parts.length - 1 ? 'text-zinc-200' : 'hover:text-teal-300'}
+            >
+              {part}
+            </button>
+          </span>
+        )
+      })}
     </div>
   )
 }

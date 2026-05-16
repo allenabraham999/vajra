@@ -5,11 +5,13 @@
 package master
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -84,6 +86,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/auth/config", h.authConfig)
 	mux.Handle("GET /v1/auth/google", s.limiter.Middleware(http.HandlerFunc(h.googleInitiate)))
 	mux.Handle("GET /v1/auth/google/callback", s.limiter.Middleware(http.HandlerFunc(h.googleCallback)))
+
+	// Browser terminal — a WebSocket. Registered here, outside
+	// AuthMiddleware, because a browser WebSocket cannot set an
+	// Authorization header; terminalSandbox authenticates from the
+	// ?token= query parameter instead.
+	mux.HandleFunc("GET /v1/sandboxes/{id}/terminal", h.terminalSandbox)
 
 	// Authed routes — wrap each with AuthMiddleware + the per-account
 	// rate limiter. The limiter is applied AFTER auth so the bucket is
@@ -286,4 +294,16 @@ func (r *statusRecorder) WriteHeader(code int) {
 func (r *statusRecorder) Write(b []byte) (int, error) {
 	r.written = true
 	return r.ResponseWriter.Write(b)
+}
+
+// Hijack exposes the underlying connection so the WebSocket terminal
+// handler can take over the socket. Without this passthrough the
+// statusRecorder wrapper would mask the http.Hijacker interface and the
+// upgrade would fail.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter is not a Hijacker")
+	}
+	return hj.Hijack()
 }
