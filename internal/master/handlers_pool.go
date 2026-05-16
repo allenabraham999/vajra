@@ -13,10 +13,11 @@ import (
 	"github.com/allenabraham999/vajra/internal/store"
 )
 
-// poolStatsTimeout bounds a single per-node pool-stats probe. The
-// dashboard polls every few seconds, so a slow agent must not stall the
-// request — we move on to the next node instead.
-const poolStatsTimeout = 5 * time.Second
+// poolStatsTimeout bounds the per-node pool-stats probes. Probes run
+// concurrently, so this is the worst-case wall time even when several
+// stale nodes are unreachable — the dashboard polls every few seconds
+// and must not stall on a dead agent.
+const poolStatsTimeout = 3 * time.Second
 
 // AgentPoolStats mirrors the agent's PoolStats JSON (GET /pool/stats on a
 // vajra-agent). Field tags match the agent wire format exactly.
@@ -46,25 +47,42 @@ func (h *Handlers) getPoolStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectPoolStats probes active nodes for pool stats, preferring a node
-// with a configured pool (non-empty Template). It never errors — an
-// unreachable agent just means we try the next node.
+// with a configured pool (non-empty Template). Probes run concurrently
+// so a handful of stale, unreachable nodes cost one timeout in total
+// rather than one each. It never errors — an unreachable agent just
+// drops out of the result set.
 func (h *Handlers) collectPoolStats(ctx context.Context) AgentPoolStats {
 	nodes, err := h.Store.Nodes().List(ctx, store.ListOpts{Limit: 200})
 	if err != nil {
 		h.log().Warn("getPoolStats: list nodes", "err", err)
 		return AgentPoolStats{}
 	}
-	var fallback AgentPoolStats
-	var gotAny bool
+	probeCtx, cancel := context.WithTimeout(ctx, poolStatsTimeout)
+	defer cancel()
+	// Buffered to len(nodes) so a goroutine never blocks on send even
+	// when we return early after finding a configured pool.
+	results := make(chan *AgentPoolStats, len(nodes))
+	probes := 0
 	for _, n := range nodes {
 		if n.State != models.NodeStateActive {
 			continue
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, poolStatsTimeout)
-		ps, perr := h.Pool.ClientFor(n).PoolStats(probeCtx)
-		cancel()
-		if perr != nil {
-			h.log().Debug("getPoolStats: probe", "node", n.ID, "err", perr)
+		probes++
+		go func(n *models.Node) {
+			ps, perr := h.Pool.ClientFor(n).PoolStats(probeCtx)
+			if perr != nil {
+				h.log().Debug("getPoolStats: probe", "node", n.ID, "err", perr)
+				results <- nil
+				return
+			}
+			results <- ps
+		}(n)
+	}
+	var fallback AgentPoolStats
+	var gotAny bool
+	for i := 0; i < probes; i++ {
+		ps := <-results
+		if ps == nil {
 			continue
 		}
 		if ps.Template != "" {
