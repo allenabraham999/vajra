@@ -81,7 +81,11 @@ func serveTerminal(c net.Conn, l *prefixLogger) {
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: int(slave.Fd())}
+	// Ctty must be a descriptor number in the CHILD, not the parent's
+	// slave.Fd(). cmd.Stdin/Stdout/Stderr map the slave onto child fds
+	// 0/1/2, so fd 0 is the slave there. Passing the parent fd makes the
+	// child fail with "Setctty set but Ctty not valid in child".
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
 		_ = slave.Close()
 		_, _ = fmt.Fprintf(c, "error: start: %s\n", err)
