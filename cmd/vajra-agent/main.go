@@ -13,7 +13,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -69,6 +71,9 @@ func main() {
 		"version", "0.0.1",
 		"node_id", cfg.nodeID,
 		"listen", cfg.listenAddr,
+		"capacity_cpu", cfg.totalCPU,
+		"capacity_mem_mb", cfg.totalMemMB,
+		"capacity_disk_gb", cfg.totalDiskGB,
 	)
 
 	if err := run(ctx, cfg, logger); err != nil {
@@ -336,9 +341,26 @@ func loadConfig() (config, error) {
 	cfg.cacheMaxBytes = envInt64("VAJRA_AGENT_CACHE_MAX_BYTES", 50*1024*1024*1024)
 	cfg.poolMinSize = envInt("VAJRA_AGENT_POOL_MIN_SIZE", 0)
 	cfg.poolMaxSize = envInt("VAJRA_AGENT_POOL_MAX_SIZE", 0)
+	// Host capacity advertised to the scheduler. The VAJRA_AGENT_TOTAL_*
+	// vars are operator overrides; when unset (or non-positive) we
+	// auto-detect from the host so a node always advertises the capacity
+	// it actually has. A hardcoded override silently mis-sizes the node
+	// whenever the box is resized — a stale "2" left over from a
+	// c8i.large on a since-upgraded 4-vCPU host makes the scheduler call
+	// the node full after a single 2-vCPU sandbox and autoscale a fresh
+	// EC2 for every subsequent create instead of bin-packing.
 	cfg.totalCPU = envInt("VAJRA_AGENT_TOTAL_CPU", 0)
+	if cfg.totalCPU <= 0 {
+		cfg.totalCPU = detectCPU()
+	}
 	cfg.totalMemMB = envInt("VAJRA_AGENT_TOTAL_MEMORY_MB", 0)
+	if cfg.totalMemMB <= 0 {
+		cfg.totalMemMB = detectMemoryMB()
+	}
 	cfg.totalDiskGB = envInt("VAJRA_AGENT_TOTAL_DISK_GB", 0)
+	if cfg.totalDiskGB <= 0 {
+		cfg.totalDiskGB = detectDiskGB(cfg.sandboxRoot)
+	}
 
 	if cfg.nodeID == "" {
 		host, err := os.Hostname()
@@ -382,4 +404,47 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// detectCPU returns the host's logical CPU count. Used when the
+// VAJRA_AGENT_TOTAL_CPU override is unset so a node always advertises
+// the capacity it actually has rather than a stale hardcoded value.
+func detectCPU() int {
+	return runtime.NumCPU()
+}
+
+// detectMemoryMB returns total host RAM in MB, read from /proc/meminfo's
+// MemTotal. Returns 0 when the file can't be read or parsed (e.g.
+// non-Linux dev hosts) so the caller can fall back to an explicit value.
+func detectMemoryMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "MemTotal:" {
+			kb, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				return 0
+			}
+			return int(kb / 1024)
+		}
+	}
+	return 0
+}
+
+// detectDiskGB returns the total size, in GB, of the filesystem backing
+// path. Falls back to the root filesystem when path does not exist yet
+// (the sandbox root is created lazily). Returns 0 if neither resolves.
+func detectDiskGB(path string) int {
+	for _, p := range []string{path, "/"} {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(p, &st); err != nil {
+			continue
+		}
+		total := st.Blocks * uint64(st.Bsize)
+		return int(total / (1024 * 1024 * 1024))
+	}
+	return 0
 }
