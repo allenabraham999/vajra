@@ -521,6 +521,10 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 			if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
 				h.log().Error("createSandbox: poll timeout update", "err", uerr, "sandbox_id", sandboxID)
 			}
+			// Refresh the cache so GET /v1/sandboxes/{id} stops serving a
+			// stale CREATING — without this the user waits out the cache
+			// TTL before the failure becomes visible.
+			h.writeSandboxStateCache(context.Background(), sandboxID, models.SandboxStateError)
 			_ = h.Tracker.Complete(context.Background(), opID, err)
 			h.log().Error("createSandbox: poll timeout", "sandbox_id", sandboxID)
 			return
@@ -566,6 +570,10 @@ func (h *Handlers) pollAgentCreate(accountID, sandboxID, opID string, agent *Age
 				if uerr := h.Store.Sandboxes().UpdateState(context.Background(), accountID, sandboxID, models.SandboxStateError); uerr != nil {
 					h.log().Error("createSandbox: poll error update", "err", uerr, "sandbox_id", sandboxID)
 				}
+				// Refresh the cache so GET /v1/sandboxes/{id} reflects the
+				// failure immediately instead of serving a stale CREATING
+				// until the cache TTL expires.
+				h.writeSandboxStateCache(context.Background(), sandboxID, models.SandboxStateError)
 				// Prefer the agent's own failure reason (e.g. a template
 				// that could not be distributed) over a generic message.
 				reason := "agent reported ERROR"
