@@ -183,21 +183,20 @@ function Hero() {
       <div className="relative mx-auto grid max-w-6xl items-center gap-14 px-5 py-20 lg:grid-cols-2 lg:py-28">
         {/* Left: copy */}
         <div className="animate-fade-in">
-          <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-teal-500/25 bg-teal-500/10 px-3 py-1 text-xs text-teal-300">
-            <span className="size-1.5 animate-pulse-soft rounded-full bg-teal-400" />
-            Sub-30ms boots verified on bare metal
+          <div className="mb-5 text-sm font-medium uppercase tracking-wider text-teal-400">
+            Verified on bare metal · Open source-friendly
           </div>
 
-          <h1 className="text-4xl font-semibold leading-[1.08] tracking-tight sm:text-5xl lg:text-[3.4rem]">
-            Sandbox Cloud for{' '}
+          <h1 className="text-5xl font-bold leading-[1.08] tracking-tight md:text-6xl">
+            Sandbox cloud for{' '}
             <span className="bg-gradient-to-r from-teal-300 to-teal-500 bg-clip-text text-transparent">
-              AI Agents
+              AI agents.
             </span>
           </h1>
 
-          <p className="mt-5 max-w-xl text-base leading-relaxed text-zinc-400 sm:text-lg">
-            Sub-30ms sandbox boots. Cloud Hypervisor microVMs. Production-ready
-            isolation. Open source-friendly architecture.
+          <p className="mt-5 max-w-2xl text-xl leading-relaxed text-zinc-400">
+            Hardware-isolated microVMs. Built for autonomous agents that need to
+            write, run, and verify code in sub-second time.
           </p>
 
           <div className="mt-8 flex flex-wrap items-center gap-3">
@@ -362,10 +361,10 @@ function DashboardPreview() {
  * -------------------------------------------------------------------- */
 function Performance() {
   const stats = [
-    { value: '27ms', label: 'Pool-hit sandbox boot' },
-    { value: '115ms', label: 'Cold restore on bare metal' },
-    { value: '6×', label: 'Faster than container baselines' },
-    { value: '100%', label: 'Hardware-isolated microVMs' },
+    { value: '28ms', label: 'Pool hit · RAM-to-RAM restore' },
+    { value: '115ms', label: 'Cold restore · disk snapshot to RAM' },
+    { value: '3-5s', label: 'Fresh cold boot · one-time, then pool warms' },
+    { value: 'Adaptive', label: 'Per-template pool sizing in real time' },
   ]
   return (
     <section id="performance" className="scroll-mt-20 border-y border-zinc-900 bg-zinc-950">
@@ -375,17 +374,17 @@ function Performance() {
             Performance
           </h2>
           <p className="mt-2 text-2xl font-semibold tracking-tight text-zinc-100 sm:text-3xl">
-            Built to boot before the prompt finishes.
+            Built for speed at every tier.
           </p>
         </Reveal>
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {stats.map((s, i) => (
             <Reveal
               key={s.label}
               delay={i * 90}
               className="rounded-xl border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950 p-6 text-center"
             >
-              <div className="bg-gradient-to-r from-teal-200 to-teal-500 bg-clip-text text-4xl font-bold tracking-tight text-transparent sm:text-5xl">
+              <div className="bg-gradient-to-r from-teal-200 to-teal-500 bg-clip-text font-mono text-4xl font-bold tracking-tight text-transparent sm:text-5xl">
                 {s.value}
               </div>
               <div className="mt-2 text-xs text-zinc-400 sm:text-sm">{s.label}</div>
