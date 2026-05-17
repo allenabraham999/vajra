@@ -349,25 +349,28 @@ func TestHandleNoCapacityDisabled(t *testing.T) {
 	}
 }
 
-// TestInstanceTypeForResources locks the ladder mapping from the brief
-// so a future edit can't silently shrink what we'll launch.
+// TestInstanceTypeForResources locks the resource-fit ladder. Requests
+// are matched against each rung's USABLE memory (memUsablePercent of
+// nominal), so a request equal to a rung's nominal RAM steps up to the
+// next rung — that nominal-vs-usable gap was the autoscaler-capacity
+// bug, and {2, 8192} below is its direct regression case.
 func TestInstanceTypeForResources(t *testing.T) {
 	cases := []struct {
 		vcpu, mem int
 		want      string
 	}{
-		{1, 1024, "c8i.large"},
-		{2, 2048, "c8i.large"},
-		{2, 4096, "c8i.large"},
-		{3, 4097, "c8i.xlarge"},
-		{4, 8192, "c8i.xlarge"},
-		{5, 8192, "c8i.2xlarge"},
-		{8, 16384, "c8i.2xlarge"},
-		{9, 16384, "c8i.4xlarge"},
-		{16, 32768, "c8i.4xlarge"},
-		{17, 1024, ""},        // exceeds ceiling on vCPU
-		{1, 32769, ""},        // exceeds ceiling on memory
-		{128, 256 * 1024, ""}, // way past the ceiling
+		{1, 1024, "c8i.large"},     // smallest rung
+		{2, 3500, "c8i.large"},     // within c8i.large usable (~3768 MB)
+		{2, 4096, "c8i.xlarge"},    // 4 GiB exceeds c8i.large usable
+		{2, 8192, "c8i.2xlarge"},   // regression: 8 GiB needs >8 GiB nominal
+		{4, 8192, "c8i.2xlarge"},   // memory-bound, not vCPU-bound
+		{8, 8192, "c8i.2xlarge"},   // 8 vCPU / 8 GiB
+		{8, 16384, "c8i.4xlarge"},  // 16 GiB exceeds c8i.2xlarge usable
+		{16, 30000, "c8i.4xlarge"}, // largest sandbox the ladder can host
+		{16, 32768, ""},            // a full-nominal 32 GiB VM fits no host
+		{17, 1024, ""},             // exceeds ceiling on vCPU
+		{1, 32769, ""},             // exceeds ceiling on memory
+		{128, 256 * 1024, ""},      // way past the ceiling
 	}
 	for _, c := range cases {
 		got := instanceTypeForResources(c.vcpu, c.mem)
@@ -378,12 +381,15 @@ func TestInstanceTypeForResources(t *testing.T) {
 	}
 }
 
-// TestExceedsAnyNodeCapacity verifies the handler-side check the brief
-// asks for: 128 vCPU is rejected up front, whereas anything inside the
-// ladder ceiling is allowed.
+// TestExceedsAnyNodeCapacity verifies the handler-side oversize check:
+// requests no rung's usable capacity can host are rejected up front,
+// while anything that fits a rung is allowed through.
 func TestExceedsAnyNodeCapacity(t *testing.T) {
-	if ExceedsAnyNodeCapacity(16, 32*1024) {
-		t.Fatal("ladder ceiling reported as exceeding capacity")
+	if ExceedsAnyNodeCapacity(16, 30000) {
+		t.Fatal("a 30 GB sandbox fits the top of the ladder")
+	}
+	if !ExceedsAnyNodeCapacity(16, 32*1024) {
+		t.Fatal("a full-nominal 32 GB sandbox fits on no node")
 	}
 	if !ExceedsAnyNodeCapacity(128, 1024) {
 		t.Fatal("128 vCPU request should be flagged as oversize")

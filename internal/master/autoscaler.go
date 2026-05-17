@@ -44,7 +44,7 @@ type EC2API interface {
 // that exact type. When empty, the autoscaler picks the smallest type
 // from instanceLadder that fits the requested sandbox resources, so a
 // user asking for 8 vCPU on a host with only a c8i.large lights up a
-// c6i.2xlarge instead of a too-small c8i.large.
+// c8i.2xlarge instead of a too-small c8i.large.
 type AutoscaleConfig struct {
 	Enabled       bool
 	AMI           string
@@ -95,13 +95,15 @@ type instanceSpec struct {
 }
 
 // instanceLadder is the ordered list of supported EC2 types, smallest
-// first. instanceTypeForResources picks the first rung that fits the
-// request. The ceiling (c6i.4xlarge) caps what a single sandbox can ask
-// for — requests above that are rejected at the handler with 400 since
-// no single node we know how to launch could host them.
+// first. MemoryMB is the type's NOMINAL spec-sheet RAM — the agent
+// registers less than this once the OS reservation is taken off the
+// top, so instanceTypeForResources matches requests against
+// usableMemoryMB, never these raw figures. The ceiling (c8i.4xlarge)
+// caps what a single sandbox can ask for — requests above that are
+// rejected at the handler with 400 since no node we can launch fits.
 //
-// The brief defines this mapping explicitly. Keep entries sorted by
-// VCPUs (then MemoryMB) so the linear scan stays correct.
+// Keep entries sorted by VCPUs (then MemoryMB) so the linear scan stays
+// correct.
 var instanceLadder = []instanceSpec{
 	{Type: "c8i.large", VCPUs: 2, MemoryMB: 4 * 1024},
 	{Type: "c8i.xlarge", VCPUs: 4, MemoryMB: 8 * 1024},
@@ -109,23 +111,47 @@ var instanceLadder = []instanceSpec{
 	{Type: "c8i.4xlarge", VCPUs: 16, MemoryMB: 32 * 1024},
 }
 
+// memUsablePercent is the share of an EC2 instance type's nominal RAM
+// that the OS actually exposes. An instance always reports less than
+// its spec sheet via `free -m` — firmware-reserved regions, the kernel
+// image, and the crash-kernel reservation all come off the top — and
+// the agent registers that smaller `free -m` figure as the node's
+// capacity. Observed: a nominal 8 GiB c8i.xlarge reports ~7780 MB.
+//
+// instanceTypeForResources MUST size against this usable figure. Sizing
+// against nominal RAM was the autoscaler-capacity bug: an 8192 MB
+// request matched a nominal-8192 c8i.xlarge whose real ~7780 MB cannot
+// host it, so the post-scale re-schedule rejected the very node we just
+// launched. 92% sits safely under every observed ratio while still
+// leaving the top of the ladder usable for near-nominal requests.
+const memUsablePercent = 92
+
+// usableMemoryMB converts an instance type's nominal RAM into the figure
+// its agent will actually register once the OS reservation is deducted.
+func usableMemoryMB(nominalMB int) int {
+	return nominalMB * memUsablePercent / 100
+}
+
 // instanceTypeForResources returns the smallest instance type in
-// instanceLadder that can host a sandbox of (vcpus, memoryMB). Returns
+// instanceLadder that can host a sandbox of (vcpus, memoryMB), comparing
+// the request against each rung's USABLE (not nominal) memory. Returns
 // "" when no rung fits — callers translate that into a 400 because no
 // scale-up will help.
 func instanceTypeForResources(vcpus, memoryMB int) string {
 	for _, spec := range instanceLadder {
-		if spec.VCPUs >= vcpus && spec.MemoryMB >= memoryMB {
+		if spec.VCPUs >= vcpus && usableMemoryMB(spec.MemoryMB) >= memoryMB {
 			return spec.Type
 		}
 	}
 	return ""
 }
 
-// maxNodeVCPUs and maxNodeMemoryMB are the ceiling of instanceLadder.
-// Used by handlers to short-circuit oversize requests before they hit
-// the queue. Kept as functions so the values track the slice if anyone
-// edits the ladder.
+// maxNodeVCPUs and maxNodeMemoryMB are the ceiling of instanceLadder —
+// the largest sandbox the autoscaler can ever host. The handler quotes
+// them in its oversize-request 400 message. maxNodeMemoryMB reports the
+// top rung's USABLE memory so the limit it advertises is one a sandbox
+// could actually reach. Kept as functions so the values track the slice
+// if anyone edits the ladder.
 func maxNodeVCPUs() int {
 	out := 0
 	for _, s := range instanceLadder {
@@ -139,8 +165,8 @@ func maxNodeVCPUs() int {
 func maxNodeMemoryMB() int {
 	out := 0
 	for _, s := range instanceLadder {
-		if s.MemoryMB > out {
-			out = s.MemoryMB
+		if u := usableMemoryMB(s.MemoryMB); u > out {
+			out = u
 		}
 	}
 	return out
@@ -149,8 +175,11 @@ func maxNodeMemoryMB() int {
 // ExceedsAnyNodeCapacity reports whether (vcpus, memoryMB) is larger
 // than any instance the autoscaler can launch. Exported so handlers can
 // classify the request as "too big to ever fit" vs "wait for capacity".
+// Defined in terms of instanceTypeForResources so it stays exactly
+// consistent with what a scale-up could actually satisfy — including
+// the nominal-vs-usable memory haircut.
 func ExceedsAnyNodeCapacity(vcpus, memoryMB int) bool {
-	return vcpus > maxNodeVCPUs() || memoryMB > maxNodeMemoryMB()
+	return instanceTypeForResources(vcpus, memoryMB) == ""
 }
 
 // Autoscaler owns the pending-request queue and the EC2 client. Single
@@ -259,8 +288,25 @@ func (a *Autoscaler) HandleNoCapacity(ctx context.Context, req createSandboxRequ
 	}
 }
 
+// queuedDemand returns the largest vCPU and memory figures across every
+// create request currently waiting in the queue — the dimensions a
+// scale-up must satisfy. (0, 0) means nothing is queued.
+func (a *Autoscaler) queuedDemand() (vcpus, memoryMB int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, pc := range a.pendingQueue {
+		if pc.Request.VCPUs > vcpus {
+			vcpus = pc.Request.VCPUs
+		}
+		if pc.Request.MemoryMB > memoryMB {
+			memoryMB = pc.Request.MemoryMB
+		}
+	}
+	return vcpus, memoryMB
+}
+
 // pickInstanceType decides which EC2 type to launch. Config.InstanceType
-// (the operator override) wins when set; otherwise we look at the
+// (the operator override) wins when set; otherwise we size for the
 // largest queued request and pick the smallest ladder rung that fits
 // it. Picking the biggest waiter is deliberate: one too-small node
 // would leave that waiter stuck even though smaller waiters would have
@@ -269,17 +315,7 @@ func (a *Autoscaler) pickInstanceType() string {
 	if a.Config.InstanceType != "" {
 		return a.Config.InstanceType
 	}
-	a.mu.Lock()
-	maxVCPU, maxMem := 0, 0
-	for _, pc := range a.pendingQueue {
-		if pc.Request.VCPUs > maxVCPU {
-			maxVCPU = pc.Request.VCPUs
-		}
-		if pc.Request.MemoryMB > maxMem {
-			maxMem = pc.Request.MemoryMB
-		}
-	}
-	a.mu.Unlock()
+	maxVCPU, maxMem := a.queuedDemand()
 	if maxVCPU == 0 && maxMem == 0 {
 		// No queued requests (e.g. admin-triggered scale-up). Fall back
 		// to the smallest rung; operators who want a specific size set
@@ -311,8 +347,11 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 	}
 
 	instType := a.pickInstanceType()
+	demandVCPU, demandMem := a.queuedDemand()
 	if instType == "" {
-		a.broadcastError(fmt.Errorf("autoscale: no instance type fits queued requests"))
+		a.broadcastError(fmt.Errorf(
+			"autoscale: no instance type fits queued demand (%d vcpu, %d MB)",
+			demandVCPU, demandMem))
 		return
 	}
 	userData := a.buildUserData()
@@ -339,7 +378,9 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 		}},
 	}
 
-	a.logger.Info("autoscale: launching ec2 instance", "ami", a.Config.AMI, "type", instType)
+	a.logger.Info("autoscale: launching ec2 instance",
+		"ami", a.Config.AMI, "type", instType,
+		"needs_vcpus", demandVCPU, "needs_memory_mb", demandMem)
 	out, err := a.ec2Client.RunInstances(ctx, in)
 	if err != nil {
 		a.broadcastError(fmt.Errorf("autoscale: run instances: %w", err))
