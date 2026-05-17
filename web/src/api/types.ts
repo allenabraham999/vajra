@@ -243,18 +243,42 @@ export interface UsageResponse {
   storage_gb_hours: number
 }
 
-// PoolStats is the pre-warm pool snapshot from GET /v1/pool/stats.
-export interface PoolStats {
-  min_size: number
-  max_size: number
-  target_size: number
+// PoolGlobal is the cluster-wide warm-pool summary in GET /v1/pool/stats.
+export interface PoolGlobal {
+  total_warm_vms: number
+  total_capacity: number
+  total_hits_24h: number
+  total_misses_24h: number
+  hit_rate_pct: number
+}
+
+// PoolTemplateStats is one per-template warm-pool row, scoped to a node.
+export interface PoolTemplateStats {
+  template_name: string
+  template_hash: string
+  template_id: string
   available: number
   warming: number
-  total_hits: number
-  total_misses: number
-  total_created: number
-  hit_rate_pct: number
-  template: string
+  target_size: number
+  in_use: number
+  hits_last_hour: number
+  // last_hit_at may be absent when the pool has never served a create.
+  last_hit_at?: string
+}
+
+// PoolNodeStats is the warm-pool state of a single node. `templates` may be
+// absent or empty for nodes that host no pool.
+export interface PoolNodeStats {
+  node_id: string
+  capacity: number
+  templates?: PoolTemplateStats[]
+}
+
+// PoolStats is the per-node, per-template pre-warm pool snapshot from
+// GET /v1/pool/stats.
+export interface PoolStats {
+  global: PoolGlobal
+  nodes: PoolNodeStats[]
 }
 
 // BootTime is one recent sandbox create from GET /v1/sandboxes/boot-times.

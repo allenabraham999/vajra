@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,14 +16,13 @@ import (
 	"time"
 )
 
-// Pool tunables. Min/max are upper/lower bounds on the dynamic target —
-// the loop oscillates inside that band based on observed hit/miss rate.
+// Pool tunables. The pre-warm pool is per-template: each template hash
+// gets its own warm set, sized adaptively from observed hit traffic and
+// bounded by a per-node global cap so a busy node can't overcommit.
 const (
-	DefaultPoolMinSize        = 5
-	DefaultPoolMaxSize        = 15
 	DefaultPoolFirstCID       = uint32(100)
 	DefaultPoolReplenishEvery = 1 * time.Second
-	DefaultPoolAdjustEvery    = 30 * time.Second
+	DefaultPoolAdjustEvery    = 60 * time.Second
 	DefaultPoolRotateEvery    = 60 * time.Second
 	DefaultPoolStaleAfter     = 10 * time.Minute
 	DefaultPoolWarmConcurrent = 3
@@ -30,20 +30,88 @@ const (
 	// remain free for the pool to start another warm-up. Below this, the
 	// replenish loop logs and waits.
 	DefaultPoolMemReserveFrac = 0.20
+
+	// Adaptive-sizing defaults — all overridable via env (see PoolConfig).
+	DefaultPoolNewTemplateTarget = 2          // brand-new template pool
+	DefaultPoolTemplateMax       = 5          // ceiling on one pool's target
+	DefaultPoolSystemMinTarget   = 3          // system template never drains below this
+	DefaultPoolHitThresholdMed   = 3          // hits/window → target 3
+	DefaultPoolHitThresholdHigh  = 10         // hits/window → target 5
+	DefaultPoolAdaptiveWindow    = time.Hour  // rolling hit/miss window
+	DefaultPoolDrainAfterIdle    = time.Hour  // no hits this long → target 0
+	poolDrainHalfIdle            = 30 * time.Minute // no hits this long → target 1
+	poolTargetMedium             = 3
+	poolTargetHigh               = 5
 )
 
-// PoolStats is the JSON shape returned by GET /pool/stats.
-type PoolStats struct {
-	MinSize      int     `json:"min_size"`
-	MaxSize      int     `json:"max_size"`
-	TargetSize   int     `json:"target_size"`
-	Available    int     `json:"available"`
-	Warming      int     `json:"warming"`
-	TotalHits    int64   `json:"total_hits"`
-	TotalMisses  int64   `json:"total_misses"`
-	TotalCreated int64   `json:"total_created"`
-	HitRatePct   float64 `json:"hit_rate_pct"`
-	Template     string  `json:"template"`
+// ErrPoolEmpty is returned by AssignFromPool when no warm sandbox is ready
+// for the requested template — the caller falls back to a cold create.
+var ErrPoolEmpty = errors.New("pool: no warm sandbox available")
+
+// PoolConfig carries the per-node pre-warm-pool tunables. Values at or
+// below zero fall back to the documented defaults via withDefaults.
+type PoolConfig struct {
+	// SystemTemplate is the default template (ubuntu-noble) kept warm at
+	// all times — its pool is seeded on startup and never drains below
+	// SystemMinTarget or gets garbage-collected.
+	SystemTemplate string
+	// GlobalCap bounds total warm VMs across every template pool on this
+	// node. Derived from host CPU (total_cpu * 1.5) by the agent.
+	GlobalCap int
+	// NewTemplate is the target a freshly-seen template pool starts at.
+	NewTemplate int
+	// PerTemplateMax caps any single pool's adaptive target.
+	PerTemplateMax int
+	// SystemMinTarget is the floor on the system template's target.
+	SystemMinTarget int
+	// HitThreshMed / HitThreshHigh are the hits-in-window cutoffs that
+	// step a pool's target up to 3 and 5 respectively.
+	HitThreshMed  int
+	HitThreshHigh int
+	// AdaptiveWindow is the rolling window over which hits/misses count.
+	AdaptiveWindow time.Duration
+	// DrainAfterIdle is how long a pool may go without a hit before its
+	// target collapses to 0 and the pool is garbage-collected.
+	DrainAfterIdle time.Duration
+	// Sandbox is the resource shape every warmed VM is built with.
+	Sandbox SandboxConfig
+}
+
+func (c PoolConfig) withDefaults() PoolConfig {
+	if c.GlobalCap <= 0 {
+		c.GlobalCap = 6
+	}
+	if c.NewTemplate <= 0 {
+		c.NewTemplate = DefaultPoolNewTemplateTarget
+	}
+	if c.PerTemplateMax <= 0 {
+		c.PerTemplateMax = DefaultPoolTemplateMax
+	}
+	if c.SystemMinTarget <= 0 {
+		c.SystemMinTarget = DefaultPoolSystemMinTarget
+	}
+	if c.HitThreshMed <= 0 {
+		c.HitThreshMed = DefaultPoolHitThresholdMed
+	}
+	if c.HitThreshHigh <= 0 {
+		c.HitThreshHigh = DefaultPoolHitThresholdHigh
+	}
+	if c.AdaptiveWindow <= 0 {
+		c.AdaptiveWindow = DefaultPoolAdaptiveWindow
+	}
+	if c.DrainAfterIdle <= 0 {
+		c.DrainAfterIdle = DefaultPoolDrainAfterIdle
+	}
+	if c.Sandbox.VCPUs == 0 {
+		c.Sandbox.VCPUs = 2
+	}
+	if c.Sandbox.MemoryMB == 0 {
+		c.Sandbox.MemoryMB = 512
+	}
+	if c.Sandbox.DiskGB == 0 {
+		c.Sandbox.DiskGB = 4
+	}
+	return c
 }
 
 // PooledSandbox is a fully-restored, paused microVM the pool owns until
@@ -62,17 +130,55 @@ type PooledSandbox struct {
 	CreatedAt       time.Time
 }
 
-// PoolManager keeps a small dynamic pool of pre-restored, paused
-// sandboxes so create requests hit warm capacity instead of paying the
-// full ~1.5 s overlay+restore overhead.
+// templatePool is the warm pool for a single template hash plus the
+// bookkeeping the adaptive sizer reads. Every field is guarded by
+// PoolManager.mu — templatePool carries no lock of its own.
+type templatePool struct {
+	hash         string
+	id           string // registry template ID, for stats display
+	warm         []*PooledSandbox
+	warming      int
+	target       int
+	hitWindow    []time.Time // hit timestamps, pruned to AdaptiveWindow
+	missWindow   []time.Time
+	lastHitAt    time.Time
+	createdAt    time.Time
+	lifetimeHits int64
+}
+
+// TemplatePoolStats is one template's pool snapshot inside NodePoolStats.
+type TemplatePoolStats struct {
+	TemplateHash string     `json:"template_hash"`
+	TemplateID   string     `json:"template_id,omitempty"`
+	Available    int        `json:"available"`
+	Warming      int        `json:"warming"`
+	TargetSize   int        `json:"target_size"`
+	InUse        int        `json:"in_use"`
+	HitsLastHour int        `json:"hits_last_hour"`
+	TotalHits    int64      `json:"total_hits"`
+	LastHitAt    *time.Time `json:"last_hit_at,omitempty"`
+}
+
+// NodePoolStats is the GET /pool/stats body: this node's per-template
+// warm pools plus the node-wide warm-VM budget.
+type NodePoolStats struct {
+	Capacity    int                 `json:"capacity"`
+	TotalWarm   int                 `json:"total_warm"`
+	TotalHits   int64               `json:"total_hits"`
+	TotalMisses int64               `json:"total_misses"`
+	Templates   []TemplatePoolStats `json:"templates"`
+}
+
+// PoolManager keeps a per-template set of pre-restored, paused sandboxes
+// so create requests hit warm capacity instead of paying the full
+// overlay+restore overhead. Each template hash has its own templatePool;
+// the manager warms, drains, rotates and adaptively resizes them under a
+// single mutex.
 //
 // Ownership: pool members are NOT in SandboxManager until AssignFromPool
-// adopts them. That means the heartbeat usage accounting excludes them,
-// while the host's vsock + memory footprint is real. The trade-off is
-// intentional — under-reporting usage trades a small scheduling lie for
-// a much faster create path; the alternative (registering pool members)
-// would have them fail health checks because the paused guest can't
-// answer the vsock probe.
+// adopts them. Heartbeat usage accounting excludes them, while the host's
+// vsock + memory footprint is real — an intentional trade of a small
+// scheduling lie for a much faster create path.
 type PoolManager struct {
 	sandboxes *SandboxManager
 	cache     *ImageCache
@@ -80,10 +186,8 @@ type PoolManager struct {
 	logger    *slog.Logger
 	root      string
 
-	minSize         int
-	maxSize         int
-	templateHash    string
-	config          SandboxConfig
+	cfg PoolConfig
+
 	replenishEvery  time.Duration
 	adjustEvery     time.Duration
 	rotateEvery     time.Duration
@@ -97,80 +201,74 @@ type PoolManager struct {
 
 	cidCounter atomic.Uint32
 
-	mu           sync.Mutex
-	warm         []*PooledSandbox
-	warming      int
-	freeCIDs     []uint32
-	targetSize   int
-	recentHits   int
-	recentMisses int
-	windowStart  time.Time
+	mu       sync.Mutex
+	pools    map[string]*templatePool
+	freeCIDs []uint32
 
 	wg      sync.WaitGroup
 	stop    chan struct{}
 	stopped atomic.Bool
 }
 
-// ErrPoolEmpty is returned by AssignFromPool when no warm sandbox is ready.
-var ErrPoolEmpty = errors.New("pool: no warm sandbox available")
-
-// NewPoolManager builds a pool sized between minSize and maxSize. Pass
-// minSize <= 0 for DefaultPoolMinSize; pass maxSize <= 0 for the larger of
-// minSize and DefaultPoolMaxSize.
-func NewPoolManager(
-	minSize, maxSize int,
-	templateHash string,
-	cfg SandboxConfig,
-	sandboxes *SandboxManager,
-	logger *slog.Logger,
-) *PoolManager {
-	if minSize <= 0 {
-		minSize = DefaultPoolMinSize
-	}
-	if maxSize <= 0 {
-		maxSize = DefaultPoolMaxSize
-	}
-	if maxSize < minSize {
-		maxSize = minSize
-	}
+// NewPoolManager builds a per-template pool manager. The system template,
+// when set, is seeded immediately so it warms from process start.
+func NewPoolManager(cfg PoolConfig, sandboxes *SandboxManager, logger *slog.Logger) *PoolManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	cfg = cfg.withDefaults()
 	p := &PoolManager{
 		sandboxes:       sandboxes,
 		cache:           sandboxes.Cache(),
 		vmm:             sandboxes.VMM(),
 		logger:          logger,
 		root:            sandboxes.Root(),
-		minSize:         minSize,
-		maxSize:         maxSize,
-		templateHash:    templateHash,
-		config:          cfg,
+		cfg:             cfg,
 		replenishEvery:  DefaultPoolReplenishEvery,
 		adjustEvery:     DefaultPoolAdjustEvery,
 		rotateEvery:     DefaultPoolRotateEvery,
 		staleAfter:      DefaultPoolStaleAfter,
 		warmConcurrency: DefaultPoolWarmConcurrent,
 		memReserveFrac:  DefaultPoolMemReserveFrac,
-		targetSize:      minSize,
-		windowStart:     time.Now(),
+		pools:           make(map[string]*templatePool),
 		stop:            make(chan struct{}),
 	}
 	p.cidCounter.Store(DefaultPoolFirstCID)
+	if cfg.SystemTemplate != "" {
+		p.pools[cfg.SystemTemplate] = newTemplatePool(cfg.SystemTemplate, "", cfg.SystemMinTarget)
+	}
 	return p
+}
+
+// newTemplatePool returns a pool seeded with target and clocks set to now
+// so a brand-new pool isn't immediately treated as idle.
+func newTemplatePool(hash, id string, target int) *templatePool {
+	now := time.Now()
+	return &templatePool{
+		hash:      hash,
+		id:        id,
+		target:    target,
+		lastHitAt: now,
+		createdAt: now,
+	}
 }
 
 // Start launches the background pool loops. Calling more than once
 // returns immediately. The pool warms in the background — Start does not
-// block on minSize warm members being ready, so the agent can serve cold
-// creates while the pool catches up.
+// block on warm members being ready, so the agent can serve cold creates
+// while the pools fill.
 func (p *PoolManager) Start(ctx context.Context) {
 	if p.stopped.Load() {
 		return
 	}
+	p.mu.Lock()
+	seeded := len(p.pools)
+	p.mu.Unlock()
 	p.logger.Info("pool: warming",
-		"target", p.targetSize, "min", p.minSize, "max", p.maxSize,
-		"template", p.templateHash)
+		"system_template", p.cfg.SystemTemplate,
+		"seeded_pools", seeded,
+		"global_cap", p.cfg.GlobalCap,
+		"per_template_max", p.cfg.PerTemplateMax)
 	p.wg.Add(1)
 	go p.replenishLoop(ctx)
 	p.wg.Add(1)
@@ -179,9 +277,9 @@ func (p *PoolManager) Start(ctx context.Context) {
 	go p.rotateLoop(ctx)
 }
 
-// Stop terminates the loops and destroys every warm member. Safe to call
-// multiple times. Blocks until all warming goroutines have finished —
-// pool members never outlive a clean Stop.
+// Stop terminates the loops and destroys every warm member across all
+// template pools. Safe to call multiple times. Blocks until all warming
+// goroutines have finished.
 func (p *PoolManager) Stop() {
 	if p.stopped.Swap(true) {
 		return
@@ -195,30 +293,50 @@ func (p *PoolManager) Stop() {
 // the agent's SIGTERM handler.
 func (p *PoolManager) Shutdown() { p.Stop() }
 
-// AssignFromPool hands a warm member to the caller. Returns ErrPoolEmpty
-// if no warm sandbox is ready — the caller falls back to a cold create.
-// The pool removes the member from its tracking under the lock, so two
-// simultaneous Assign calls cannot return the same sandbox.
-func (p *PoolManager) AssignFromPool() (*PooledSandbox, error) {
+// AssignFromPool hands a warm member for templateHash to the caller, or
+// ErrPoolEmpty when none is ready. A miss on a template with no pool
+// stands one up (at the new-template target) so the warmer starts
+// filling it; templateID is recorded for stats display when known.
+func (p *PoolManager) AssignFromPool(templateHash, templateID string) (*PooledSandbox, error) {
+	if templateHash == "" {
+		return nil, ErrPoolEmpty
+	}
+	now := time.Now()
 	p.mu.Lock()
-	if len(p.warm) == 0 {
-		p.recentMisses++
+	tp := p.pools[templateHash]
+	if tp == nil {
+		tp = newTemplatePool(templateHash, templateID, p.cfg.NewTemplate)
+		p.pools[templateHash] = tp
+		tp.missWindow = append(tp.missWindow, now)
+		p.mu.Unlock()
+		p.totalMisses.Add(1)
+		p.logger.Info("pool: new template pool",
+			"template", templateHash, "target", tp.target)
+		return nil, ErrPoolEmpty
+	}
+	if tp.id == "" && templateID != "" {
+		tp.id = templateID
+	}
+	if len(tp.warm) == 0 {
+		tp.missWindow = append(tp.missWindow, now)
 		p.mu.Unlock()
 		p.totalMisses.Add(1)
 		return nil, ErrPoolEmpty
 	}
 	// FIFO: hand out the oldest so warm dwell time stays bounded.
-	ps := p.warm[0]
-	p.warm = p.warm[1:]
-	p.recentHits++
+	ps := tp.warm[0]
+	tp.warm = tp.warm[1:]
+	tp.hitWindow = append(tp.hitWindow, now)
+	tp.lastHitAt = now
+	tp.lifetimeHits++
 	p.mu.Unlock()
 	p.totalHits.Add(1)
 	return ps, nil
 }
 
-// MakeSandbox builds a SandboxManager-ready Sandbox value from a pooled
-// member. The caller (the create handler) calls this after ResumeVM so
-// the sandbox is RUNNING and Healthy before being adopted.
+// MakeSandbox builds a SandboxManager-ready Sandbox from a pooled member.
+// The caller calls this after ResumeVM so the sandbox is RUNNING and
+// Healthy before being adopted.
 func (p *PoolManager) MakeSandbox(ps *PooledSandbox) *Sandbox {
 	now := time.Now().UTC()
 	return &Sandbox{
@@ -238,48 +356,59 @@ func (p *PoolManager) MakeSandbox(ps *PooledSandbox) *Sandbox {
 	}
 }
 
-// Release is kept for API parity with the older pool; pool members
-// are never returned to the warm list after a destroy, so this is just
-// a CID-recycling hook.
+// Release recycles a pooled member's CID after the caller destroys it.
+// Pool members are never returned to the warm list once handed out.
 func (p *PoolManager) Release(cid uint32) {
-	if cid < DefaultPoolFirstCID {
-		return
-	}
-	p.mu.Lock()
-	p.freeCIDs = append(p.freeCIDs, cid)
-	p.mu.Unlock()
+	p.recycleCID(cid)
 }
 
-// Stats returns a point-in-time snapshot.
-func (p *PoolManager) Stats() PoolStats {
+// Stats returns a point-in-time snapshot of every template pool plus the
+// node-wide warm-VM budget.
+func (p *PoolManager) Stats() NodePoolStats {
+	// in_use: pool-sourced sandboxes still running, bucketed by template.
+	inUse := map[string]int{}
+	for _, sb := range p.sandboxes.List() {
+		if sb.FromPool && sb.State == SandboxStateRunning {
+			inUse[sb.TemplateHash]++
+		}
+	}
+	now := time.Now()
 	p.mu.Lock()
-	available := len(p.warm)
-	warming := p.warming
-	target := p.targetSize
+	out := NodePoolStats{
+		Capacity:  p.cfg.GlobalCap,
+		Templates: make([]TemplatePoolStats, 0, len(p.pools)),
+	}
+	for hash, tp := range p.pools {
+		p.pruneWindowsLocked(tp, now)
+		ts := TemplatePoolStats{
+			TemplateHash: hash,
+			TemplateID:   tp.id,
+			Available:    len(tp.warm),
+			Warming:      tp.warming,
+			TargetSize:   tp.target,
+			InUse:        inUse[hash],
+			HitsLastHour: len(tp.hitWindow),
+			TotalHits:    tp.lifetimeHits,
+		}
+		if tp.lifetimeHits > 0 {
+			t := tp.lastHitAt
+			ts.LastHitAt = &t
+		}
+		out.TotalWarm += len(tp.warm)
+		out.Templates = append(out.Templates, ts)
+	}
 	p.mu.Unlock()
-	hits := p.totalHits.Load()
-	misses := p.totalMisses.Load()
-	rate := 0.0
-	if total := hits + misses; total > 0 {
-		rate = 100.0 * float64(hits) / float64(total)
-	}
-	return PoolStats{
-		MinSize:      p.minSize,
-		MaxSize:      p.maxSize,
-		TargetSize:   target,
-		Available:    available,
-		Warming:      warming,
-		TotalHits:    hits,
-		TotalMisses:  misses,
-		TotalCreated: p.totalCreated.Load(),
-		HitRatePct:   rate,
-		Template:     p.templateHash,
-	}
+	sort.Slice(out.Templates, func(i, j int) bool {
+		return out.Templates[i].TemplateHash < out.Templates[j].TemplateHash
+	})
+	out.TotalHits = p.totalHits.Load()
+	out.TotalMisses = p.totalMisses.Load()
+	return out
 }
 
 func (p *PoolManager) replenishLoop(ctx context.Context) {
 	defer p.wg.Done()
-	// Kick once immediately so WarmUp is observable inside the first
+	// Kick once immediately so warm-up is observable inside the first
 	// second instead of waiting for the first tick.
 	p.replenishOnce(ctx)
 	ticker := time.NewTicker(p.replenishEvery)
@@ -308,7 +437,7 @@ func (p *PoolManager) adjustLoop(ctx context.Context) {
 		case <-p.stop:
 			return
 		case <-ticker.C:
-			p.adjustTargetSize()
+			p.adjustAll()
 		}
 	}
 }
@@ -329,74 +458,157 @@ func (p *PoolManager) rotateLoop(ctx context.Context) {
 	}
 }
 
-// replenishOnce launches warm-up goroutines until warm+warming reaches
-// the dynamic target, capped at maxSize and DefaultPoolWarmConcurrent
-// inflight at once. The actual restore happens in a goroutine; this
-// function only schedules and returns quickly so the loop can react.
+// replenishOnce drives every template pool toward its target, highest
+// priority first, never exceeding warmConcurrency inflight restores or
+// the node-wide GlobalCap on warm VMs. When the cap blocks a needed
+// warm-up it drains one member from a strictly-lower-priority pool to
+// free a slot. The actual restore runs in a goroutine.
 func (p *PoolManager) replenishOnce(ctx context.Context) {
-	for {
+	for iter := 0; iter < 64; iter++ {
 		if p.shouldStop() {
 			return
 		}
 		p.mu.Lock()
-		warmCount := len(p.warm)
-		warming := p.warming
-		target := p.targetSize
-		if target > p.maxSize {
-			target = p.maxSize
+		totalWarm, totalWarming := 0, 0
+		for _, tp := range p.pools {
+			totalWarm += len(tp.warm)
+			totalWarming += tp.warming
 		}
-		needed := target - warmCount - warming
-		if needed <= 0 || warmCount+warming >= p.maxSize || warming >= p.warmConcurrency {
+		if totalWarming >= p.warmConcurrency {
 			p.mu.Unlock()
 			return
+		}
+		needy := p.neediestPoolLocked()
+		if needy == nil {
+			p.mu.Unlock()
+			return
+		}
+		if totalWarm+totalWarming >= p.cfg.GlobalCap {
+			// At the node cap. Free a slot by draining the oldest member
+			// of a strictly-lower-priority pool; if there is none we
+			// simply can't grow this tick.
+			victim := p.evictionVictimLocked(needy)
+			if victim == nil {
+				p.mu.Unlock()
+				return
+			}
+			v := victim.warm[0]
+			victim.warm = victim.warm[1:]
+			victimHash := victim.hash
+			p.mu.Unlock()
+			p.logger.Info("pool: evict for higher-priority template",
+				"victim_template", victimHash, "needed_for", needy.hash)
+			p.destroyMember(ctx, v, "evict")
+			continue
 		}
 		if !p.hostHasMemoryHeadroomLocked() {
 			p.mu.Unlock()
 			p.logger.Warn("pool: skipping warm-up; host low on memory",
-				"warm", warmCount, "warming", warming, "target", target)
+				"warm", totalWarm, "warming", totalWarming)
 			return
 		}
-		p.warming++
+		needy.warming++
+		hash := needy.hash
 		p.mu.Unlock()
-		p.logger.Info("pool: replenishing",
-			"warm", warmCount, "warming", warming+1, "target", target)
+		p.logger.Info("pool: replenishing", "template", hash)
 		p.wg.Add(1)
-		go p.warmOne(ctx)
+		go p.warmOne(ctx, hash)
 	}
 }
 
-// warmOne runs a single pre-warm in the background. On success the
-// member is appended to warm; on failure the warming counter still
-// decrements so the loop will retry.
-func (p *PoolManager) warmOne(ctx context.Context) {
+// neediestPoolLocked returns the highest-priority pool that is below its
+// target (warm+warming < target), or nil when every pool is satisfied.
+// Caller holds p.mu.
+func (p *PoolManager) neediestPoolLocked() *templatePool {
+	var best *templatePool
+	bestRank := -1
+	for _, tp := range p.pools {
+		if len(tp.warm)+tp.warming >= tp.target {
+			continue
+		}
+		if r := p.poolRankLocked(tp); r > bestRank {
+			best, bestRank = tp, r
+		}
+	}
+	return best
+}
+
+// evictionVictimLocked returns the lowest-priority pool that has a warm
+// member to spare and ranks strictly below needy, or nil. Caller holds
+// p.mu.
+func (p *PoolManager) evictionVictimLocked(needy *templatePool) *templatePool {
+	needyRank := p.poolRankLocked(needy)
+	var victim *templatePool
+	victimRank := -1
+	for _, tp := range p.pools {
+		if tp == needy || len(tp.warm) == 0 {
+			continue
+		}
+		r := p.poolRankLocked(tp)
+		if r >= needyRank {
+			continue
+		}
+		if victim == nil || r < victimRank {
+			victim, victimRank = tp, r
+		}
+	}
+	return victim
+}
+
+// poolRankLocked scores a pool's scheduling priority: the system template
+// always outranks the rest, and within each tier more recent hits rank
+// higher. Caller holds p.mu.
+func (p *PoolManager) poolRankLocked(tp *templatePool) int {
+	rank := len(tp.hitWindow)
+	if tp.hash == p.cfg.SystemTemplate {
+		rank += 1_000_000
+	}
+	return rank
+}
+
+// warmOne runs a single pre-warm for templateHash in the background. On
+// success the member is appended to that pool; if the pool was
+// garbage-collected mid-build the orphan VM is destroyed.
+func (p *PoolManager) warmOne(ctx context.Context, templateHash string) {
 	defer p.wg.Done()
 	t0 := time.Now()
-	ps, err := p.buildPooled(ctx)
+	ps, err := p.buildPooled(ctx, templateHash)
 	p.mu.Lock()
-	p.warming--
+	tp := p.pools[templateHash]
+	if tp != nil {
+		tp.warming--
+	}
 	if err != nil {
 		p.mu.Unlock()
-		p.logger.Warn("pool: warm-up failed", "err", err)
+		p.logger.Warn("pool: warm-up failed", "template", templateHash, "err", err)
 		return
 	}
-	p.warm = append(p.warm, ps)
+	if tp == nil {
+		p.mu.Unlock()
+		p.destroyMember(ctx, ps, "orphan")
+		return
+	}
+	tp.warm = append(tp.warm, ps)
 	p.mu.Unlock()
 	p.totalCreated.Add(1)
 	p.logger.Info("pool: pre-warmed sandbox",
-		"id", ps.ID, "elapsed_ms", time.Since(t0).Milliseconds())
+		"id", ps.ID, "template", templateHash,
+		"elapsed_ms", time.Since(t0).Milliseconds())
 }
 
-// buildPooled materialises a single pool member end-to-end:
-//   qcow2 overlay → hardlink snapshot → rewrite config → CH restore (paused).
-// The new VM is fully restored but stays paused; AssignFromPool's caller
-// resumes it. On any failure the partial sandbox directory is removed
-// and the CID is returned to the free list.
-func (p *PoolManager) buildPooled(ctx context.Context) (*PooledSandbox, error) {
-	if !p.cache.HasTemplate(p.templateHash) {
-		return nil, fmt.Errorf("template %s not in cache", p.templateHash)
+// buildPooled materialises a single pool member for templateHash:
+//
+//	qcow2 overlay → hardlink snapshot → rewrite config → CH restore (paused).
+//
+// The new VM is fully restored but stays paused. On any failure the
+// partial sandbox directory is removed and the CID returned to the free
+// list.
+func (p *PoolManager) buildPooled(ctx context.Context, templateHash string) (*PooledSandbox, error) {
+	if !p.cache.HasTemplate(templateHash) {
+		return nil, fmt.Errorf("template %s not in cache", templateHash)
 	}
-	layout := p.cache.Layout(p.templateHash)
-	if err := p.cache.EnsureRootfsBacking(p.templateHash); err != nil {
+	layout := p.cache.Layout(templateHash)
+	if err := p.cache.EnsureRootfsBacking(templateHash); err != nil {
 		return nil, fmt.Errorf("ensure rootfs backing: %w", err)
 	}
 
@@ -425,7 +637,7 @@ func (p *PoolManager) buildPooled(ctx context.Context) (*PooledSandbox, error) {
 		p.recycleCID(cid)
 		return nil, fmt.Errorf("restore paused: %w", err)
 	}
-	p.cache.Touch(p.templateHash)
+	p.cache.Touch(templateHash)
 	return &PooledSandbox{
 		ID:              id,
 		Dir:             dir,
@@ -433,87 +645,131 @@ func (p *PoolManager) buildPooled(ctx context.Context) (*PooledSandbox, error) {
 		VsockSocketPath: vsockSocketPath,
 		CID:             cid,
 		RootfsPath:      overlay,
-		TemplateHash:    p.templateHash,
-		Config:          p.config,
+		TemplateHash:    templateHash,
+		Config:          p.cfg.Sandbox,
 		CreatedAt:       time.Now().UTC(),
 	}, nil
 }
 
-// shrinkExcess drops warm members past the current target. Triggered on
-// every replenish tick so a freshly-lowered target reflects on disk
-// without waiting for the rotate loop.
+// shrinkExcess drops warm members past each pool's current target.
+// Triggered on every replenish tick so a freshly-lowered target reflects
+// on disk without waiting for the rotate loop.
 func (p *PoolManager) shrinkExcess(ctx context.Context) {
 	p.mu.Lock()
-	excess := len(p.warm) - p.targetSize
-	if excess <= 0 {
-		p.mu.Unlock()
-		return
-	}
-	victims := make([]*PooledSandbox, 0, excess)
-	for i := 0; i < excess; i++ {
+	var victims []*PooledSandbox
+	for _, tp := range p.pools {
+		excess := len(tp.warm) - tp.target
+		if excess <= 0 {
+			continue
+		}
 		// FIFO: oldest first so the survivors are the freshest.
-		victims = append(victims, p.warm[i])
+		victims = append(victims, tp.warm[:excess]...)
+		tp.warm = tp.warm[excess:]
 	}
-	p.warm = p.warm[excess:]
 	p.mu.Unlock()
 	for _, v := range victims {
 		p.destroyMember(ctx, v, "shrink")
 	}
 }
 
-// adjustTargetSize moves targetSize between min and max based on the
-// last 30s of pool traffic. Misses pull the target up, idle silence
-// pulls it down. Hits with no misses hold the target where it is.
-func (p *PoolManager) adjustTargetSize() {
+// adjustAll re-evaluates every pool's adaptive target from the last hour
+// of hit traffic and garbage-collects fully-drained idle pools. Runs once
+// per adjustEvery tick.
+func (p *PoolManager) adjustAll() {
+	now := time.Now()
+	var gc []string
 	p.mu.Lock()
-	hits := p.recentHits
-	misses := p.recentMisses
-	prev := p.targetSize
-	switch {
-	case misses > 0:
-		p.targetSize += misses + 2
-	case hits == 0:
-		p.targetSize--
+	for hash, tp := range p.pools {
+		p.pruneWindowsLocked(tp, now)
+		prev := tp.target
+		tp.target = p.computeTargetLocked(tp, now)
+		if tp.target != prev {
+			p.logger.Info("pool: adaptive resize",
+				"template", hash, "target", tp.target, "prev", prev,
+				"hits_window", len(tp.hitWindow), "warm", len(tp.warm))
+		}
+		// GC a non-system pool only once it is fully drained, idle to a
+		// zero target, and has nothing inflight.
+		if hash != p.cfg.SystemTemplate &&
+			tp.target == 0 && len(tp.warm) == 0 && tp.warming == 0 {
+			gc = append(gc, hash)
+		}
 	}
-	if p.targetSize < p.minSize {
-		p.targetSize = p.minSize
+	for _, hash := range gc {
+		delete(p.pools, hash)
+		p.logger.Info("pool: garbage-collected idle template pool", "template", hash)
 	}
-	if p.targetSize > p.maxSize {
-		p.targetSize = p.maxSize
-	}
-	p.recentHits = 0
-	p.recentMisses = 0
-	p.windowStart = time.Now()
-	target := p.targetSize
-	warm := len(p.warm)
 	p.mu.Unlock()
-	if target != prev {
-		p.logger.Info("pool: adjust",
-			"target", target, "warm", warm, "hits", hits, "misses", misses,
-		)
-	} else {
-		p.logger.Debug("pool: adjust (no change)",
-			"target", target, "warm", warm, "hits", hits, "misses", misses,
-		)
-	}
 }
 
-// rotateStale destroys warm members older than staleAfter so the pool
-// doesn't accumulate dirty kernel state. Replacements come on the next
-// replenish tick.
+// computeTargetLocked applies the adaptive-sizing rules for one pool:
+// idle pools drain, busy pools grow, and the system template is floored
+// at SystemMinTarget so it never starves. Caller holds p.mu.
+func (p *PoolManager) computeTargetLocked(tp *templatePool, now time.Time) int {
+	hits := len(tp.hitWindow)
+	idle := now.Sub(tp.lastHitAt)
+	var target int
+	switch {
+	case idle >= p.cfg.DrainAfterIdle:
+		target = 0
+	case idle >= poolDrainHalfIdle:
+		target = 1
+	case hits >= p.cfg.HitThreshHigh:
+		target = poolTargetHigh
+	case hits >= p.cfg.HitThreshMed:
+		target = poolTargetMedium
+	default:
+		target = p.cfg.NewTemplate
+	}
+	if tp.hash == p.cfg.SystemTemplate && target < p.cfg.SystemMinTarget {
+		target = p.cfg.SystemMinTarget
+	}
+	if target > p.cfg.PerTemplateMax {
+		target = p.cfg.PerTemplateMax
+	}
+	return target
+}
+
+// pruneWindowsLocked drops hit/miss timestamps older than the adaptive
+// window so the counts reflect only recent traffic. Caller holds p.mu.
+func (p *PoolManager) pruneWindowsLocked(tp *templatePool, now time.Time) {
+	cutoff := now.Add(-p.cfg.AdaptiveWindow)
+	tp.hitWindow = pruneTimestamps(tp.hitWindow, cutoff)
+	tp.missWindow = pruneTimestamps(tp.missWindow, cutoff)
+}
+
+// pruneTimestamps returns ts with every entry at or before cutoff dropped.
+// The slice is assumed roughly time-ordered (appends only), so a single
+// forward scan suffices.
+func pruneTimestamps(ts []time.Time, cutoff time.Time) []time.Time {
+	i := 0
+	for i < len(ts) && !ts[i].After(cutoff) {
+		i++
+	}
+	if i == 0 {
+		return ts
+	}
+	return append(ts[:0], ts[i:]...)
+}
+
+// rotateStale destroys warm members older than staleAfter across every
+// pool so the pools don't accumulate dirty kernel state. Replacements
+// come on the next replenish tick.
 func (p *PoolManager) rotateStale(ctx context.Context) {
 	now := time.Now()
+	var stale []*PooledSandbox
 	p.mu.Lock()
-	kept := p.warm[:0]
-	stale := make([]*PooledSandbox, 0)
-	for _, ps := range p.warm {
-		if now.Sub(ps.CreatedAt) > p.staleAfter {
-			stale = append(stale, ps)
-			continue
+	for _, tp := range p.pools {
+		kept := tp.warm[:0]
+		for _, ps := range tp.warm {
+			if now.Sub(ps.CreatedAt) > p.staleAfter {
+				stale = append(stale, ps)
+				continue
+			}
+			kept = append(kept, ps)
 		}
-		kept = append(kept, ps)
+		tp.warm = kept
 	}
-	p.warm = kept
 	p.mu.Unlock()
 	for _, ps := range stale {
 		p.destroyMember(ctx, ps, "stale")
@@ -538,8 +794,12 @@ func (p *PoolManager) destroyMember(ctx context.Context, ps *PooledSandbox, reas
 
 func (p *PoolManager) destroyAll() {
 	p.mu.Lock()
-	victims := p.warm
-	p.warm = nil
+	var victims []*PooledSandbox
+	for _, tp := range p.pools {
+		victims = append(victims, tp.warm...)
+		tp.warm = nil
+	}
+	p.pools = make(map[string]*templatePool)
 	p.mu.Unlock()
 	ctx := context.Background()
 	for _, ps := range victims {

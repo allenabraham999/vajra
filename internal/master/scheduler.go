@@ -41,12 +41,14 @@ type SchedRequest struct {
 	TemplateHash string
 }
 
-// NodePoolProber reports a node's warm pre-warm pool: the template hash
-// the node pre-warms and how many members are ready to hand out. PickNode
-// uses it to prefer a node that can serve a template-matched create as a
-// pool hit. ok=false (probe failed, or the node runs no pool) means the
-// node simply gets no pool affinity.
-type NodePoolProber func(ctx context.Context, node *models.Node) (template string, available int, ok bool)
+// NodePoolProber probes a node's per-template warm pools. For the given
+// template hash it returns available (warm members ready right now) and
+// poolCapacity (the node's total warm-VM budget — >0 only for nodes that
+// run a per-template pool at all). PickNode prefers a node with warm
+// members for the exact template; failing that, a pool-capable node, so
+// a new template's pool gets seeded somewhere it can actually warm.
+// ok=false means the probe failed and the node gets no pool affinity.
+type NodePoolProber func(ctx context.Context, node *models.Node, templateHash string) (available, poolCapacity int, ok bool)
 
 // Quota is a per-account ceiling enforced before scheduling. Values are
 // hard caps; CheckQuota rejects a request that would push the account to
@@ -272,11 +274,14 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 			(freeDiskGB - req.DiskGB)
 		candidates = append(candidates, scored{node: n, score: score})
 	}
-	// Pool affinity: if the request names a template and a heartbeat-fresh
-	// node holds a warm pre-warm member for it, place there even if that
-	// node would fail the resource-fit filter above — serving from the
-	// pool consumes a VM that is already running, not fresh capacity.
-	if node := d.pickPoolNode(ctx, fresh, req); node != nil {
+	// Pool affinity: prefer a node that can serve this template from a
+	// warm pre-warm member, falling back to a pool-capable node so a new
+	// template's pool gets seeded where it can actually warm.
+	candidateIDs := make(map[string]bool, len(candidates))
+	for _, c := range candidates {
+		candidateIDs[c.node.ID] = true
+	}
+	if node := d.pickPoolNode(ctx, fresh, candidateIDs, req); node != nil {
 		return node, nil
 	}
 	if len(candidates) == 0 {
@@ -292,52 +297,75 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 	return candidates[0].node, nil
 }
 
-// pickPoolNode returns the heartbeat-fresh node best placed to serve req
-// as a pre-warm pool hit: one whose pool pre-warms req.TemplateHash and
-// reports at least one warm member ready. Probes run concurrently under
-// poolProbeTimeout so a slow or dead agent can't stall scheduling.
+// pickPoolNode picks the node best placed to serve req via the pre-warm
+// pool. It probes every heartbeat-fresh node concurrently for
+// req.TemplateHash and applies two tiers:
+//
+//	tier 1 — a node with warm members ready: placed there even if it
+//	         would fail the resource-fit filter, since a pool hit reuses
+//	         an already-running VM rather than claiming fresh capacity.
+//	tier 2 — no warm members anywhere, but a pool-capable node that also
+//	         has real capacity: placed there (a cold create) so that
+//	         node seeds and warms a pool for next time.
+//
 // Returns nil — and the caller falls back to plain resource-fit — when
-// the request carries no template, no prober is wired, or no node has a
-// matching warm member. Among matches the node with the most warm
-// members wins (best odds the create still hits warm), tie-broken by ID.
-func (d *dbScheduler) pickPoolNode(ctx context.Context, fresh []*models.Node, req SchedRequest) *models.Node {
+// the request carries no template, no prober is wired, or neither tier
+// matches. hasCapacity is the set of node IDs that passed the resource
+// filter; tier 2 only ever picks from it.
+func (d *dbScheduler) pickPoolNode(ctx context.Context, fresh []*models.Node, hasCapacity map[string]bool, req SchedRequest) *models.Node {
 	if req.TemplateHash == "" || d.poolProbe == nil || len(fresh) == 0 {
 		return nil
 	}
 	type probed struct {
 		node      *models.Node
 		available int
+		capacity  int
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, poolProbeTimeout)
 	defer cancel()
 	results := make(chan probed, len(fresh))
 	for _, n := range fresh {
 		go func(n *models.Node) {
-			tmpl, avail, ok := d.poolProbe(probeCtx, n)
-			if !ok || avail <= 0 || tmpl != req.TemplateHash {
+			avail, capacity, ok := d.poolProbe(probeCtx, n, req.TemplateHash)
+			if !ok {
 				results <- probed{}
 				return
 			}
-			results <- probed{node: n, available: avail}
+			results <- probed{node: n, available: avail, capacity: capacity}
 		}(n)
 	}
-	var best probed
+	var warmBest, capableBest probed
 	for range fresh {
 		p := <-results
 		if p.node == nil {
 			continue
 		}
-		if best.node == nil || p.available > best.available ||
-			(p.available == best.available && p.node.ID < best.node.ID) {
-			best = p
+		if p.available > 0 {
+			if warmBest.node == nil || p.available > warmBest.available ||
+				(p.available == warmBest.available && p.node.ID < warmBest.node.ID) {
+				warmBest = p
+			}
+		}
+		if p.capacity > 0 && hasCapacity[p.node.ID] {
+			if capableBest.node == nil || p.capacity > capableBest.capacity ||
+				(p.capacity == capableBest.capacity && p.node.ID < capableBest.node.ID) {
+				capableBest = p
+			}
 		}
 	}
-	if best.node != nil {
+	if warmBest.node != nil {
 		d.log.Info("scheduler: pool-affinity placement",
-			"node", best.node.ID, "template", req.TemplateHash,
-			"available", best.available)
+			"node", warmBest.node.ID, "template", req.TemplateHash,
+			"available", warmBest.available, "tier", "warm")
+		return warmBest.node
 	}
-	return best.node
+	if capableBest.node != nil {
+		d.log.Info("scheduler: pool-affinity placement",
+			"node", capableBest.node.ID, "template", req.TemplateHash,
+			"tier", "pool-capable")
+		return capableBest.node
+	}
+	return nil
 }
 
 // CheckQuota enforces both interpretations of "quota": a count of active

@@ -13,7 +13,14 @@ import {
   YAxis,
 } from 'recharts'
 import api from '../api/client'
-import type { AdminNode, PoolStats, Sandbox, Template } from '../api/types'
+import type {
+  AdminNode,
+  PoolNodeStats,
+  PoolStats,
+  PoolTemplateStats,
+  Sandbox,
+  Template,
+} from '../api/types'
 import PageHeader from '../components/PageHeader'
 import EmptyState from '../components/EmptyState'
 import { useAuth } from '../auth/AuthContext'
@@ -99,9 +106,48 @@ export default function MetricsPage() {
   const [loaded, setLoaded] = useState(false)
 
   const prevStates = useRef<Map<string, string>>(new Map())
+  // Total warm VMs across the whole cluster on the previous poll — drives
+  // the "pool grew/shrank" ticker line.
   const prevPoolAvail = useRef<number | null>(null)
+  // Per-(node,template) snapshot of the previous poll, keyed by
+  // `${node_id}::${template_hash}`. Used to flash a row when its available
+  // count or hits/hr ticks up between polls.
+  const prevPoolRows = useRef<Map<string, { available: number; hits: number }>>(
+    new Map(),
+  )
+  // Keys of rows that changed on the latest poll — drives the flash class.
+  const [flashed, setFlashed] = useState<Set<string>>(new Set())
   const seeded = useRef(false)
   const evtSeq = useRef(0)
+
+  // Sum the warm VMs across every node/template in a pool snapshot.
+  function totalWarm(p: PoolStats | null): number {
+    if (!p) return 0
+    if (typeof p.global?.total_warm_vms === 'number') {
+      return p.global.total_warm_vms
+    }
+    let n = 0
+    for (const node of p.nodes ?? [])
+      for (const t of node.templates ?? []) n += t.available
+    return n
+  }
+
+  // poolRowMap flattens a pool snapshot to a per-(node,template) map so
+  // consecutive polls can be diffed for the flash animation.
+  function poolRowMap(
+    p: PoolStats | null,
+  ): Map<string, { available: number; hits: number }> {
+    const m = new Map<string, { available: number; hits: number }>()
+    for (const node of p?.nodes ?? []) {
+      for (const t of node.templates ?? []) {
+        m.set(`${node.node_id}::${t.template_hash}`, {
+          available: t.available,
+          hits: t.hits_last_hour,
+        })
+      }
+    }
+    return m
+  }
 
   // Live poll — pool + sandboxes every 2s drives every section except
   // node health. The charts derive from this same data via useMemo, so a
@@ -133,7 +179,8 @@ export default function MetricsPage() {
           })),
         )
         prevStates.current = new Map(sb.map((s) => [s.id, s.state]))
-        prevPoolAvail.current = p ? p.available : null
+        prevPoolAvail.current = p ? totalWarm(p) : null
+        prevPoolRows.current = poolRowMap(p)
         seeded.current = true
         return
       }
@@ -158,22 +205,35 @@ export default function MetricsPage() {
           })
         }
       }
-      if (
-        p &&
-        prevPoolAvail.current !== null &&
-        p.available !== prevPoolAvail.current
-      ) {
-        const from = prevPoolAvail.current
-        const to = p.available
-        fresh.push({
-          key: `e${evtSeq.current++}`,
-          ts: Date.now(),
-          text: `Pool ${to > from ? 'grew' : 'shrank'}: ${from} → ${to} ready`,
-          kind: 'pool',
-        })
+      if (p) {
+        const warm = totalWarm(p)
+        if (prevPoolAvail.current !== null && warm !== prevPoolAvail.current) {
+          const from = prevPoolAvail.current
+          fresh.push({
+            key: `e${evtSeq.current++}`,
+            ts: Date.now(),
+            text: `Pool ${warm > from ? 'grew' : 'shrank'}: ${from} → ${warm} ready`,
+            kind: 'pool',
+          })
+        }
+        // Flash any pool row whose available or hits/hr ticked up.
+        const nextRows = poolRowMap(p)
+        const lit = new Set<string>()
+        for (const [key, cur] of nextRows) {
+          const prev = prevPoolRows.current.get(key)
+          if (prev && (cur.available > prev.available || cur.hits > prev.hits)) {
+            lit.add(key)
+          }
+        }
+        prevPoolRows.current = nextRows
+        prevPoolAvail.current = warm
+        if (lit.size) {
+          setFlashed(lit)
+          // Clear the flash so the CSS transition can replay next time.
+          window.setTimeout(() => setFlashed(new Set()), 900)
+        }
       }
       prevStates.current = new Map(sb.map((s) => [s.id, s.state]))
-      if (p) prevPoolAvail.current = p.available
       if (fresh.length) setEvents((prev) => [...fresh, ...prev].slice(0, 12))
     }
     tick()
@@ -230,7 +290,7 @@ export default function MetricsPage() {
     const hitRate =
       definedHit.length > 0
         ? (hitCount / definedHit.length) * 100
-        : pool?.hit_rate_pct ?? 0
+        : pool?.global?.hit_rate_pct ?? 0
     return {
       p50Pool: median(poolTimes),
       p50Cold: median(coldTimes),
@@ -292,11 +352,14 @@ export default function MetricsPage() {
     [sandboxes],
   )
 
-  const hasPool = pool != null && pool.template !== ''
-  const ready = pool?.available ?? 0
-  const inUse = sandboxes.filter((s) => s.state === 'RUNNING').length
-  const capacity = pool?.max_size ?? 0
-  const span = Math.max(capacity, ready + inUse, 1)
+  // poolNodes is every node carrying a non-empty template list — these are
+  // the rows rendered by the Live Pool Status section.
+  const poolNodes = useMemo<PoolNodeStats[]>(
+    () => (pool?.nodes ?? []).filter((n) => (n.templates ?? []).length > 0),
+    [pool],
+  )
+  const hasPool = poolNodes.length > 0
+  const g = pool?.global
 
   // --- render ---------------------------------------------------------
 
@@ -386,39 +449,52 @@ export default function MetricsPage() {
         <section>
           <SectionTitle live>Live Pool Status</SectionTitle>
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 shadow-lg shadow-black/20 p-4">
+            {/* Global summary across the whole cluster */}
+            {g && (
+              <div className="grid grid-cols-3 gap-3 mb-4">
+                <PoolStat
+                  label="Warm VMs"
+                  value={`${g.total_warm_vms} / ${g.total_capacity}`}
+                />
+                <PoolStat
+                  label="Hit rate (24h)"
+                  value={`${(g.hit_rate_pct ?? 0).toFixed(1)}%`}
+                  accent
+                />
+                <PoolStat
+                  label="Hits / misses (24h)"
+                  value={`${g.total_hits_24h} / ${g.total_misses_24h}`}
+                />
+              </div>
+            )}
+
             {hasPool ? (
-              <>
-                <div className="flex items-center justify-between text-xs mb-2">
-                  <span className="text-zinc-400">
-                    <span className="text-teal-300 font-medium tabular-nums">
-                      {ready}
-                    </span>{' '}
-                    ready ·{' '}
-                    <span className="text-amber-300 font-medium tabular-nums">
-                      {inUse}
-                    </span>{' '}
-                    in use
-                  </span>
-                  <span className="text-zinc-500 font-mono">
-                    capacity {capacity}
-                  </span>
-                </div>
-                <div className="flex h-3 w-full overflow-hidden rounded-full bg-zinc-800">
-                  <div
-                    className="bg-teal-500 transition-all duration-500"
-                    style={{ width: `${(ready / span) * 100}%` }}
-                  />
-                  <div
-                    className="bg-amber-500 transition-all duration-500"
-                    style={{ width: `${(inUse / span) * 100}%` }}
-                  />
-                </div>
-                {pool && pool.warming > 0 && (
-                  <div className="mt-1.5 text-[11px] text-zinc-500">
-                    {pool.warming} warming · target {pool.target_size}
+              <div className="space-y-4">
+                {poolNodes.map((node) => (
+                  <div key={node.node_id}>
+                    <div className="flex items-center justify-between text-[11px] mb-1.5">
+                      <span className="font-mono text-zinc-400 flex items-center gap-1.5">
+                        <Server size={11} className="text-zinc-600" />
+                        {node.node_id}
+                      </span>
+                      <span className="text-zinc-600 font-mono">
+                        capacity {node.capacity}
+                      </span>
+                    </div>
+                    <div className="space-y-2">
+                      {(node.templates ?? []).map((t) => (
+                        <PoolTemplateRow
+                          key={t.template_hash}
+                          tpl={t}
+                          flash={flashed.has(
+                            `${node.node_id}::${t.template_hash}`,
+                          )}
+                        />
+                      ))}
+                    </div>
                   </div>
-                )}
-              </>
+                ))}
+              </div>
             ) : (
               <div className="text-sm text-zinc-500">
                 No pre-warm pool configured on the cluster.
@@ -773,6 +849,99 @@ function LegendDot({ color, label }: { color: string; label: string }) {
       />
       {label}
     </span>
+  )
+}
+
+// PoolStat is one cell of the cluster-wide warm-pool summary grid.
+function PoolStat({
+  label,
+  value,
+  accent = false,
+}: {
+  label: string
+  value: string
+  accent?: boolean
+}) {
+  return (
+    <div className="rounded-md border border-zinc-800 bg-zinc-950/40 px-3 py-2">
+      <div className="text-[10px] text-zinc-500 uppercase tracking-wider font-mono">
+        {label}
+      </div>
+      <div
+        className={`mt-0.5 text-lg font-semibold tabular-nums ${
+          accent ? 'text-teal-300' : 'text-zinc-200'
+        }`}
+      >
+        {value}
+      </div>
+    </div>
+  )
+}
+
+// PoolTemplateRow renders one template's warm-pool state on one node: a
+// stacked bar of available vs in-use against target_size, plus hits/hr.
+// `flash` lights up the row briefly when its pool grew or got a fresh hit.
+function PoolTemplateRow({
+  tpl,
+  flash,
+}: {
+  tpl: PoolTemplateStats
+  flash: boolean
+}) {
+  // The bar spans the larger of target_size or the live available+in-use,
+  // so an over-target pool never overflows its track.
+  const span = Math.max(tpl.target_size, tpl.available + tpl.in_use, 1)
+  const availPct = (tpl.available / span) * 100
+  const inUsePct = (tpl.in_use / span) * 100
+  // Target marker — only shown when the pool can still grow into it.
+  const targetPct = Math.min(100, (tpl.target_size / span) * 100)
+  return (
+    <div
+      className={`rounded-md border px-3 py-2 transition-colors duration-700 ${
+        flash
+          ? 'border-teal-500/50 bg-teal-500/10'
+          : 'border-zinc-800/70 bg-zinc-900/30'
+      }`}
+    >
+      <div className="flex items-center justify-between text-xs mb-1.5">
+        <span className="font-medium text-zinc-200">{tpl.template_name}</span>
+        <span className="text-zinc-500 font-mono tabular-nums">
+          <span className="text-teal-300">{tpl.available}</span> ready ·{' '}
+          <span className="text-amber-300">{tpl.in_use}</span> in use · target{' '}
+          {tpl.target_size}
+        </span>
+      </div>
+      <div className="relative flex h-2.5 w-full overflow-hidden rounded-full bg-zinc-800">
+        <div
+          className="bg-teal-500 transition-all duration-500"
+          style={{ width: `${availPct}%` }}
+        />
+        <div
+          className="bg-amber-500 transition-all duration-500"
+          style={{ width: `${inUsePct}%` }}
+        />
+        {targetPct < 100 && (
+          <div
+            className="absolute top-0 bottom-0 w-px bg-zinc-400/70"
+            style={{ left: `${targetPct}%` }}
+            title={`target ${tpl.target_size}`}
+          />
+        )}
+      </div>
+      <div className="mt-1 flex items-center justify-between text-[10px] text-zinc-500 font-mono">
+        <span>
+          {tpl.warming > 0 ? `${tpl.warming} warming · ` : ''}
+          <span className={flash ? 'text-teal-300' : ''}>
+            {tpl.hits_last_hour} hits/hr
+          </span>
+        </span>
+        <span>
+          {tpl.last_hit_at
+            ? `last hit ${formatRelative(tpl.last_hit_at)}`
+            : 'no hits yet'}
+        </span>
+      </div>
+    </div>
   )
 }
 

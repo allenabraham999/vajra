@@ -304,7 +304,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePoolStats(w http.ResponseWriter, _ *http.Request) {
 	if s.pool == nil {
-		writeJSON(w, http.StatusOK, PoolStats{})
+		writeJSON(w, http.StatusOK, NodePoolStats{})
 		return
 	}
 	writeJSON(w, http.StatusOK, s.pool.Stats())
@@ -318,20 +318,19 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, _ *http.Request) {
 // ok=false is returned — never propagate a half-baked pool sandbox to
 // the API surface.
 func (s *Server) tryAssignFromPool(ctx context.Context, body CreateRequestBody) (*Sandbox, bool) {
-	stats := s.pool.Stats()
 	s.logger.Info("pool_assign: trying",
 		"template", body.TemplateHash,
-		"vcpu", body.Config.VCPUs, "mem", body.Config.MemoryMB,
-		"pool_template", stats.Template, "available", stats.Available)
-	if body.TemplateHash != "" && stats.Template != "" && stats.Template != body.TemplateHash {
-		s.logger.Info("pool_assign: skip",
-			"reason", "template_mismatch",
-			"pool_template", stats.Template, "want", body.TemplateHash)
+		"vcpu", body.Config.VCPUs, "mem", body.Config.MemoryMB)
+	if body.TemplateHash == "" {
+		s.logger.Info("pool_assign: skip", "reason", "no_template_hash")
 		return nil, false
 	}
-	ps, err := s.pool.AssignFromPool()
+	// AssignFromPool stands up a pool for an unseen template on a miss, so
+	// the warmer starts filling it for the next create of the same kind.
+	ps, err := s.pool.AssignFromPool(body.TemplateHash, body.TemplateID)
 	if err != nil {
-		s.logger.Info("pool_assign: skip", "reason", "pool_empty", "err", err.Error())
+		s.logger.Info("pool_assign: skip",
+			"reason", "pool_empty", "template", body.TemplateHash)
 		return nil, false
 	}
 	resumeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -352,7 +351,8 @@ func (s *Server) tryAssignFromPool(ctx context.Context, body CreateRequestBody) 
 		sb.Config = cfg
 	}
 	s.sandboxes.AdoptSandbox(sb)
-	s.logger.Info("pool_assign: hit", "sandbox_id", sb.ID, "pool_member", ps.ID)
+	s.logger.Info("pool_assign: hit",
+		"sandbox_id", sb.ID, "pool_member", ps.ID, "template", body.TemplateHash)
 	return sb, true
 }
 
@@ -362,9 +362,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	var poolStats PoolStats
+	var poolStats NodePoolStats
 	if s.pool != nil {
 		poolStats = s.pool.Stats()
+	}
+	var poolWarming, poolTarget int
+	for _, tp := range poolStats.Templates {
+		poolWarming += tp.Warming
+		poolTarget += tp.TargetSize
+	}
+	poolHitRate := 0.0
+	if total := poolStats.TotalHits + poolStats.TotalMisses; total > 0 {
+		poolHitRate = 100.0 * float64(poolStats.TotalHits) / float64(total)
 	}
 	sandboxes := s.sandboxes.List()
 	stateCounts := map[SandboxState]int{}
@@ -390,13 +399,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	fmt.Fprintf(w, "# HELP vajra_pool_available Warm pool members ready for assignment\n")
 	fmt.Fprintf(w, "# TYPE vajra_pool_available gauge\n")
-	fmt.Fprintf(w, "vajra_pool_available %d\n", poolStats.Available)
+	fmt.Fprintf(w, "vajra_pool_available %d\n", poolStats.TotalWarm)
+	fmt.Fprintf(w, "# HELP vajra_pool_templates Distinct templates with a warm pool\n")
+	fmt.Fprintf(w, "# TYPE vajra_pool_templates gauge\n")
+	fmt.Fprintf(w, "vajra_pool_templates %d\n", len(poolStats.Templates))
 	fmt.Fprintf(w, "# HELP vajra_pool_warming Pool members currently being pre-warmed\n")
 	fmt.Fprintf(w, "# TYPE vajra_pool_warming gauge\n")
-	fmt.Fprintf(w, "vajra_pool_warming %d\n", poolStats.Warming)
-	fmt.Fprintf(w, "# HELP vajra_pool_target Dynamic target pool size\n")
+	fmt.Fprintf(w, "vajra_pool_warming %d\n", poolWarming)
+	fmt.Fprintf(w, "# HELP vajra_pool_target Sum of dynamic per-template target sizes\n")
 	fmt.Fprintf(w, "# TYPE vajra_pool_target gauge\n")
-	fmt.Fprintf(w, "vajra_pool_target %d\n", poolStats.TargetSize)
+	fmt.Fprintf(w, "vajra_pool_target %d\n", poolTarget)
 	fmt.Fprintf(w, "# HELP vajra_pool_hits_total Pool assignments served from a warm member\n")
 	fmt.Fprintf(w, "# TYPE vajra_pool_hits_total counter\n")
 	fmt.Fprintf(w, "vajra_pool_hits_total %d\n", poolStats.TotalHits)
@@ -405,7 +417,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "vajra_pool_misses_total %d\n", poolStats.TotalMisses)
 	fmt.Fprintf(w, "# HELP vajra_pool_hit_rate Rolling pool hit-rate (0-100)\n")
 	fmt.Fprintf(w, "# TYPE vajra_pool_hit_rate gauge\n")
-	fmt.Fprintf(w, "vajra_pool_hit_rate %.2f\n", poolStats.HitRatePct)
+	fmt.Fprintf(w, "vajra_pool_hit_rate %.2f\n", poolHitRate)
 }
 
 func decodeBody(r *http.Request, dst any) error {

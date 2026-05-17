@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { PackageSearch, Plus } from 'lucide-react'
 import api from '../api/client'
-import type { Template, Snapshot } from '../api/types'
+import type { PoolStats, Template, Snapshot } from '../api/types'
 import PageHeader from '../components/PageHeader'
 import EmptyState from '../components/EmptyState'
 import Modal from '../components/Modal'
@@ -9,10 +9,19 @@ import Spinner from '../components/Spinner'
 import { useToast } from '../components/Toast'
 import { formatRelative, shortHash } from '../utils/format'
 
+// PoolSummary is the warm-pool rollup for a single template, aggregated
+// across every node in /v1/pool/stats.
+interface PoolSummary {
+  available: number
+  target_size: number
+  hits_last_hour: number
+}
+
 export default function TemplatesPage() {
   const toast = useToast()
   const [items, setItems] = useState<Template[]>([])
   const [snaps, setSnaps] = useState<Snapshot[]>([])
+  const [pool, setPool] = useState<PoolStats | null>(null)
   const [openCreate, setOpenCreate] = useState(false)
   const [openPromote, setOpenPromote] = useState(false)
   const [openBuild, setOpenBuild] = useState(false)
@@ -36,6 +45,44 @@ export default function TemplatesPage() {
   useEffect(() => {
     load()
   }, [])
+
+  // Warm-pool stats refresh on a light interval so the column tracks the
+  // pool without the user reloading the page.
+  useEffect(() => {
+    let alive = true
+    const tick = () =>
+      api.pool
+        .stats()
+        .then((p) => alive && setPool(p))
+        .catch(() => {})
+    tick()
+    const t = setInterval(tick, 10_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [])
+
+  // Roll the per-node, per-template pool rows up into one summary keyed by
+  // both template_hash and template_id, so a template matches on either.
+  const poolByTemplate = useMemo(() => {
+    const m = new Map<string, PoolSummary>()
+    const add = (key: string, available: number, target: number, hits: number) => {
+      if (!key) return
+      const cur = m.get(key) ?? { available: 0, target_size: 0, hits_last_hour: 0 }
+      cur.available += available
+      cur.target_size += target
+      cur.hits_last_hour += hits
+      m.set(key, cur)
+    }
+    for (const node of pool?.nodes ?? []) {
+      for (const t of node.templates ?? []) {
+        add(t.template_hash, t.available, t.target_size, t.hits_last_hour)
+        add(t.template_id, t.available, t.target_size, t.hits_last_hour)
+      }
+    }
+    return m
+  }, [pool])
 
   return (
     <>
@@ -82,6 +129,7 @@ export default function TemplatesPage() {
                   <th className="text-left font-medium px-4 py-2.5">Name</th>
                   <th className="text-left font-medium px-4 py-2.5">Version</th>
                   <th className="text-left font-medium px-4 py-2.5">Hash</th>
+                  <th className="text-left font-medium px-4 py-2.5">Warm pool</th>
                   <th className="text-left font-medium px-4 py-2.5">Created</th>
                 </tr>
               </thead>
@@ -94,6 +142,13 @@ export default function TemplatesPage() {
                     </td>
                     <td className="px-4 py-2.5 font-mono text-xs text-zinc-500">
                       {shortHash(t.hash, 16)}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <WarmPoolCell
+                        summary={
+                          poolByTemplate.get(t.hash) ?? poolByTemplate.get(t.id)
+                        }
+                      />
                     </td>
                     <td className="px-4 py-2.5 text-zinc-500 text-xs">
                       {formatRelative(t.created_at)}
@@ -466,6 +521,32 @@ function PromoteSnapshotModal({
         </div>
       </form>
     </Modal>
+  )
+}
+
+// WarmPoolCell shows the total warm VMs ready for a template across all
+// nodes. Hovering reveals hits/hr and the configured target size.
+function WarmPoolCell({ summary }: { summary?: PoolSummary }) {
+  if (!summary || (summary.available === 0 && summary.target_size === 0)) {
+    return <span className="text-zinc-600 text-xs">—</span>
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 cursor-default"
+      title={`${summary.hits_last_hour} hits/hr · target ${summary.target_size}`}
+    >
+      <span
+        className={`size-1.5 rounded-full ${
+          summary.available > 0
+            ? 'bg-teal-400 animate-pulse'
+            : 'bg-zinc-600'
+        }`}
+      />
+      <span className="tabular-nums text-sm text-teal-300 font-medium">
+        {summary.available}
+      </span>
+      <span className="text-[11px] text-zinc-600">/ {summary.target_size}</span>
+    </span>
   )
 }
 

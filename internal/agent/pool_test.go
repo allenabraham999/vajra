@@ -23,46 +23,69 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 	t.Fatalf("condition not met within %s", d)
 }
 
-// newFastPool wires a PoolManager with tight tick intervals so tests run
-// in under a second per case. Min/max bracket the dynamic target; the
-// caller can adjust the manager fields after construction.
-func newFastPool(t *testing.T, min, max int) (*PoolManager, *SandboxManager, *fakeVMM) {
+// newFastPool wires a per-template PoolManager with tight tick intervals
+// so tests run in well under a second. The returned hash is the seeded
+// system template; cacheDir lets a test seed additional templates. cfg
+// fields left zero fall back to PoolConfig defaults.
+func newFastPool(t *testing.T, cfg PoolConfig) (pool *PoolManager, mgr *SandboxManager, vm *fakeVMM, sysHash, cacheDir string) {
 	t.Helper()
-	mgr, vm, cacheDir := newTestManager(t)
-	hash := seedTemplate(t, cacheDir, []byte("rootfs"))
-	pool := NewPoolManager(min, max, hash, SandboxConfig{VCPUs: 2, MemoryMB: 512}, mgr, nil)
+	mgr, vm, cacheDir = newTestManager(t)
+	sysHash = seedTemplate(t, cacheDir, []byte("system-rootfs"))
+	cfg.SystemTemplate = sysHash
+	cfg.Sandbox = SandboxConfig{VCPUs: 2, MemoryMB: 512}
+	pool = NewPoolManager(cfg, mgr, nil)
 	pool.replenishEvery = 20 * time.Millisecond
 	pool.adjustEvery = 50 * time.Millisecond
 	pool.rotateEvery = 50 * time.Millisecond
 	pool.staleAfter = 100 * time.Millisecond
 	pool.memReserveFrac = 0 // never block on memory in tests
-	return pool, mgr, vm
+	return pool, mgr, vm, sysHash, cacheDir
+}
+
+// templateStat returns the per-template stats row for hash, or ok=false.
+func templateStat(p *PoolManager, hash string) (TemplatePoolStats, bool) {
+	for _, ts := range p.Stats().Templates {
+		if ts.TemplateHash == hash {
+			return ts, true
+		}
+	}
+	return TemplatePoolStats{}, false
+}
+
+func templateAvailable(p *PoolManager, hash string) int {
+	ts, _ := templateStat(p, hash)
+	return ts.Available
+}
+
+func templateTarget(p *PoolManager, hash string) int {
+	ts, _ := templateStat(p, hash)
+	return ts.TargetSize
 }
 
 func TestPoolWarmUp(t *testing.T) {
-	pool, _, vm := newFastPool(t, 3, 5)
+	pool, _, vm, sysHash, _ := newFastPool(t, PoolConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
 	waitFor(t, 2*time.Second, func() bool {
-		return pool.Stats().Available >= 3
+		return templateAvailable(pool, sysHash) >= 3
 	})
-	if got := vm.restoreCalls; got < 3 {
+	if got := vm.restores(); got < 3 {
 		t.Fatalf("expected >=3 restore calls, got %d", got)
 	}
 }
 
 func TestPoolAssign(t *testing.T) {
-	pool, mgr, _ := newFastPool(t, 3, 5)
+	pool, mgr, _, sysHash, _ := newFastPool(t, PoolConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 3 })
-	ps, err := pool.AssignFromPool()
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 3 })
+	ps, err := pool.AssignFromPool(sysHash, "tmpl-sys")
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
@@ -79,18 +102,17 @@ func TestPoolAssign(t *testing.T) {
 	if !got.FromPool {
 		t.Fatalf("adopted sandbox should be flagged FromPool")
 	}
-	stats := pool.Stats()
-	if stats.TotalHits != 1 {
+	if stats := pool.Stats(); stats.TotalHits != 1 {
 		t.Fatalf("expected TotalHits=1, got %d", stats.TotalHits)
 	}
 	// Pool should refill back to target.
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 3 })
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 3 })
 }
 
 func TestPoolMiss(t *testing.T) {
-	pool, _, _ := newFastPool(t, 1, 1)
-	// Don't Start: pool stays empty so AssignFromPool returns ErrPoolEmpty.
-	if _, err := pool.AssignFromPool(); !errors.Is(err, ErrPoolEmpty) {
+	pool, _, _, sysHash, _ := newFastPool(t, PoolConfig{})
+	// Don't Start: the pool stays empty so AssignFromPool returns ErrPoolEmpty.
+	if _, err := pool.AssignFromPool(sysHash, ""); !errors.Is(err, ErrPoolEmpty) {
 		t.Fatalf("expected ErrPoolEmpty, got %v", err)
 	}
 	if got := pool.Stats().TotalMisses; got != 1 {
@@ -99,78 +121,201 @@ func TestPoolMiss(t *testing.T) {
 }
 
 func TestPoolReplenish(t *testing.T) {
-	pool, _, _ := newFastPool(t, 2, 5)
+	pool, _, _, sysHash, _ := newFastPool(t, PoolConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 2 })
-	// Drain.
-	first, err := pool.AssignFromPool()
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 2 })
+	first, err := pool.AssignFromPool(sysHash, "")
 	if err != nil {
 		t.Fatalf("assign1: %v", err)
 	}
-	second, err := pool.AssignFromPool()
+	second, err := pool.AssignFromPool(sysHash, "")
 	if err != nil {
 		t.Fatalf("assign2: %v", err)
 	}
 	if first.ID == second.ID {
 		t.Fatalf("two assigns returned the same pool member: %s", first.ID)
 	}
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 2 })
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 2 })
 }
 
-func TestPoolDynamicGrow(t *testing.T) {
-	pool, _, _ := newFastPool(t, 1, 10)
-	pool.adjustEvery = 30 * time.Millisecond
+// TestPerTemplatePoolWarming verifies that a miss on an unseen template
+// stands up its own pool and that the warmer fills it independently of
+// the system template's pool.
+func TestPerTemplatePoolWarming(t *testing.T) {
+	pool, _, _, sysHash, cacheDir := newFastPool(t, PoolConfig{})
+	customHash := seedTemplate(t, cacheDir, []byte("custom-rootfs"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	// Force misses by assigning when pool is empty.
-	for i := 0; i < 5; i++ {
-		_, _ = pool.AssignFromPool()
+	// System template warms on its own.
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 1 })
+
+	// The custom template has no pool until the first miss creates one.
+	if _, ok := templateStat(pool, customHash); ok {
+		t.Fatalf("custom template should have no pool before first request")
 	}
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().TargetSize > 1 })
+	if _, err := pool.AssignFromPool(customHash, "tmpl-custom"); !errors.Is(err, ErrPoolEmpty) {
+		t.Fatalf("first custom assign should miss, got %v", err)
+	}
+	// The miss seeded a pool; the warmer now fills it.
+	waitFor(t, 3*time.Second, func() bool { return templateAvailable(pool, customHash) >= 1 })
+
+	// Both templates now have independent warm pools.
+	if templateAvailable(pool, sysHash) < 1 {
+		t.Fatalf("system pool drained while custom pool warmed")
+	}
+	ps, err := pool.AssignFromPool(customHash, "tmpl-custom")
+	if err != nil {
+		t.Fatalf("custom assign after warm should hit: %v", err)
+	}
+	if ps.TemplateHash != customHash {
+		t.Fatalf("assigned member has wrong template: got %s want %s", ps.TemplateHash, customHash)
+	}
 }
 
-func TestPoolDynamicShrink(t *testing.T) {
-	pool, _, _ := newFastPool(t, 1, 10)
-	// Set a higher initial target than min; with no traffic, adjust should pull it down.
+// TestPoolAdaptiveSizingUpScales verifies that observed hit traffic walks
+// a template's target up through the medium and high tiers.
+func TestPoolAdaptiveSizingUpScales(t *testing.T) {
+	pool, _, _, _, cacheDir := newFastPool(t, PoolConfig{HitThreshMed: 3, HitThreshHigh: 10})
+	hash := seedTemplate(t, cacheDir, []byte("busy-template"))
+	// Stand up the pool (non-system, so no SystemMinTarget floor).
+	_, _ = pool.AssignFromPool(hash, "tmpl-busy")
+	if got := templateTarget(pool, hash); got != DefaultPoolNewTemplateTarget {
+		t.Fatalf("new pool target = %d, want %d", got, DefaultPoolNewTemplateTarget)
+	}
+
+	setHitWindow := func(n int) {
+		pool.mu.Lock()
+		tp := pool.pools[hash]
+		now := time.Now()
+		tp.hitWindow = tp.hitWindow[:0]
+		for i := 0; i < n; i++ {
+			tp.hitWindow = append(tp.hitWindow, now)
+		}
+		tp.lastHitAt = now
+		pool.mu.Unlock()
+	}
+
+	setHitWindow(5) // medium tier
+	pool.adjustAll()
+	if got := templateTarget(pool, hash); got != poolTargetMedium {
+		t.Fatalf("after 5 hits target = %d, want %d", got, poolTargetMedium)
+	}
+
+	setHitWindow(12) // high tier
+	pool.adjustAll()
+	if got := templateTarget(pool, hash); got != poolTargetHigh {
+		t.Fatalf("after 12 hits target = %d, want %d", got, poolTargetHigh)
+	}
+}
+
+// TestPoolAdaptiveSizingDrains verifies that an idle template pool's
+// target collapses and the empty pool is garbage-collected.
+func TestPoolAdaptiveSizingDrains(t *testing.T) {
+	pool, _, _, _, cacheDir := newFastPool(t, PoolConfig{})
+	hash := seedTemplate(t, cacheDir, []byte("idle-template"))
+	_, _ = pool.AssignFromPool(hash, "tmpl-idle")
+
+	// Idle past the half-drain mark: target collapses to 1.
 	pool.mu.Lock()
-	pool.targetSize = 5
+	pool.pools[hash].lastHitAt = time.Now().Add(-40 * time.Minute)
 	pool.mu.Unlock()
-	pool.adjustEvery = 30 * time.Millisecond
+	pool.adjustAll()
+	if got := templateTarget(pool, hash); got != 1 {
+		t.Fatalf("after 40m idle target = %d, want 1", got)
+	}
+
+	// Idle past the full-drain mark: target hits 0 and the empty,
+	// non-system pool is garbage-collected.
+	pool.mu.Lock()
+	pool.pools[hash].lastHitAt = time.Now().Add(-2 * time.Hour)
+	pool.mu.Unlock()
+	pool.adjustAll()
+	if _, ok := templateStat(pool, hash); ok {
+		t.Fatalf("idle drained pool should have been garbage-collected")
+	}
+}
+
+// TestPoolGlobalCapRespected verifies that total warm VMs across all
+// template pools never exceeds the per-node global cap, with the system
+// template winning the contention.
+func TestPoolGlobalCapRespected(t *testing.T) {
+	const cap = 3
+	pool, _, _, sysHash, cacheDir := newFastPool(t, PoolConfig{GlobalCap: cap})
+	// Two extra templates competing for the same node budget.
+	h2 := seedTemplate(t, cacheDir, []byte("competitor-a"))
+	h3 := seedTemplate(t, cacheDir, []byte("competitor-b"))
+	_, _ = pool.AssignFromPool(h2, "tmpl-a")
+	_, _ = pool.AssignFromPool(h3, "tmpl-b")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	waitFor(t, 3*time.Second, func() bool { return pool.Stats().TargetSize == pool.minSize })
+	// The cap must hold at every observation.
+	deadline := time.Now().Add(2 * time.Second)
+	maxSeen := 0
+	for time.Now().Before(deadline) {
+		w := pool.Stats().TotalWarm
+		if w > cap {
+			t.Fatalf("total warm VMs %d exceeded global cap %d", w, cap)
+		}
+		if w > maxSeen {
+			maxSeen = w
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if maxSeen != cap {
+		t.Fatalf("pool never filled to the cap: maxSeen=%d cap=%d", maxSeen, cap)
+	}
+	// The system template, being highest priority, should own the budget.
+	if got := templateAvailable(pool, sysHash); got == 0 {
+		t.Fatalf("system template starved under cap pressure")
+	}
 }
 
-func TestPoolMaxSizeCap(t *testing.T) {
-	pool, _, _ := newFastPool(t, 5, 5)
-	// Push for growth by injecting misses; max should still cap at 5.
-	for i := 0; i < 20; i++ {
-		_, _ = pool.AssignFromPool()
+// TestUbuntuNobleAlwaysMinThree is the regression guard for the system
+// template: however idle it gets, its target never drains below 3 and
+// its pool is never garbage-collected.
+func TestUbuntuNobleAlwaysMinThree(t *testing.T) {
+	pool, _, _, sysHash, _ := newFastPool(t, PoolConfig{})
+
+	// Force maximum idleness — well past the full-drain threshold.
+	pool.mu.Lock()
+	pool.pools[sysHash].lastHitAt = time.Now().Add(-6 * time.Hour)
+	pool.pools[sysHash].hitWindow = nil
+	pool.mu.Unlock()
+	pool.adjustAll()
+
+	if got := templateTarget(pool, sysHash); got < 3 {
+		t.Fatalf("system template target drained to %d; must stay >= 3", got)
 	}
-	pool.adjustTargetSize()
-	if got := pool.Stats().TargetSize; got > 5 {
-		t.Fatalf("target exceeded max: got %d, max=5", got)
+	if _, ok := templateStat(pool, sysHash); !ok {
+		t.Fatalf("system template pool was garbage-collected; must persist")
 	}
 }
 
 func TestConcurrentAssign(t *testing.T) {
-	pool, _, _ := newFastPool(t, 10, 20)
+	pool, _, _, sysHash, _ := newFastPool(t, PoolConfig{GlobalCap: 20})
+	// Pin a wide system pool: disable the adaptive loop so the manual
+	// target survives, then warm 12 members for the concurrent drain.
+	pool.adjustEvery = time.Hour
+	pool.mu.Lock()
+	pool.pools[sysHash].target = 12
+	pool.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	waitFor(t, 3*time.Second, func() bool { return pool.Stats().Available >= 10 })
+	waitFor(t, 4*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 10 })
 
 	const N = 10
 	var wg sync.WaitGroup
@@ -179,7 +324,7 @@ func TestConcurrentAssign(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			ps, err := pool.AssignFromPool()
+			ps, err := pool.AssignFromPool(sysHash, "")
 			if err != nil {
 				return
 			}
@@ -201,7 +346,7 @@ func TestConcurrentAssign(t *testing.T) {
 }
 
 func TestStaleRotation(t *testing.T) {
-	pool, _, vm := newFastPool(t, 2, 5)
+	pool, _, vm, sysHash, _ := newFastPool(t, PoolConfig{})
 	pool.staleAfter = 60 * time.Millisecond
 	pool.rotateEvery = 20 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
@@ -209,47 +354,47 @@ func TestStaleRotation(t *testing.T) {
 	pool.Start(ctx)
 	defer pool.Shutdown()
 
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 2 })
-	startRestores := vm.restoreCalls
-	startDestroys := vm.destroyCalls
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 2 })
+	startRestores := vm.restores()
+	startDestroys := vm.destroys()
 	// Wait long enough for at least one full rotate sweep on the warmed members.
 	time.Sleep(250 * time.Millisecond)
-	if vm.destroyCalls <= startDestroys {
+	if after := vm.destroys(); after <= startDestroys {
 		t.Fatalf("expected stale rotate to destroy older members; destroys: before=%d after=%d",
-			startDestroys, vm.destroyCalls)
+			startDestroys, after)
 	}
-	if vm.restoreCalls <= startRestores {
+	if after := vm.restores(); after <= startRestores {
 		t.Fatalf("expected replacement restores after stale rotate; restores: before=%d after=%d",
-			startRestores, vm.restoreCalls)
+			startRestores, after)
 	}
 }
 
 func TestStartupRace(t *testing.T) {
-	pool, _, _ := newFastPool(t, 1, 5)
+	pool, _, _, sysHash, _ := newFastPool(t, PoolConfig{})
 	// Don't Start the pool yet: an Assign here must miss without blocking.
-	_, err := pool.AssignFromPool()
+	_, err := pool.AssignFromPool(sysHash, "")
 	if !errors.Is(err, ErrPoolEmpty) {
 		t.Fatalf("expected ErrPoolEmpty on pre-start assign, got %v", err)
 	}
 }
 
 func TestShutdownCleansUp(t *testing.T) {
-	pool, _, vm := newFastPool(t, 3, 5)
+	pool, _, vm, sysHash, _ := newFastPool(t, PoolConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool.Start(ctx)
-	waitFor(t, 2*time.Second, func() bool { return pool.Stats().Available >= 3 })
+	waitFor(t, 2*time.Second, func() bool { return templateAvailable(pool, sysHash) >= 3 })
 	pool.Shutdown()
-	if pool.Stats().Available != 0 {
-		t.Fatalf("expected Available=0 after shutdown, got %d", pool.Stats().Available)
+	if got := pool.Stats().TotalWarm; got != 0 {
+		t.Fatalf("expected TotalWarm=0 after shutdown, got %d", got)
 	}
-	if vm.destroyCalls == 0 {
+	if vm.destroys() == 0 {
 		t.Fatalf("expected shutdown to destroy warm members; destroyCalls=0")
 	}
 }
 
 func TestCIDRecycling(t *testing.T) {
-	pool, _, _ := newFastPool(t, 0, 5)
+	pool, _, _, _, _ := newFastPool(t, PoolConfig{})
 	cid := pool.acquireCID()
 	if cid < DefaultPoolFirstCID {
 		t.Fatalf("CID below reserved range: %d", cid)

@@ -11,19 +11,26 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// poolStats mirrors agent.PoolStats. Kept as its own type so the CLI
-// doesn't pull internal/agent into its build graph.
-type poolStats struct {
-	MinSize      int     `json:"min_size"`
-	MaxSize      int     `json:"max_size"`
-	TargetSize   int     `json:"target_size"`
-	Available    int     `json:"available"`
-	Warming      int     `json:"warming"`
-	TotalHits    int64   `json:"total_hits"`
-	TotalMisses  int64   `json:"total_misses"`
-	TotalCreated int64   `json:"total_created"`
-	HitRatePct   float64 `json:"hit_rate_pct"`
-	Template     string  `json:"template"`
+// templatePoolStats mirrors agent.TemplatePoolStats — one template's
+// warm pool. nodePoolStats mirrors agent.NodePoolStats. Kept as their own
+// types so the CLI doesn't pull internal/agent into its build graph.
+type templatePoolStats struct {
+	TemplateHash string `json:"template_hash"`
+	TemplateID   string `json:"template_id,omitempty"`
+	Available    int    `json:"available"`
+	Warming      int    `json:"warming"`
+	TargetSize   int    `json:"target_size"`
+	InUse        int    `json:"in_use"`
+	HitsLastHour int    `json:"hits_last_hour"`
+	TotalHits    int64  `json:"total_hits"`
+}
+
+type nodePoolStats struct {
+	Capacity    int                 `json:"capacity"`
+	TotalWarm   int                 `json:"total_warm"`
+	TotalHits   int64               `json:"total_hits"`
+	TotalMisses int64               `json:"total_misses"`
+	Templates   []templatePoolStats `json:"templates"`
 }
 
 // newPoolCmd wires `vajra pool …`. Unlike most subcommands the pool API
@@ -60,21 +67,31 @@ func newPoolStatsCmd() *cobra.Command {
 			if resp.StatusCode >= 400 {
 				return fmt.Errorf("agent returned HTTP %d", resp.StatusCode)
 			}
-			var st poolStats
+			var st nodePoolStats
 			if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 				return fmt.Errorf("decode response: %w", err)
 			}
 			if gFlags.asJSON {
 				return printJSON(st)
 			}
-			template := st.Template
-			if template == "" {
-				template = "(pool disabled)"
+			rate := 0.0
+			if total := st.TotalHits + st.TotalMisses; total > 0 {
+				rate = 100.0 * float64(st.TotalHits) / float64(total)
 			}
-			out(fmt.Sprintf("pool  template=%s  available=%d  warming=%d  target=%d (min=%d max=%d)",
-				template, st.Available, st.Warming, st.TargetSize, st.MinSize, st.MaxSize))
-			out(fmt.Sprintf("hits=%d  misses=%d  created=%d  hit_rate=%.1f%%",
-				st.TotalHits, st.TotalMisses, st.TotalCreated, st.HitRatePct))
+			out(fmt.Sprintf("pool  templates=%d  warm=%d/%d  hits=%d  misses=%d  hit_rate=%.1f%%",
+				len(st.Templates), st.TotalWarm, st.Capacity,
+				st.TotalHits, st.TotalMisses, rate))
+			if len(st.Templates) == 0 {
+				out("  (no template pools — pool disabled or not yet warmed)")
+			}
+			for _, tp := range st.Templates {
+				id := tp.TemplateID
+				if id == "" {
+					id = tp.TemplateHash
+				}
+				out(fmt.Sprintf("  %-40s available=%d warming=%d target=%d in_use=%d hits/hr=%d",
+					id, tp.Available, tp.Warming, tp.TargetSize, tp.InUse, tp.HitsLastHour))
+			}
 			return nil
 		},
 	}

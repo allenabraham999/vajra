@@ -317,15 +317,23 @@ func main() {
 
 	signer := master.NewJWTSigner([]byte(cfg.JWTSecret))
 	pool := master.NewAgentPool(cfg.AgentSharedSecret, logger)
-	// Pool-affinity probe: lets PickNode steer template-matched creates
-	// onto a node that already holds a warm pre-warm member, so the
-	// create lands as an instant pool hit instead of a cold boot.
-	poolProber := func(ctx context.Context, node *models.Node) (string, int, bool) {
+	// Pool-affinity probe: reports warm members for a given template plus
+	// the node's warm-VM budget, so PickNode can route a create onto a
+	// node that serves it as an instant pool hit — or, failing that, onto
+	// a pool-capable node that will warm a pool for next time.
+	poolProber := func(ctx context.Context, node *models.Node, templateHash string) (int, int, bool) {
 		ps, err := pool.ClientFor(node).PoolStats(ctx)
 		if err != nil || ps == nil {
-			return "", 0, false
+			return 0, 0, false
 		}
-		return ps.Template, ps.Available, true
+		available := 0
+		for _, t := range ps.Templates {
+			if t.TemplateHash == templateHash {
+				available = t.Available
+				break
+			}
+		}
+		return available, ps.Capacity, true
 	}
 	scheduler := master.NewScheduler(st, nil).WithCache(c).WithLogger(logger).WithPoolProber(poolProber)
 	tracker := master.NewOperationTracker(st)

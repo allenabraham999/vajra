@@ -91,6 +91,20 @@ func (f *fakeVMM) ResumeVM(_ context.Context, _ string) error {
 	return nil
 }
 
+// restores / destroys are lock-safe accessors so tests can read the call
+// counters while the pool's background loops are still mutating them.
+func (f *fakeVMM) restores() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.restoreCalls
+}
+
+func (f *fakeVMM) destroys() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.destroyCalls
+}
+
 var (
 	errFakeRestore  = errFake("fake restore error")
 	errFakeSnapshot = errFake("fake snapshot error")

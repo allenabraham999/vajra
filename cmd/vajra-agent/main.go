@@ -42,9 +42,15 @@ type config struct {
 	archiveDir   string
 	socketDir    string
 	cacheMaxBytes int64
-	poolMinSize  int
-	poolMaxSize  int
 	poolTemplate string
+	// Per-template adaptive warm-pool tunables. Zero means "use the
+	// pool package default" (see agent.PoolConfig.withDefaults).
+	poolNewTemplateTarget int
+	poolPerTemplateMax    int
+	poolHitThreshMed      int
+	poolHitThreshHigh     int
+	poolAdaptiveWindow    time.Duration
+	poolDrainAfterIdle    time.Duration
 	heartbeatInterval time.Duration
 	healthInterval    time.Duration
 	chBinary     string
@@ -118,16 +124,22 @@ func run(ctx context.Context, cfg config, logger *slog.Logger, logBuf *agent.Log
 
 	var pool *agent.PoolManager
 	if cfg.poolTemplate != "" {
-		pool = agent.NewPoolManager(
-			cfg.poolMinSize,
-			cfg.poolMaxSize,
-			cfg.poolTemplate,
-			agent.SandboxConfig{VCPUs: 2, MemoryMB: 512, DiskGB: 4},
-			sandboxes,
-			logger,
-		)
-		// WarmUp runs in the background — the agent serves HTTP
-		// immediately so cold creates work while the pool fills.
+		// Per-node warm-VM budget: 1.5 VMs per host CPU. The pool spreads
+		// this across per-template pools, adaptively sized from hit rate.
+		globalCap := int(float64(cfg.totalCPU) * 1.5)
+		pool = agent.NewPoolManager(agent.PoolConfig{
+			SystemTemplate: cfg.poolTemplate,
+			GlobalCap:      globalCap,
+			NewTemplate:    cfg.poolNewTemplateTarget,
+			PerTemplateMax: cfg.poolPerTemplateMax,
+			HitThreshMed:   cfg.poolHitThreshMed,
+			HitThreshHigh:  cfg.poolHitThreshHigh,
+			AdaptiveWindow: cfg.poolAdaptiveWindow,
+			DrainAfterIdle: cfg.poolDrainAfterIdle,
+			Sandbox:        agent.SandboxConfig{VCPUs: 2, MemoryMB: 512, DiskGB: 4},
+		}, sandboxes, logger)
+		// Warm-up runs in the background — the agent serves HTTP
+		// immediately so cold creates work while the pools fill.
 		pool.Start(ctx)
 		defer pool.Shutdown()
 	}
@@ -350,8 +362,13 @@ func loadConfig() (config, error) {
 		natsURL:           os.Getenv("NATS_URL"),
 	}
 	cfg.cacheMaxBytes = envInt64("VAJRA_AGENT_CACHE_MAX_BYTES", 50*1024*1024*1024)
-	cfg.poolMinSize = envInt("VAJRA_AGENT_POOL_MIN_SIZE", 0)
-	cfg.poolMaxSize = envInt("VAJRA_AGENT_POOL_MAX_SIZE", 0)
+	// Per-template adaptive warm-pool knobs. 0 → pool package default.
+	cfg.poolNewTemplateTarget = envInt("VAJRA_POOL_DEFAULT_NEW_TEMPLATE", 0)
+	cfg.poolPerTemplateMax = envInt("VAJRA_POOL_TEMPLATE_MAX", 0)
+	cfg.poolHitThreshMed = envInt("VAJRA_POOL_HIT_THRESHOLD_MEDIUM", 0)
+	cfg.poolHitThreshHigh = envInt("VAJRA_POOL_HIT_THRESHOLD_HIGH", 0)
+	cfg.poolAdaptiveWindow = envDuration("VAJRA_POOL_ADAPTIVE_WINDOW", 0)
+	cfg.poolDrainAfterIdle = envDuration("VAJRA_POOL_DRAIN_AFTER_IDLE", 0)
 	// Host capacity advertised to the scheduler. The VAJRA_AGENT_TOTAL_*
 	// vars are operator overrides; when unset (or non-positive) we
 	// auto-detect from the host so a node always advertises the capacity
