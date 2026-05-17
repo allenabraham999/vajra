@@ -349,7 +349,18 @@ func main() {
 	// Builder, webhooks, and lifecycle sweeps. All three are optional
 	// — they default to no-op behaviour when their backing store rows
 	// are empty.
-	handlers.Builder = master.NewBuildManager(st, nil, logger)
+	// Template builder: ScriptBuildRunner derives custom templates from
+	// the base image by running the caller's setup script inside it.
+	buildScript := os.Getenv("VAJRA_TEMPLATE_BUILD_SCRIPT")
+	if buildScript == "" {
+		buildScript = "scripts/build-custom-template.sh"
+	}
+	baseHash := os.Getenv("VAJRA_TEMPLATE_BASE_HASH")
+	if baseHash == "" {
+		baseHash = os.Getenv("VAJRA_AGENT_POOL_TEMPLATE")
+	}
+	handlers.Builder = master.NewBuildManager(st, master.NewScriptBuildRunner(buildScript, baseHash, logger), logger)
+	master.StartBuildDirJanitor(ctx, logger)
 	handlers.Webhooks = master.NewWebhookManager(st, logger)
 	handlers.Lifecycle = master.NewLifecycleManager(st, pool, c, handlers, logger)
 	go handlers.Lifecycle.Run(ctx)

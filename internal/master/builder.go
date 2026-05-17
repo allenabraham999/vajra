@@ -1,18 +1,17 @@
 // Package master — builder.go implements the asynchronous
-// "Dockerfile → Template" pipeline driven by POST /v1/templates/build.
+// "setup script → Template" pipeline driven by POST /v1/templates/build.
 //
 // The HTTP handler persists a Build row in PENDING and returns 202 with
 // the build_id. A background goroutine then runs the pipeline:
 //
-//	PENDING → BUILDING (append guest-agent install lines → docker build →
-//	  docker export → ext4 rootfs → boot VM → guest agent ready → snapshot →
-//	  hash → cache → register template) → COMPLETED  | FAILED
+//	PENDING → BUILDING (copy base rootfs → run the caller's setup script
+//	  inside it → boot VM → guest-agent ready → snapshot → hash → cache →
+//	  register template) → COMPLETED | FAILED
 //
-// The actual Docker/Cloud-Hypervisor work is delegated to a BuildRunner
-// interface so tests can substitute a deterministic in-memory runner.
-// Production wires a Docker-backed runner that lives on the agent host;
-// at the master level, we only orchestrate state transitions and
-// persistence.
+// The heavy copy/boot/snapshot work is delegated to a BuildRunner so
+// tests can substitute a deterministic stub. Production wires the
+// ScriptBuildRunner (template_builder.go); at the master level, we only
+// orchestrate state transitions and persistence.
 package master
 
 import (
@@ -20,8 +19,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,23 +27,6 @@ import (
 	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
 )
-
-// guestAgentInstallSnippet is appended to every user-supplied Dockerfile
-// so the resulting image already ships the vajra guest agent. The agent
-// is the in-VM HTTP target reached over vsock; without it, the master
-// cannot exec or upload to a sandbox built from this image.
-const guestAgentInstallSnippet = `
-# --- vajra guest-agent (appended automatically) ---
-RUN set -eux; \
-    if command -v apt-get >/dev/null 2>&1; then \
-        apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
-    elif command -v apk >/dev/null 2>&1; then \
-        apk add --no-cache ca-certificates curl; \
-    fi; \
-    install -d /usr/local/bin /etc/vajra; \
-    curl -fsSL https://dist.vajra.dev/agent/latest/vajra-guest-agent -o /usr/local/bin/vajra-guest-agent; \
-    chmod 0755 /usr/local/bin/vajra-guest-agent
-`
 
 // BuildArtifact is what a BuildRunner returns on success. Paths are
 // agent-side absolute paths; Hash is the SHA256 of the rootfs.
@@ -206,32 +186,31 @@ func (m *BuildManager) run(ctx context.Context, b *models.Build) {
 		m.log("update build to BUILDING failed", "err", err, "build_id", b.ID)
 		return
 	}
-	finalDockerfile := strings.TrimRight(b.Dockerfile, "\n") + "\n" + guestAgentInstallSnippet
 
-	artifact, err := m.runner.Run(ctx, finalDockerfile, b.TemplateName, b.TemplateVer)
+	// b.Dockerfile carries the caller's setup script verbatim; the runner
+	// runs it inside the base rootfs. Nothing is appended — the base
+	// template already ships the guest-agent.
+	artifact, err := m.runner.Run(ctx, b.Dockerfile, b.TemplateName, b.TemplateVer)
 	if err != nil {
 		m.fail(ctx, b.ID, fmt.Errorf("build: %w", err))
 		return
 	}
-
-	// Stage the freshly built image files into the master's template
-	// directory so GET /internal/templates/{id}/download can serve them
-	// to agents on demand. The template row records the staged paths.
-	templateDir := filepath.Join(DefaultTemplatesDir, artifact.Hash)
-	staged := m.stageTemplateArtifact(artifact, templateDir)
 
 	tmplID, err := randomHex(16)
 	if err != nil {
 		m.fail(ctx, b.ID, fmt.Errorf("alloc template id: %w", err))
 		return
 	}
+	// The runner has already laid the (rootfs, kernel, snapshot) triple
+	// out under the agent image cache, keyed by hash; the template row
+	// records those real paths.
 	tmpl := &models.Template{
 		ID: tmplID, AccountID: b.AccountID,
 		Name: b.TemplateName, Version: b.TemplateVer,
 		Hash:         artifact.Hash,
-		RootfsPath:   filepath.Join(templateDir, "rootfs.raw"),
-		KernelPath:   filepath.Join(templateDir, "vmlinux"),
-		SnapshotPath: filepath.Join(templateDir, "snapshot"),
+		RootfsPath:   artifact.RootfsPath,
+		KernelPath:   artifact.KernelPath,
+		SnapshotPath: artifact.SnapshotPath,
 		CreatedAt:    m.now().UTC(),
 	}
 	if err := m.store.Templates().Create(ctx, tmpl); err != nil {
@@ -242,75 +221,7 @@ func (m *BuildManager) run(ctx context.Context, b *models.Build) {
 	if err := m.store.Builds().UpdateStatus(ctx, b.ID, models.BuildStatusCompleted, &tmpl.ID, nil, &completed); err != nil {
 		m.log("update build to COMPLETED failed", "err", err, "build_id", b.ID)
 	}
-	m.log("build completed", "build_id", b.ID, "template_id", tmpl.ID, "hash", tmpl.Hash[:12], "staged", staged)
-}
-
-// stageTemplateArtifact copies a finished build's image files into
-// destDir (<templates>/<hash>/) so the master can serve them to agents
-// via the template-download endpoint. It returns whether anything was
-// staged.
-//
-// Staging is best-effort and never fails the build: a stub build runner
-// fabricates artifact paths without writing any files, so when the
-// source rootfs is absent we skip staging and leave the template
-// undistributable — sandbox creation then surfaces a clear "failed to
-// distribute" error rather than a silent "not in cache".
-//
-// Only rootfs.raw is staged (not a qcow2 backing): the raw form is the
-// SHA256 source of truth the agent verifies the download against, and
-// the agent builds its own qcow2 backing locally after the pull.
-func (m *BuildManager) stageTemplateArtifact(a *BuildArtifact, destDir string) bool {
-	if a == nil || !fileExists(a.RootfsPath) {
-		m.log("build artifact has no rootfs on disk; skipping template staging",
-			"hash", artifactHash(a))
-		return false
-	}
-	if err := os.MkdirAll(filepath.Join(destDir, "snapshot"), 0o755); err != nil {
-		m.log("stage template: mkdir failed", "err", err, "dir", destDir)
-		return false
-	}
-	copies := []struct{ src, dst string }{
-		{a.RootfsPath, filepath.Join(destDir, "rootfs.raw")},
-		{a.KernelPath, filepath.Join(destDir, "vmlinux")},
-		{filepath.Join(a.SnapshotPath, "config.json"), filepath.Join(destDir, "snapshot", "config.json")},
-		{filepath.Join(a.SnapshotPath, "memory-ranges"), filepath.Join(destDir, "snapshot", "memory-ranges")},
-		{filepath.Join(a.SnapshotPath, "state.json"), filepath.Join(destDir, "snapshot", "state.json")},
-	}
-	for _, c := range copies {
-		if err := copyFile(c.src, c.dst); err != nil {
-			m.log("stage template: copy failed", "err", err, "src", c.src, "dst", c.dst)
-			return false
-		}
-	}
-	m.log("template staged for distribution", "hash", a.Hash, "dir", destDir)
-	return true
-}
-
-// artifactHash returns a.Hash, or "" for a nil artifact — keeps the log
-// call in stageTemplateArtifact nil-safe.
-func artifactHash(a *BuildArtifact) string {
-	if a == nil {
-		return ""
-	}
-	return a.Hash
-}
-
-// copyFile copies src to dst, creating or truncating dst.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
+	m.log("build completed", "build_id", b.ID, "template_id", tmpl.ID, "hash", artifact.Hash)
 }
 
 // fail stamps a failed status and best-effort logs.

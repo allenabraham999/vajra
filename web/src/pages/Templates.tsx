@@ -52,15 +52,9 @@ export default function TemplatesPage() {
             </button>
             <button
               onClick={() => setOpenBuild(true)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-teal-700 px-3 py-1.5 text-sm text-teal-300 hover:bg-teal-900/30"
-            >
-              Build Custom Template
-            </button>
-            <button
-              onClick={() => setOpenCreate(true)}
               className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
             >
-              <Plus size={14} /> Register
+              <Plus size={14} /> New Template
             </button>
           </div>
         }
@@ -102,6 +96,14 @@ export default function TemplatesPage() {
             </table>
           </div>
         )}
+        <div className="mt-3 text-right">
+          <button
+            onClick={() => setOpenCreate(true)}
+            className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2"
+          >
+            Advanced: register an existing image by path
+          </button>
+        </div>
       </div>
 
       <CreateTemplateModal
@@ -135,6 +137,15 @@ export default function TemplatesPage() {
   )
 }
 
+// Build steps shown while a custom-template build is running. The backend
+// reports a single BUILDING status, so this is an at-a-glance outline of
+// what the builder is doing rather than a live per-step tracker.
+const buildSteps = [
+  'Copying the Ubuntu base image',
+  'Running your setup commands',
+  'Booting & snapshotting the VM',
+]
+
 function BuildTemplateModal({
   open,
   onClose,
@@ -147,8 +158,8 @@ function BuildTemplateModal({
   const toast = useToast()
   const [name, setName] = useState('')
   const [version, setVersion] = useState('1.0.0')
-  const [dockerfile, setDockerfile] = useState(
-    'FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y python3\n',
+  const [setup, setSetup] = useState(
+    'apt-get update\napt-get install -y python3-pip\n',
   )
   const [status, setStatus] = useState<string>('')
   const [busy, setBusy] = useState(false)
@@ -157,17 +168,18 @@ function BuildTemplateModal({
     e.preventDefault()
     if (busy) return
     setBusy(true)
-    setStatus('Queuing…')
+    setStatus('PENDING')
     try {
-      const accepted = await api.templates.build({ name, version, dockerfile })
-      setStatus('PENDING')
+      // The setup script travels in the `dockerfile` field for wire
+      // compatibility; the builder runs it inside the base rootfs.
+      const accepted = await api.templates.build({ name, version, dockerfile: setup })
       // Poll until terminal state.
       const deadline = Date.now() + 10 * 60 * 1000
       while (Date.now() < deadline) {
         const b = await api.templates.buildStatus(accepted.build_id)
         setStatus(b.status)
         if (b.status === 'COMPLETED') {
-          toast.success(`Template ${name}@${version} built`)
+          toast.success(`Template "${name}" built`)
           onCompleted()
           return
         }
@@ -186,24 +198,55 @@ function BuildTemplateModal({
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="Build custom template" size="lg">
+    <Modal open={open} onClose={onClose} title="Build Custom Template" size="lg">
       <form onSubmit={submit} className="space-y-3">
-        <Field label="Name">
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required />
-        </Field>
-        <Field label="Version">
-          <input value={version} onChange={(e) => setVersion(e.target.value)} className={inputCls} required />
-        </Field>
-        <Field label="Dockerfile">
+        <p className="text-xs text-zinc-500 leading-relaxed">
+          Builds a new template from the Ubuntu 24.04 base image: your setup
+          commands run inside it, then the VM is booted and snapshotted. The
+          finished template restores in milliseconds like any other.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Name">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="my-python-env"
+              className={inputCls}
+              required
+            />
+          </Field>
+          <Field label="Version">
+            <input value={version} onChange={(e) => setVersion(e.target.value)} className={inputCls} required />
+          </Field>
+        </div>
+        <Field label="Setup commands">
           <textarea
-            value={dockerfile}
-            onChange={(e) => setDockerfile(e.target.value)}
-            rows={10}
+            value={setup}
+            onChange={(e) => setSetup(e.target.value)}
+            rows={8}
             className={`${inputCls} font-mono text-xs`}
             required
           />
         </Field>
-        {status && (
+        <p className="text-xs text-zinc-600">
+          Shell commands run as root inside the image — install packages with{' '}
+          <code className="text-zinc-400">apt-get install -y …</code>,{' '}
+          <code className="text-zinc-400">pip install …</code>, or fetch files.
+        </p>
+        {busy && (
+          <div className="rounded-md border border-zinc-800 bg-zinc-950/50 p-3 space-y-1.5">
+            <div className="flex items-center gap-2 text-xs text-teal-300">
+              <Spinner size={13} />
+              Building — this takes 2–4 minutes
+            </div>
+            <ul className="text-[11px] text-zinc-500 pl-5 list-disc space-y-0.5">
+              {buildSteps.map((s) => (
+                <li key={s}>{s}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {status && !busy && (
           <div className="text-xs text-zinc-400">
             Status: <span className="font-mono text-teal-300">{status}</span>
           </div>
@@ -214,7 +257,7 @@ function BuildTemplateModal({
             onClick={onClose}
             className="rounded-md border border-zinc-800 px-3 py-1.5 text-sm hover:bg-zinc-800"
           >
-            Cancel
+            {busy ? 'Close' : 'Cancel'}
           </button>
           <button
             type="submit"
@@ -222,7 +265,7 @@ function BuildTemplateModal({
             className="rounded-md bg-teal-500 hover:bg-teal-400 disabled:bg-zinc-800 disabled:text-zinc-500 text-zinc-950 px-3 py-1.5 text-sm font-medium flex items-center gap-1.5"
           >
             {busy && <Spinner size={14} />}
-            Build
+            Build template
           </button>
         </div>
       </form>

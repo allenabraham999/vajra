@@ -7,6 +7,7 @@ package master
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
@@ -122,10 +123,17 @@ func (h *Handlers) cloneSnapshot(w http.ResponseWriter, r *http.Request) {
 	h.runCreate(w, r, accountID, create)
 }
 
+// promoteSnapshotRequest is the body of POST /v1/snapshots/{id}/promote.
+type promoteSnapshotRequest struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
 // promoteSnapshot creates a Template row that points at the snapshot's
-// storage path. This is metadata-only: production promotion would ask
-// the agent to repackage the snapshot into the content-addressable
-// template cache, but the agent doesn't expose that yet.
+// storage path. The template's name and version come from the request
+// body. This is metadata-only: production promotion would ask the agent
+// to repackage the snapshot into the content-addressable template cache,
+// but the agent doesn't expose that yet.
 func (h *Handlers) promoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	accountID, ok := RequireAccount(w, r)
 	if !ok {
@@ -135,6 +143,20 @@ func (h *Handlers) promoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	if snapshotID == "" {
 		writeErr(w, http.StatusBadRequest, "missing snapshot id")
 		return
+	}
+	var body promoteSnapshotRequest
+	if err := decodeBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		writeErr(w, http.StatusBadRequest, "template name is required")
+		return
+	}
+	body.Version = strings.TrimSpace(body.Version)
+	if body.Version == "" {
+		body.Version = "1.0.0"
 	}
 	snap, err := h.Store.Snapshots().GetByID(r.Context(), accountID, snapshotID)
 	if err != nil {
@@ -155,8 +177,8 @@ func (h *Handlers) promoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	tmpl := &models.Template{
 		ID:           templateID,
 		AccountID:    accountID,
-		Name:         "snapshot-" + snap.ID,
-		Version:      "1",
+		Name:         body.Name,
+		Version:      body.Version,
 		Hash:         "sha256:" + snap.ID,
 		RootfsPath:   snap.StoragePath,
 		KernelPath:   "",
