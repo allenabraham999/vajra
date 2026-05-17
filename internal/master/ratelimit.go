@@ -53,10 +53,17 @@ func (b *tokenBucket) allow(now time.Time) bool {
 	for {
 		last := b.lastNS.Load()
 		cur := now.UnixNano()
-		// Refill: fractional tokens accumulated since last call.
+		// Refill: tokens accumulated since the last call. A gap longer
+		// than one full refill cycle can only top the bucket off, so
+		// clamp dt before the multiply: unclamped, dt*refill overflows
+		// int64 once a bucket has sat idle ~15 min, wrapping `add`
+		// negative and wedging the account at a permanent 429.
 		dt := cur - last
 		add := int64(0)
 		if dt > 0 {
+			if maxDt := (b.capacity/b.refill + 1) * int64(time.Second); dt > maxDt {
+				dt = maxDt
+			}
 			add = (dt * b.refill) / int64(time.Second)
 		}
 		balance := b.tokens.Load() + add

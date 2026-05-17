@@ -78,6 +78,29 @@ func TestRateLimiter_RefillsOverTime(t *testing.T) {
 	}
 }
 
+// TestRateLimiter_LongIdleNoOverflow guards against the dt*refill int64
+// overflow: a bucket left idle ~15-30 min computed a negative refill and
+// wedged the account at a permanent 429. After an idle gap far longer
+// than the refill window the bucket must simply be full again.
+func TestRateLimiter_LongIdleNoOverflow(t *testing.T) {
+	clock := time.Unix(1_700_000_500, 0)
+	limiter := NewRateLimiter(RateLimitConfig{
+		RPS: 10,
+		Now: func() time.Time { return clock },
+	})
+	if ok, _ := limiter.allowAccount("idle-acct"); !ok {
+		t.Fatalf("first call should pass")
+	}
+	// 20 min idle: unclamped, dt*refill overflows int64 and wraps the
+	// refill negative — every call below would wrongly trip the limiter.
+	clock = clock.Add(20 * time.Minute)
+	for i := 0; i < 10; i++ {
+		if ok, _ := limiter.allowAccount("idle-acct"); !ok {
+			t.Fatalf("post-idle call %d should pass — refilled bucket, not an overflow", i)
+		}
+	}
+}
+
 // TestRateLimiter_Middleware_429 confirms the middleware short-circuits
 // to 429 with a Retry-After header when the bucket is dry.
 func TestRateLimiter_Middleware_429(t *testing.T) {
