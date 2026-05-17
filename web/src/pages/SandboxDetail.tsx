@@ -7,6 +7,7 @@ import StateBadge from '../components/StateBadge'
 import Spinner from '../components/Spinner'
 import { useToast } from '../components/Toast'
 import { formatBytes, formatRelative, formatUptime, memMB } from '../utils/format'
+import { copyToClipboard } from '../utils/clipboard'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
@@ -691,9 +692,10 @@ function SnapshotsTab({ sandboxId, sandboxName }: { sandboxId: string; sandboxNa
                   <td className="px-4 py-2 font-mono text-xs flex items-center gap-1">
                     {s.id.slice(0, 16)}
                     <button
-                      onClick={() => {
-                        navigator.clipboard.writeText(s.id)
-                        toast.success('Copied')
+                      onClick={async () => {
+                        const ok = await copyToClipboard(s.id)
+                        if (ok) toast.success('Copied!')
+                        else toast.error('Copy failed')
                       }}
                       className="text-zinc-600 hover:text-zinc-200"
                     >

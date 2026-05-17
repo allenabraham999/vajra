@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { KeyRound, Plus, Trash2, Copy } from 'lucide-react'
+import { KeyRound, Plus, Trash2, Copy, Check } from 'lucide-react'
 import api from '../api/client'
 import type { APIKey } from '../api/types'
 import PageHeader from '../components/PageHeader'
@@ -8,12 +8,28 @@ import Modal from '../components/Modal'
 import Spinner from '../components/Spinner'
 import { useToast } from '../components/Toast'
 import { formatRelative } from '../utils/format'
+import { copyToClipboard } from '../utils/clipboard'
 
 export default function ApiKeysPage() {
   const toast = useToast()
   const [items, setItems] = useState<APIKey[]>([])
   const [openCreate, setOpenCreate] = useState(false)
   const [issuedKey, setIssuedKey] = useState<{ name: string; key: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  // copyIssuedKey copies the full key shown right after creation. The
+  // Clipboard API is unavailable on the plain-HTTP dashboard, so this
+  // routes through copyToClipboard's execCommand fallback.
+  async function copyIssuedKey() {
+    if (!issuedKey) return
+    if (await copyToClipboard(issuedKey.key)) {
+      setCopied(true)
+      toast.success('Copied!')
+      setTimeout(() => setCopied(false), 2000)
+    } else {
+      toast.error('Copy failed — select the key and copy manually')
+    }
+  }
 
   async function load() {
     try {
@@ -85,7 +101,18 @@ export default function ApiKeysPage() {
                   <tr key={k.id} className="border-b border-zinc-900/50 hover:bg-zinc-800/50 transition-colors">
                     <td className="px-4 py-2.5 font-medium">{k.name}</td>
                     <td className="px-4 py-2.5 font-mono text-xs text-zinc-500">
-                      vj_live_{k.id.slice(0, 8)}…
+                      <span className="inline-flex items-center gap-1.5">
+                        vj_live_{k.id.slice(0, 8)}…
+                        <button
+                          type="button"
+                          disabled
+                          title="The full key is shown only once, at creation time. Generate a new key to copy its value."
+                          aria-label="Copy key — unavailable"
+                          className="cursor-not-allowed text-zinc-700"
+                        >
+                          <Copy size={11} />
+                        </button>
+                      </span>
                     </td>
                     <td className="px-4 py-2.5 text-zinc-500 text-xs">
                       {formatRelative(k.created_at)}
@@ -118,7 +145,10 @@ export default function ApiKeysPage() {
 
       <Modal
         open={!!issuedKey}
-        onClose={() => setIssuedKey(null)}
+        onClose={() => {
+          setIssuedKey(null)
+          setCopied(false)
+        }}
         title={`API key: ${issuedKey?.name}`}
         size="md"
       >
@@ -128,15 +158,11 @@ export default function ApiKeysPage() {
         <div className="rounded-md border border-zinc-800 bg-zinc-950 p-2.5 flex items-center justify-between gap-2 mb-4">
           <code className="font-mono text-xs text-teal-300 break-all">{issuedKey?.key}</code>
           <button
-            onClick={() => {
-              if (issuedKey) {
-                navigator.clipboard.writeText(issuedKey.key)
-                toast.success('Copied')
-              }
-            }}
-            className="shrink-0 rounded bg-zinc-800 hover:bg-zinc-700 px-2 py-1.5 text-zinc-200"
+            onClick={copyIssuedKey}
+            className="shrink-0 inline-flex items-center gap-1 rounded bg-zinc-800 hover:bg-zinc-700 px-2 py-1.5 text-zinc-200"
           >
-            <Copy size={14} />
+            {copied ? <Check size={14} className="text-teal-400" /> : <Copy size={14} />}
+            {copied && <span className="text-xs">Copied!</span>}
           </button>
         </div>
         <button

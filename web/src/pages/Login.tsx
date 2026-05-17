@@ -6,6 +6,7 @@ import Spinner from '../components/Spinner'
 import Bolt from '../components/Bolt'
 import { Copy, KeyRound } from 'lucide-react'
 import { apiBase, auth as authApi } from '../api/client'
+import { copyToClipboard } from '../utils/clipboard'
 
 type Mode = 'login' | 'register'
 
@@ -75,9 +76,10 @@ export default function LoginPage({ initialMode = 'login' }: { initialMode?: Mod
           <div className="rounded-md border border-zinc-800 bg-zinc-950 p-2.5 flex items-center justify-between gap-2 mb-4">
             <code className="font-mono text-xs text-teal-300 break-all">{issuedKey}</code>
             <button
-              onClick={() => {
-                navigator.clipboard.writeText(issuedKey)
-                toast.success('Copied to clipboard')
+              onClick={async () => {
+                const ok = await copyToClipboard(issuedKey)
+                if (ok) toast.success('Copied to clipboard')
+                else toast.error('Copy failed')
               }}
               className="shrink-0 rounded bg-zinc-800 hover:bg-zinc-700 px-2 py-1.5 text-zinc-200 transition-colors"
             >
