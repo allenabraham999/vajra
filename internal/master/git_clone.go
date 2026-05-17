@@ -201,14 +201,15 @@ func (h *Handlers) execGitClone(ctx context.Context, agent *AgentClient, sandbox
 		return fmt.Errorf("upload repo to sandbox: %w", err)
 	}
 
-	// Extract into /workspace and hand the tree to the guest user. tar,
-	// rm and chown are all local — no guest network needed. Pool VMs are
-	// restored from a snapshot, so the guest clock is frozen at snapshot
-	// time (hours stale); -m (don't restore archive mtimes) plus
+	// Extract into /workspace and hand the tree to the guest's
+	// unprivileged user (uid 1000 = "cloud" on the ubuntu-noble template).
+	// tar, rm and chown are all local — no guest network needed. Pool VMs
+	// are restored from a snapshot, so the guest clock is frozen at
+	// snapshot time (hours stale); -m (don't restore archive mtimes) plus
 	// --warning=no-timestamp stop tar from failing every file with a
 	// "timestamp in the future" warning and exiting non-zero.
 	extract := fmt.Sprintf(
-		"mkdir -p /workspace && tar --warning=no-timestamp -xmf %[1]s -C /workspace && rm -f %[1]s && chown -R user:user /workspace",
+		"mkdir -p /workspace && tar --warning=no-timestamp -xmf %[1]s -C /workspace && rm -f %[1]s && chown -R cloud:cloud /workspace",
 		gitCloneTarGuestPath)
 	res, err := agent.ExecCommand(ctx, sandboxID, extract, gitCloneStepTimeout)
 	if err != nil {
