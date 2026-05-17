@@ -100,7 +100,7 @@ export default function SandboxDetailPage() {
             </div>
           </div>
           <div className="flex gap-2">
-            {sandbox.state === 'RUNNING' && (
+            {sandbox.state === 'RUNNING' && !!sandbox.node_id && (
               <Btn onClick={() => action('stop')} busy={busy} icon={<Square size={12} />} label="Stop" />
             )}
             {sandbox.state === 'STOPPED' && (

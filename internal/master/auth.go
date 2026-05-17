@@ -30,9 +30,11 @@ import (
 )
 
 // JWTTTL is how long a freshly minted browser-session token stays valid.
-// One hour matches typical dashboard activity windows; SDKs should use
-// API keys instead.
-const JWTTTL = time.Hour
+// 24h comfortably outlasts slow control-plane operations (e.g. an
+// autoscale wait that boots a fresh node) so a dashboard tab left open
+// through one never lapses into a 401 mid-flow; the dashboard also
+// re-mints the token well before this expiry. SDKs should use API keys.
+const JWTTTL = 24 * time.Hour
 
 // BcryptCost is the bcrypt work factor for stored password hashes.
 // Higher than the library default (10) — auth is not a hot path and the

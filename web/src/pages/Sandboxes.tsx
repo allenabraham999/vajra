@@ -120,7 +120,7 @@ export default function SandboxesPage() {
                       className="px-4 py-2.5 text-right space-x-1.5"
                       onClick={(e) => e.stopPropagation()}
                     >
-                      {sb.state === 'RUNNING' && (
+                      {canStop(sb) && (
                         <ActionButton
                           onClick={() => action(sb.id, 'stop')}
                           busy={busyId === sb.id}
@@ -168,6 +168,14 @@ export default function SandboxesPage() {
 
 function isTerminal(s: string) {
   return s === 'DESTROYED' || s === 'DESTROYING'
+}
+
+// canStop gates the Stop action: only a RUNNING sandbox that is actually
+// placed on a node can be stopped. A sandbox that errored before it ever
+// scheduled (e.g. autoscale found no capacity) has no node — for those
+// only Destroy applies, never Stop.
+function canStop(sb: Sandbox) {
+  return sb.state === 'RUNNING' && !!sb.node_id
 }
 
 interface ActionBtnProps {

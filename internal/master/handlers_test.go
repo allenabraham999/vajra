@@ -251,6 +251,49 @@ func TestLoginHappy(t *testing.T) {
 	}
 }
 
+// TestRefreshSession verifies POST /v1/auth/refresh re-mints a usable
+// JWT for an authenticated caller and rejects unauthenticated requests.
+func TestRefreshSession(t *testing.T) {
+	h := newTestHarness(t)
+	h.register(t, "refresh@example.com", "supersecret")
+
+	resp, body := h.req(t, "POST", "/v1/auth/login", "", map[string]string{
+		"email": "refresh@example.com", "password": "supersecret",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: want 200, got %d body %s", resp.StatusCode, body)
+	}
+	var login loginResponse
+	if err := json.Unmarshal(body, &login); err != nil {
+		t.Fatalf("decode login: %v", err)
+	}
+
+	// Unauthenticated refresh must 401.
+	resp, _ = h.req(t, "POST", "/v1/auth/refresh", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("refresh without token: want 401, got %d", resp.StatusCode)
+	}
+
+	// Authenticated refresh returns a fresh, non-expired token.
+	resp, body = h.req(t, "POST", "/v1/auth/refresh", login.Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("refresh: want 200, got %d body %s", resp.StatusCode, body)
+	}
+	var refreshed loginResponse
+	if err := json.Unmarshal(body, &refreshed); err != nil {
+		t.Fatalf("decode refresh: %v", err)
+	}
+	if refreshed.Token == "" || time.Until(refreshed.ExpiresAt) <= 0 {
+		t.Fatalf("bad refresh response: %+v", refreshed)
+	}
+
+	// The refreshed token authenticates a normal request.
+	resp, body = h.req(t, "GET", "/v1/sandboxes", refreshed.Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list with refreshed token: want 200, got %d body %s", resp.StatusCode, body)
+	}
+}
+
 func TestListSandboxesUnauthed(t *testing.T) {
 	h := newTestHarness(t)
 	resp, _ := h.req(t, "GET", "/v1/sandboxes", "", nil)

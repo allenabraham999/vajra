@@ -151,6 +151,28 @@ func (h *Handlers) login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// refreshSession re-issues a JWT for the already-authenticated caller,
+// extending the browser session by another JWTTTL. The dashboard polls
+// this proactively before its current token expires, so a tab left open
+// through a long operation (e.g. an autoscale wait) keeps a valid token
+// and its background polling never starts 401-ing.
+func (h *Handlers) refreshSession(w http.ResponseWriter, r *http.Request) {
+	accountID, ok := RequireAccount(w, r)
+	if !ok {
+		return
+	}
+	token, err := h.Signer.Sign(accountID)
+	if err != nil {
+		h.log().Error("refreshSession: sign jwt", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, loginResponse{
+		Token:     token,
+		ExpiresAt: h.now().Add(JWTTTL),
+	})
+}
+
 // createAPIKeyRequest is the body of POST /v1/api-keys.
 type createAPIKeyRequest struct {
 	Name string `json:"name"`

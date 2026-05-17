@@ -47,6 +47,45 @@ http.interceptors.request.use((config) => {
   return config
 })
 
+// onAuthRefresh is installed by AuthProvider. When a request comes back
+// 401 the response interceptor calls it once to re-mint a token, then
+// replays the original request — so dashboard polling survives a token
+// that lapsed while the tab sat idle (e.g. through an autoscale wait).
+// Returning null means the session is unrecoverable (genuine logout).
+let onAuthRefresh: (() => Promise<string | null>) | null = null
+
+export function setAuthRefreshHandler(
+  fn: (() => Promise<string | null>) | null,
+) {
+  onAuthRefresh = fn
+}
+
+http.interceptors.response.use(
+  (resp) => resp,
+  async (error: unknown) => {
+    if (!axios.isAxiosError(error)) return Promise.reject(error)
+    const cfg = error.config as
+      | (AxiosRequestConfig & { _retried?: boolean })
+      | undefined
+    // Retry exactly once on 401, and never for the auth endpoints
+    // themselves — a failed login or refresh must surface, not loop.
+    if (
+      error.response?.status === 401 &&
+      cfg &&
+      !cfg._retried &&
+      onAuthRefresh &&
+      !(cfg.url ?? '').includes('/v1/auth/')
+    ) {
+      cfg._retried = true
+      const fresh = await onAuthRefresh()
+      // The request interceptor re-reads the in-memory token, so once
+      // refresh succeeds the replay automatically carries the new one.
+      if (fresh) return http.request(cfg)
+    }
+    return Promise.reject(error)
+  },
+)
+
 export class ApiError extends Error {
   status: number
   body: unknown
@@ -96,6 +135,8 @@ export const auth = {
     }),
   config: () =>
     request<AuthConfigResponse>({ method: 'GET', url: '/v1/auth/config' }),
+  refresh: () =>
+    request<AuthLoginResponse>({ method: 'POST', url: '/v1/auth/refresh' }),
 }
 
 // apiBase is the absolute URL prefix for full-page navigations to master

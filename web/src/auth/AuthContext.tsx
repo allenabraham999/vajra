@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { auth, nodes, setAuthToken } from '../api/client'
+import { auth, nodes, setAuthToken, setAuthRefreshHandler } from '../api/client'
 
 interface AuthState {
   email: string | null
@@ -109,6 +109,53 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionStorage.removeItem(SESSION_EMAIL_KEY)
     setState({ email: null, token: null, expiresAt: null, isAdmin: false })
   }, [])
+
+  // refreshInFlight coalesces concurrent refreshes: the dashboard polls
+  // several endpoints at once, so a lapsed token would otherwise fire a
+  // burst of identical refresh calls.
+  const refreshInFlight = useRef<Promise<string | null> | null>(null)
+
+  // refresh re-mints the session JWT. Returns the new token, or null if
+  // the session is unrecoverable — in which case it clears auth state so
+  // the router bounces the user to /login instead of looping on 401s.
+  const refresh = useCallback((): Promise<string | null> => {
+    if (refreshInFlight.current) return refreshInFlight.current
+    const p = (async (): Promise<string | null> => {
+      try {
+        const r = await auth.refresh()
+        setAuthToken(r.token)
+        setState((s) => ({ ...s, token: r.token, expiresAt: r.expires_at }))
+        return r.token
+      } catch {
+        setAuthToken(null)
+        sessionStorage.removeItem(SESSION_EMAIL_KEY)
+        setState({ email: null, token: null, expiresAt: null, isAdmin: false })
+        return null
+      } finally {
+        refreshInFlight.current = null
+      }
+    })()
+    refreshInFlight.current = p
+    return p
+  }, [])
+
+  // Expose refresh to the API client so a 401 mid-poll triggers a
+  // re-mint + replay rather than a hard logout.
+  useEffect(() => {
+    setAuthRefreshHandler(state.token ? refresh : null)
+    return () => setAuthRefreshHandler(null)
+  }, [state.token, refresh])
+
+  // Proactively re-mint the token once half its lifetime has elapsed, so
+  // a tab left open through a long operation never reaches expiry. Each
+  // successful refresh moves expiresAt forward and re-arms this timer.
+  useEffect(() => {
+    if (!state.token || !state.expiresAt) return
+    const msLeft = new Date(state.expiresAt).getTime() - Date.now()
+    const delay = Math.min(Math.max(msLeft / 2, 30_000), 12 * 60 * 60 * 1000)
+    const timer = window.setTimeout(() => void refresh(), delay)
+    return () => window.clearTimeout(timer)
+  }, [state.token, state.expiresAt, refresh])
 
   const value = useMemo<AuthContextValue>(
     () => ({ ...state, login, register, logout }),

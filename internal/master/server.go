@@ -117,6 +117,10 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 	h := s.handlers
 	return map[string]http.HandlerFunc{
+		// Session — re-mint the caller's JWT before it expires so an
+		// open dashboard tab never lapses into a 401 mid-session.
+		"POST /v1/auth/refresh": h.refreshSession,
+
 		// API keys
 		"POST /v1/api-keys":        h.createAPIKey,
 		"GET /v1/api-keys":         h.listAPIKeys,
