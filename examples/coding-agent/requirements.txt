@@ -1,5 +1,5 @@
 # Vajra coding-agent example — Python dependencies.
 # Install from inside this directory so the relative SDK path resolves:
 #   cd examples/coding-agent && pip install -r requirements.txt
-anthropic>=0.40.0
+openai>=1.40.0
 -e ../../sdk/python   # the `vajra` SDK lives in this repo

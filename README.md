@@ -82,7 +82,7 @@ make benchmark    # Run vmm benchmarks
 ## Examples
 
 - **[examples/coding-agent/](examples/coding-agent/)** — an autonomous AI
-  coding agent built on Claude + Vajra in under 250 lines of Python. The
+  coding agent built on OpenAI + Vajra in under 250 lines of Python. The
   canonical pattern for AI agents that run code in isolated environments.
 
 ## Status

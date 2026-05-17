@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Autonomous AI coding agent — Claude + Vajra.
+"""Autonomous AI coding agent — OpenAI + Vajra.
 
-Claude is handed a coding task and three tools that execute inside a fresh,
-hardware-isolated Vajra microVM sandbox: run a shell command, write a file,
-and read a file. Claude plans, acts, observes the results, and iterates until
+An OpenAI model is handed a coding task and three tools that execute inside a
+fresh, hardware-isolated Vajra microVM sandbox: run a command, write a file,
+read a file. The model plans, acts, observes the results, and iterates until
 the task is done — then returns a final summary.
 
-    [ agent.py ] -> [ Claude API ] -> [ Vajra SDK ] -> [ sandbox /workspace ]
+    [ agent.py ] -> [ OpenAI API ] -> [ Vajra SDK ] -> [ sandbox /workspace ]
          ^_______________________________________________________|
-                       tool results feed back to Claude
+                     tool results feed back to the model
 
-Usage: set ANTHROPIC_API_KEY, VAJRA_API_KEY and VAJRA_API_URL, then run
+Usage: set OPENAI_API_KEY, VAJRA_API_KEY and VAJRA_API_URL, then run
 `python agent.py ["a coding task in plain English"]`. See README.md for details.
 
 The sandbox has no internet access (vsock-only), so the agent works entirely
@@ -21,16 +21,17 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import time
 import tempfile
 
-from anthropic import Anthropic
+from openai import OpenAI
 from vajra import VajraClient, VajraAPIError
 
 
 # --- Configuration (all overridable via environment) -----------------------
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 VAJRA_URL = os.environ.get("VAJRA_API_URL", "http://localhost:8080")
 TEMPLATE = os.environ.get("VAJRA_TEMPLATE", "ubuntu-noble")
 MAX_TURNS = 16            # hard cap on agent <-> sandbox round trips
@@ -57,18 +58,21 @@ tools and reply with a concise summary of what you did and the final result.
 """
 
 
-# --- Tool schemas exposed to Claude ----------------------------------------
+# --- Tool schemas exposed to the model -------------------------------------
 
 def _tool(name: str, description: str, **params: str) -> dict:
-    """Build an Anthropic tool schema; every parameter is a required string."""
+    """Build an OpenAI function-tool schema; every parameter is a required string."""
     return {
-        "name": name,
-        "description": description,
-        "input_schema": {
-            "type": "object",
-            "properties": {k: {"type": "string", "description": v}
-                           for k, v in params.items()},
-            "required": list(params),
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {k: {"type": "string", "description": v}
+                               for k, v in params.items()},
+                "required": list(params),
+            },
         },
     }
 
@@ -86,17 +90,11 @@ TOOLS = [
           path="Absolute file path."),
 ]
 
-# One cache breakpoint on the system prompt also caches the tool schemas, so
-# every turn after the first re-uses them instead of re-billing those tokens.
-CACHED_SYSTEM = [
-    {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
-]
-
 
 # --- Sandbox-backed tool implementations -----------------------------------
 
 class SandboxTools:
-    """Runs each Claude tool call inside one Vajra sandbox."""
+    """Runs each model tool call inside one Vajra sandbox."""
 
     def __init__(self, client: VajraClient, sandbox_id: str):
         self._client = client
@@ -160,16 +158,16 @@ def _indent(text: str) -> str:
 # --- Agent loop ------------------------------------------------------------
 
 def run_agent(task: str) -> int:
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
     vajra_key = os.environ.get("VAJRA_API_KEY")
-    if not anthropic_key:
-        sys.exit("error: set ANTHROPIC_API_KEY")
+    if not openai_key:
+        sys.exit("error: set OPENAI_API_KEY")
     if not vajra_key:
         sys.exit("error: set VAJRA_API_KEY")
 
-    claude = Anthropic(api_key=anthropic_key)
+    openai = OpenAI(api_key=openai_key)
     vajra = VajraClient(api_key=vajra_key, base_url=VAJRA_URL)
-    in_tokens = out_tokens = cached_tokens = 0
+    prompt_tokens = completion_tokens = 0
 
     print(f"task: {task}\n")
     print(f"creating sandbox from template '{TEMPLATE}' ...")
@@ -181,51 +179,51 @@ def run_agent(task: str) -> int:
         print(f"  sandbox {sandbox.id} ready in {(time.time() - started) * 1000:.0f} ms\n")
 
         tools = SandboxTools(vajra, sandbox.id)
-        messages = [{"role": "user", "content": task}]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
 
         for turn in range(1, MAX_TURNS + 1):
-            reply = claude.messages.create(
+            response = openai.chat.completions.create(
                 model=MODEL,
-                max_tokens=2048,
-                system=CACHED_SYSTEM,
-                tools=TOOLS,
                 messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
             )
-            usage = reply.usage
-            in_tokens += usage.input_tokens
-            out_tokens += usage.output_tokens
-            cached_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+            usage = response.usage
+            if usage:
+                prompt_tokens += usage.prompt_tokens
+                completion_tokens += usage.completion_tokens
 
-            for block in reply.content:
-                if block.type == "text" and block.text.strip():
-                    print(f"[claude] {block.text.strip()}\n")
+            message = response.choices[0].message
+            if message.content and message.content.strip():
+                print(f"[model] {message.content.strip()}\n")
 
-            if reply.stop_reason != "tool_use":
+            messages.append(message)
+            if not message.tool_calls:
                 print(f"--- done in {turn} turn(s) ---")
                 return 0
 
-            # Echo Claude's turn back, then run every tool call it requested.
-            messages.append({"role": "assistant", "content": reply.content})
-            results = []
-            for block in reply.content:
-                if block.type != "tool_use":
-                    continue
-                print(f"[tool] {block.name}({_short_args(block.input)})")
+            # Run every tool call the model requested. OpenAI requires a
+            # matching `tool` message for each call before the next request.
+            for call in message.tool_calls:
+                name = call.function.name
+                args: dict = {}
                 try:
-                    output = tools.dispatch(block.name, block.input)
-                    is_error = False
+                    args = json.loads(call.function.arguments or "{}")
+                    output = tools.dispatch(name, args)
                 except (VajraAPIError, ValueError, TypeError) as exc:
-                    output, is_error = f"error: {exc}", True
+                    output = f"error: {exc}"
+                print(f"[tool] {name}({_short_args(args)})")
                 if len(output) > MAX_TOOL_OUTPUT:
                     output = output[:MAX_TOOL_OUTPUT] + "\n...[truncated]"
                 print(_indent(output) + "\n")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
                     "content": output,
-                    "is_error": is_error,
                 })
-            messages.append({"role": "user", "content": results})
 
         print(f"--- stopped: hit MAX_TURNS ({MAX_TURNS}) ---")
         return 1
@@ -236,7 +234,9 @@ def run_agent(task: str) -> int:
             print("  destroyed.")
         except VajraAPIError as exc:
             print(f"  warning: destroy failed: {exc}")
-        print(f"tokens: {in_tokens} in ({cached_tokens} cached) / {out_tokens} out")
+        total = prompt_tokens + completion_tokens
+        print(f"tokens: {prompt_tokens} prompt + {completion_tokens} completion "
+              f"= {total} total")
 
 
 def main() -> None:

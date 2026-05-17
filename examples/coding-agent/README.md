@@ -1,14 +1,15 @@
-# Autonomous AI coding agent — Claude + Vajra
+# Autonomous AI coding agent — OpenAI + Vajra
 
-A working autonomous coding agent in **under 250 lines of Python**. Claude is
-given a coding task and three tools that run inside a fresh, hardware-isolated
-[Vajra](../../README.md) microVM sandbox. It plans, writes code, runs it,
-reads back the results, fixes its own mistakes, and reports when done.
+A working autonomous coding agent in **under 250 lines of Python**. An OpenAI
+model is given a coding task and three tools that run inside a fresh,
+hardware-isolated [Vajra](../../README.md) microVM sandbox. It plans, writes
+code, runs it, reads back the results, fixes its own mistakes, and reports
+when done.
 
 ```
-[ agent.py ] --> [ Claude API ] --> [ Vajra SDK ] --> [ sandbox /workspace ]
+[ agent.py ] --> [ OpenAI API ] --> [ Vajra SDK ] --> [ sandbox /workspace ]
       ^________________________________________________________|
-                     tool results feed back to Claude
+                   tool results feed back to the model
 ```
 
 This is the canonical pattern for AI agents that execute untrusted code:
@@ -17,7 +18,7 @@ inside a disposable VM that is destroyed when the run ends.
 
 ## The tools
 
-Claude drives the sandbox through three tools, each backed by the Vajra SDK:
+The model drives the sandbox through three tools, each backed by the Vajra SDK:
 
 | Tool           | Backed by                     | What it does                      |
 | -------------- | ----------------------------- | --------------------------------- |
@@ -25,17 +26,17 @@ Claude drives the sandbox through three tools, each backed by the Vajra SDK:
 | `write_file`   | `client.sandbox.upload_bytes` | Write a file into `/workspace`    |
 | `read_file`    | `client.sandbox.download_file`| Read a file back out              |
 
-The agent loop is plain Claude tool use: call the model, run whatever tools
-it asks for inside the sandbox, feed the results back, repeat until Claude
-stops calling tools and returns a summary.
+The agent loop is plain OpenAI tool calling: call the model, run whatever
+tools it asks for inside the sandbox, feed the results back as `tool`
+messages, repeat until the model stops calling tools and returns a summary.
 
 ## Quick start
 
 ```sh
 cd examples/coding-agent
-pip install -r requirements.txt          # anthropic + the vajra SDK from this repo
+pip install -r requirements.txt          # openai + the vajra SDK from this repo
 
-export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
 export VAJRA_API_KEY=vj_live_...
 export VAJRA_API_URL=http://localhost:8080   # your vajra-master endpoint
 
@@ -52,13 +53,13 @@ python agent.py "Write a Python script that finds the first 10 prime numbers, ru
 
 All settings come from the environment:
 
-| Variable            | Default                  | Purpose                           |
-| ------------------- | ------------------------ | --------------------------------- |
-| `ANTHROPIC_API_KEY` | _(required)_             | Claude API key                    |
-| `VAJRA_API_KEY`     | _(required)_             | Vajra API key (`vj_live_...`)     |
-| `VAJRA_API_URL`     | `http://localhost:8080`  | vajra-master base URL             |
-| `ANTHROPIC_MODEL`   | `claude-sonnet-4-6`      | Claude model to drive the agent   |
-| `VAJRA_TEMPLATE`    | `ubuntu-noble`           | Sandbox template                  |
+| Variable          | Default                  | Purpose                           |
+| ----------------- | ------------------------ | --------------------------------- |
+| `OPENAI_API_KEY`  | _(required)_             | OpenAI API key                    |
+| `VAJRA_API_KEY`   | _(required)_             | Vajra API key (`vj_live_...`)     |
+| `VAJRA_API_URL`   | `http://localhost:8080`  | vajra-master base URL             |
+| `OPENAI_MODEL`    | `gpt-4o`                 | OpenAI model to drive the agent   |
+| `VAJRA_TEMPLATE`  | `ubuntu-noble`           | Sandbox template                  |
 
 ## Example run
 
@@ -68,7 +69,7 @@ task: Write a Python program to /workspace/fizzbuzz.py ...
 creating sandbox from template 'ubuntu-noble' ...
   sandbox sbx_a1b2c3 ready in 142 ms
 
-[claude] I'll write the FizzBuzz program, then run it to verify.
+[model] I'll write the FizzBuzz program, then run it to verify.
 
 [tool] write_file(path=/workspace/fizzbuzz.py, content=for i in range(1, 21): ...)
     wrote 168 bytes to /workspace/fizzbuzz.py
@@ -80,12 +81,12 @@ creating sandbox from template 'ubuntu-noble' ...
     Fizz
     ...
 
-[claude] Done. fizzbuzz.py prints the correct sequence for 1-20.
+[model] Done. fizzbuzz.py prints the correct sequence for 1-20.
 --- done in 3 turn(s) ---
 
 destroying sandbox sbx_a1b2c3 ...
   destroyed.
-tokens: 4821 in (3110 cached) / 612 out
+tokens: 4821 prompt + 612 completion = 5433 total
 ```
 
 ## Why this matters
