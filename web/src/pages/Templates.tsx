@@ -65,6 +65,14 @@ export default function TemplatesPage() {
             icon={<PackageSearch size={32} />}
             title="No templates registered"
             description="Templates are immutable rootfs + kernel + snapshot bundles, identified by SHA256 hash."
+            action={
+              <button
+                onClick={() => setOpenBuild(true)}
+                className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
+              >
+                <Plus size={14} /> Build your first template
+              </button>
+            }
           />
         ) : (
           <div className="rounded-lg border border-zinc-900 bg-zinc-900/30 overflow-hidden">

@@ -197,7 +197,11 @@ export default function UsagePage() {
             </div>
           </div>
           {tab === 'sandboxes' ? (
-            <PerSandboxTable summary={summary} />
+            <PerSandboxTable
+              summary={summary}
+              stripeEnabled={!!config?.stripe_enabled}
+              onAddFunds={() => setModalOpen(true)}
+            />
           ) : (
             <TransactionsTable transactions={transactions} />
           )}
@@ -209,11 +213,31 @@ export default function UsagePage() {
   )
 }
 
-function PerSandboxTable({ summary }: { summary: UsageSummary }) {
+function PerSandboxTable({
+  summary,
+  stripeEnabled,
+  onAddFunds,
+}: {
+  summary: UsageSummary
+  stripeEnabled: boolean
+  onAddFunds: () => void
+}) {
   if (summary.per_sandbox.length === 0) {
     return (
-      <div className="p-8 text-center text-xs text-zinc-500">
-        No usage yet. Create a sandbox to start tracking.
+      <div className="p-10 text-center">
+        <p className="text-sm font-medium text-zinc-300">No usage yet</p>
+        <p className="text-xs text-zinc-500 mt-1 max-w-sm mx-auto">
+          Spin up a sandbox to start metering vCPU and memory. Usage is billed
+          against your prepaid account balance.
+        </p>
+        {stripeEnabled && (
+          <button
+            onClick={onAddFunds}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
+          >
+            <Plus size={14} /> Add funds to start using paid features
+          </button>
+        )}
       </div>
     )
   }

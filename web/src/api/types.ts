@@ -65,6 +65,11 @@ export interface Sandbox {
   created_at: string
   updated_at: string
   operation_id?: string
+  // Boot metrics — stamped once when the sandbox first reaches RUNNING.
+  // time_to_running_ms is the wall-clock create→RUNNING duration;
+  // pool_hit is true when the agent served it from the warm pool.
+  time_to_running_ms?: number
+  pool_hit?: boolean
   // Git auto-clone. git_url/git_branch echo the create request; the
   // git_clone_status field tracks the post-create clone hook
   // ('' | pending | cloning | done | failed).

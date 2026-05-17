@@ -166,9 +166,11 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"DELETE /v1/sandboxes/{id}/share/{token_id}":     h.revokeShare,
 
 		// Snapshots
+		"GET /v1/snapshots":               h.listSnapshots,
 		"POST /v1/snapshots/{id}/restore": h.restoreSnapshot,
 		"POST /v1/snapshots/{id}/clone":   h.cloneSnapshot,
 		"POST /v1/snapshots/{id}/promote": h.promoteSnapshot,
+		"DELETE /v1/snapshots/{id}":       h.deleteSnapshot,
 
 		// Templates
 		"GET /v1/templates":               h.listTemplates,

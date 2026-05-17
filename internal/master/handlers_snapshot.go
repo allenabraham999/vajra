@@ -193,6 +193,49 @@ func (h *Handlers) promoteSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, tmpl)
 }
 
+// listSnapshots returns every snapshot the calling account owns, newest
+// first. It backs the dashboard's Snapshots page, which would otherwise
+// have to fan out a per-sandbox request for each of the account's
+// sandboxes just to assemble one list.
+func (h *Handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	accountID, ok := RequireAccount(w, r)
+	if !ok {
+		return
+	}
+	out, err := h.Store.Snapshots().ListByAccount(r.Context(), accountID, parseListOpts(r))
+	if err != nil {
+		h.log().Error("listSnapshots", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// deleteSnapshot removes a snapshot record the account owns. This is
+// metadata-only: the on-disk blob is left for the node's periodic
+// snapshot GC, since the agent exposes no targeted snapshot-delete RPC.
+func (h *Handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	accountID, ok := RequireAccount(w, r)
+	if !ok {
+		return
+	}
+	snapshotID := pathID(r)
+	if snapshotID == "" {
+		writeErr(w, http.StatusBadRequest, "missing snapshot id")
+		return
+	}
+	if err := h.Store.Snapshots().Delete(r.Context(), accountID, snapshotID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "snapshot not found")
+			return
+		}
+		h.log().Error("deleteSnapshot", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // runCreate is the shared back-end of createSandbox and the
 // snapshot-restore endpoints. It enforces precondition checks the HTTP
 // path already did, then schedules + dispatches.

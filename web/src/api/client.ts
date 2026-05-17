@@ -273,12 +273,16 @@ export const sandboxes = {
 
 // --- Snapshots ---
 export const snapshotsApi = {
+  // list returns every snapshot the account owns, across all sandboxes.
+  list: () => request<Snapshot[]>({ method: 'GET', url: '/v1/snapshots' }),
   restore: (id: string, name: string) =>
     request<Sandbox>({
       method: 'POST',
       url: `/v1/snapshots/${id}/restore`,
       data: { name },
     }),
+  delete: (id: string) =>
+    request<void>({ method: 'DELETE', url: `/v1/snapshots/${id}` }),
   clone: (id: string, name: string) =>
     request<Sandbox>({
       method: 'POST',

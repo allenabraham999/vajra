@@ -14,6 +14,8 @@ import UsagePage from './pages/Usage'
 import AdminPage from './pages/Admin'
 import MetricsPage from './pages/Metrics'
 import WebhooksPage from './pages/Webhooks'
+import SnapshotsPage from './pages/Snapshots'
+import SettingsPage from './pages/Settings'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { token } = useAuth()
@@ -45,12 +47,14 @@ function AppRoutes() {
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="sandboxes" element={<SandboxesPage />} />
         <Route path="sandboxes/:id" element={<SandboxDetailPage />} />
+        <Route path="snapshots" element={<SnapshotsPage />} />
         <Route path="templates" element={<TemplatesPage />} />
         <Route path="nodes" element={<NodesPage />} />
         <Route path="api-keys" element={<ApiKeysPage />} />
         <Route path="webhooks" element={<WebhooksPage />} />
         <Route path="usage" element={<UsagePage />} />
         <Route path="metrics" element={<MetricsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
