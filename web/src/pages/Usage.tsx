@@ -117,19 +117,18 @@ export default function UsagePage() {
       <PageHeader
         title="Usage & Billing"
         description="Resource consumption, spend, and prepaid account credits."
-      />
-      <div className="p-6 space-y-6">
-        <div className="flex items-center justify-end">
-          {config?.stripe_enabled && (
+        actions={
+          config?.stripe_enabled ? (
             <button
               onClick={() => setModalOpen(true)}
-              className="flex items-center gap-1.5 rounded-md bg-teal-600 hover:bg-teal-500 px-3 py-1.5 text-sm font-medium text-white transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md bg-teal-500 hover:bg-teal-400 text-zinc-950 shadow-md shadow-teal-500/20 hover:shadow-teal-500/40 transition-all duration-200 hover:scale-[1.02] px-3 py-1.5 text-sm font-medium"
             >
               <Plus size={14} /> Add Funds
             </button>
-          )}
-        </div>
-
+          ) : undefined
+        }
+      />
+      <div className="p-6 space-y-6">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
           <BillingTile
             label="Credits remaining"

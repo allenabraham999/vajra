@@ -85,7 +85,11 @@ export default function Layout() {
       </aside>
 
       <main className="flex-1 flex flex-col min-w-0">
-        <header className="flex items-center justify-end h-12 border-b border-zinc-900 px-4 gap-3 bg-zinc-950/60 backdrop-blur">
+        {/* relative z-40 lifts this header's stacking context (created by
+            backdrop-blur) above the page content, so the UserMenu dropdown
+            overlays page content instead of being painted behind it. Stays
+            below the z-50 Modal overlay. */}
+        <header className="relative z-40 flex items-center justify-end h-12 border-b border-zinc-900 px-4 gap-3 bg-zinc-950/60 backdrop-blur">
           <UserMenu />
         </header>
         <div key={location.pathname} className="flex-1 overflow-auto animate-fade-in">
