@@ -43,11 +43,33 @@ export interface LogEntry {
   message: string
 }
 
-// JWT lives in module-private memory. Reload = logout, by design.
-let inMemoryToken: string | null = null
+// The JWT is held in module memory for the request interceptor and
+// mirrored to localStorage so a page reload keeps the user signed in.
+const TOKEN_KEY = 'vajra.token'
 
+// readStoredToken pulls a persisted JWT from localStorage. Wrapped in a
+// try/catch because Safari private mode throws on any storage access.
+function readStoredToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+let inMemoryToken: string | null = readStoredToken()
+
+// setAuthToken updates the in-memory JWT and mirrors it to localStorage
+// so it survives a reload. Passing null clears both.
 export function setAuthToken(token: string | null) {
   inMemoryToken = token
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    // Storage unavailable (private mode / disabled): fall back to an
+    // in-memory token; the session simply won't survive a reload.
+  }
 }
 
 export function getAuthToken(): string | null {

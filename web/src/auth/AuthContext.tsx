@@ -1,7 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { auth, nodes, setAuthToken, setAuthRefreshHandler } from '../api/client'
+import {
+  ApiError,
+  auth,
+  getAuthToken,
+  nodes,
+  setAuthToken,
+  setAuthRefreshHandler,
+} from '../api/client'
 
 interface AuthState {
   email: string | null
@@ -18,7 +25,12 @@ interface AuthContextValue extends AuthState {
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
-const SESSION_EMAIL_KEY = 'vajra.email'
+// localStorage keys for the persisted session. The JWT itself is owned
+// by the API client (see setAuthToken); the email and expiry are kept
+// here so a page reload can rehydrate the user identity and re-arm the
+// proactive refresh timer without a round-trip.
+const EMAIL_KEY = 'vajra.email'
+const EXPIRES_KEY = 'vajra.token_expires'
 
 async function detectAdmin(): Promise<boolean> {
   try {
@@ -56,12 +68,16 @@ function consumeOAuthHash(): { token: string; email: string | null; expiresAt: s
 export function AuthProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate()
   const justOAuth = useRef(false)
+  // rehydrated is set when this mount restored a token from localStorage
+  // (a page reload). It gates the one-shot token-validation effect below.
+  const rehydrated = useRef(false)
 
   const [state, setState] = useState<AuthState>(() => {
     const oauth = consumeOAuthHash()
     if (oauth) {
       setAuthToken(oauth.token)
-      if (oauth.email) sessionStorage.setItem(SESSION_EMAIL_KEY, oauth.email)
+      if (oauth.email) localStorage.setItem(EMAIL_KEY, oauth.email)
+      if (oauth.expiresAt) localStorage.setItem(EXPIRES_KEY, oauth.expiresAt)
       justOAuth.current = true
       return {
         email: oauth.email,
@@ -70,10 +86,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isAdmin: false,
       }
     }
+    // Rehydrate a prior session: the API client already restored the JWT
+    // from localStorage at module load, so getAuthToken() is the source
+    // of truth for whether a session survived the reload.
+    const token = getAuthToken()
+    if (token) rehydrated.current = true
     return {
-      email: sessionStorage.getItem(SESSION_EMAIL_KEY),
-      token: null,
-      expiresAt: null,
+      email: localStorage.getItem(EMAIL_KEY),
+      token,
+      expiresAt: token ? localStorage.getItem(EXPIRES_KEY) : null,
       isAdmin: false,
     }
   })
@@ -89,10 +110,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     navigate('/sandboxes', { replace: true })
   }, [navigate])
 
+  // After a reload that rehydrated a stored token, confirm the token is
+  // still good before the user keeps acting on it. A successful refresh
+  // re-mints the JWT and re-arms the expiry timer; a 401/403 means the
+  // stored token expired, so clear the session and let the router bounce
+  // to /login. A network error leaves the session intact — the user
+  // stays signed in and the next real request retries the token.
+  useEffect(() => {
+    if (!rehydrated.current) return
+    rehydrated.current = false
+    void (async () => {
+      try {
+        const r = await auth.refresh()
+        setAuthToken(r.token)
+        localStorage.setItem(EXPIRES_KEY, r.expires_at)
+        const isAdmin = await detectAdmin()
+        setState((s) => ({
+          ...s,
+          token: r.token,
+          expiresAt: r.expires_at,
+          isAdmin,
+        }))
+      } catch (e) {
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          setAuthToken(null)
+          localStorage.removeItem(EMAIL_KEY)
+          localStorage.removeItem(EXPIRES_KEY)
+          setState({ email: null, token: null, expiresAt: null, isAdmin: false })
+        }
+        // Network/server error: keep the session and let later requests
+        // retry rather than logging the user out on a transient blip.
+      }
+    })()
+  }, [])
+
   const login = useCallback(async (email: string, password: string) => {
     const r = await auth.login(email, password)
     setAuthToken(r.token)
-    sessionStorage.setItem(SESSION_EMAIL_KEY, email)
+    localStorage.setItem(EMAIL_KEY, email)
+    localStorage.setItem(EXPIRES_KEY, r.expires_at)
     const isAdmin = await detectAdmin()
     setState({ email, token: r.token, expiresAt: r.expires_at, isAdmin })
   }, [])
@@ -106,7 +162,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     setAuthToken(null)
-    sessionStorage.removeItem(SESSION_EMAIL_KEY)
+    localStorage.removeItem(EMAIL_KEY)
+    localStorage.removeItem(EXPIRES_KEY)
     setState({ email: null, token: null, expiresAt: null, isAdmin: false })
   }, [])
 
@@ -124,11 +181,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       try {
         const r = await auth.refresh()
         setAuthToken(r.token)
+        localStorage.setItem(EXPIRES_KEY, r.expires_at)
         setState((s) => ({ ...s, token: r.token, expiresAt: r.expires_at }))
         return r.token
       } catch {
         setAuthToken(null)
-        sessionStorage.removeItem(SESSION_EMAIL_KEY)
+        localStorage.removeItem(EMAIL_KEY)
+        localStorage.removeItem(EXPIRES_KEY)
         setState({ email: null, token: null, expiresAt: null, isAdmin: false })
         return null
       } finally {
@@ -149,6 +208,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Proactively re-mint the token once half its lifetime has elapsed, so
   // a tab left open through a long operation never reaches expiry. Each
   // successful refresh moves expiresAt forward and re-arms this timer.
+  // On a page reload the timer re-arms from the rehydrated expiresAt.
   useEffect(() => {
     if (!state.token || !state.expiresAt) return
     const msLeft = new Date(state.expiresAt).getTime() - Date.now()
