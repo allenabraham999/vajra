@@ -1,21 +1,36 @@
 // Package master — git_clone.go is the post-create git auto-clone hook.
 //
 // When a sandbox create request carries a git_url, master clones that
-// repository into /workspace once the sandbox reaches RUNNING. The hook
-// is spawned as a background goroutine and is fully decoupled from the
-// create dispatch: it watches the sandbox DB row, so it works the same
-// for the synchronous, dispatch-reconcile, and autoscale create paths.
+// repository into /workspace once the sandbox reaches RUNNING.
+//
+// Vajra microVMs are vsock-only and have no outbound network, so the
+// clone cannot run inside the guest. Instead master — which does have
+// internet — clones the repo into a local temp directory, packs the
+// working tree into a tarball, streams the tarball into the sandbox over
+// vsock, and runs one in-guest command to extract it into /workspace.
+// Every guest-side step (tar, chown) is local, so the missing network
+// never matters.
+//
+// The hook is spawned as a background goroutine and is fully decoupled
+// from the create dispatch: it watches the sandbox DB row, so it works
+// the same for the synchronous, dispatch-reconcile, and autoscale create
+// paths.
 //
 // The clone is best-effort. A failure is recorded on the sandbox row
 // (git_clone_status=failed, git_clone_error=<reason>) and surfaced in the
 // dashboard, but it never flips the sandbox out of RUNNING — the user
-// still gets a working box, just an empty /workspace.
+// still gets a working box, just an empty /workspace. A bad or
+// unreachable git_url fails master's own clone cleanly; the reason is
+// reported to the sandbox owner and never crashes master.
 package master
 
 import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,12 +56,15 @@ const (
 	// gitCloneReadyPoll is how often the hook re-reads the sandbox row
 	// while waiting for RUNNING.
 	gitCloneReadyPoll = 250 * time.Millisecond
-	// gitCloneStepTimeout bounds a single network-bound exec step
-	// (apt-get install, git clone) — both can be slow on a cold box.
+	// gitCloneStepTimeout bounds each network/IO-bound step: master's
+	// `git clone`, the vsock tarball upload, and the in-guest extract.
+	// Generous because a large repo on a cold node is slow.
 	gitCloneStepTimeout = 5 * time.Minute
-	// gitChownTimeout bounds the final chown — local and fast.
-	gitChownTimeout = 30 * time.Second
 )
+
+// gitCloneTarGuestPath is where master drops the repo tarball inside the
+// sandbox before extracting it; /tmp is writable on every template.
+const gitCloneTarGuestPath = "/tmp/vajra-git-clone.tar"
 
 // gitCloneSpec carries the optional git auto-clone parameters from a
 // create request through to the post-create hook. The token is held only
@@ -89,9 +107,9 @@ func (req *createSandboxRequest) gitSpec() gitCloneSpec {
 }
 
 // runGitCloneHook is the post-create git auto-clone hook. It waits for
-// the sandbox to reach RUNNING, then clones the requested repository into
-// /workspace via the agent exec flow. Spawned as a goroutine from the
-// create path; it owns its own context and never returns to a handler.
+// the sandbox to reach RUNNING, then transfers the requested repository
+// into /workspace. Spawned as a goroutine from the create path; it owns
+// its own context and never returns to a handler.
 func (h *Handlers) runGitCloneHook(accountID, sandboxID string, git gitCloneSpec) {
 	ctx := context.Background()
 
@@ -155,43 +173,91 @@ func (h *Handlers) waitForGitCloneTarget(ctx context.Context, accountID, sandbox
 	}
 }
 
-// execGitClone runs the three-step clone inside the sandbox via the agent
-// exec flow: install git, clone the repo into /workspace, then hand the
-// tree to the unprivileged user. A non-zero exit on any step aborts and
-// returns an error naming the step that failed.
+// execGitClone transfers the requested repository into the sandbox's
+// /workspace. Because Vajra microVMs have no outbound network, the clone
+// runs on master (gitCloneToTar), is streamed into the guest over vsock,
+// and unpacked by a single local in-guest command. The master-side temp
+// directory is always removed.
 func (h *Handlers) execGitClone(ctx context.Context, agent *AgentClient, sandboxID string, git gitCloneSpec) error {
-	steps := []struct {
-		label   string
-		command string
-		timeout time.Duration
-	}{
-		{"install git", "apt-get install -y git", gitCloneStepTimeout},
-		{"git clone", gitCloneCommand(git), gitCloneStepTimeout},
-		{"chown workspace", "chown -R user:user /workspace", gitChownTimeout},
+	tarPath, cleanup, err := gitCloneToTar(ctx, git)
+	if err != nil {
+		return err
 	}
-	for _, step := range steps {
-		res, err := agent.ExecCommand(ctx, sandboxID, step.command, step.timeout)
-		if err != nil {
-			return fmt.Errorf("%s: %w", step.label, err)
+	defer cleanup()
+
+	// Stream the tarball into the guest over vsock.
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return fmt.Errorf("open tarball: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat tarball: %w", err)
+	}
+	uploadCtx, cancel := context.WithTimeout(ctx, gitCloneStepTimeout)
+	defer cancel()
+	if err := agent.UploadFile(uploadCtx, sandboxID, gitCloneTarGuestPath, 0o644, info.Size(), f); err != nil {
+		return fmt.Errorf("upload repo to sandbox: %w", err)
+	}
+
+	// Extract into /workspace and hand the tree to the guest user. tar,
+	// rm and chown are all local — no guest network needed.
+	extract := fmt.Sprintf(
+		"mkdir -p /workspace && tar -xf %[1]s -C /workspace && rm -f %[1]s && chown -R user:user /workspace",
+		gitCloneTarGuestPath)
+	res, err := agent.ExecCommand(ctx, sandboxID, extract, gitCloneStepTimeout)
+	if err != nil {
+		return fmt.Errorf("extract repo: %w", err)
+	}
+	if res.ExitCode != 0 {
+		detail := strings.TrimSpace(res.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(res.Stdout)
 		}
-		if res.ExitCode != 0 {
-			detail := strings.TrimSpace(res.Stderr)
-			if detail == "" {
-				detail = strings.TrimSpace(res.Stdout)
-			}
-			return fmt.Errorf("%s: exited %d: %s", step.label, res.ExitCode, detail)
-		}
+		return fmt.Errorf("extract repo: exited %d: %s", res.ExitCode, detail)
 	}
 	return nil
 }
 
-// gitCloneCommand builds the `git clone` shell command. The branch and
-// URL are single-quote escaped because the guest agent runs the command
-// via /bin/sh -c.
-func gitCloneCommand(git gitCloneSpec) string {
-	return fmt.Sprintf("git clone -b %s %s /workspace",
-		shellSingleQuote(git.Branch),
-		shellSingleQuote(gitCloneURL(git.URL, git.Token)))
+// gitCloneToTar performs the master-side half of the auto-clone: it
+// clones the repository into a temporary directory and packs the working
+// tree into a tar archive, returning the archive path and a cleanup func
+// the caller must invoke. It is a package var purely so tests can
+// substitute a stub — production always uses defaultGitCloneToTar.
+var gitCloneToTar = defaultGitCloneToTar
+
+// defaultGitCloneToTar is the real gitCloneToTar. A bad URL or missing
+// branch fails the `git clone` here; the error is returned for the hook
+// to record on the sandbox row and never crashes master.
+func defaultGitCloneToTar(ctx context.Context, git gitCloneSpec) (string, func(), error) {
+	workDir, err := os.MkdirTemp("", "vajra-git-clone-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(workDir) }
+
+	// Clone on master. GIT_TERMINAL_PROMPT=0 makes a private repo with no
+	// token fail fast instead of blocking on a credential prompt.
+	repoDir := filepath.Join(workDir, "repo")
+	cloneCtx, cancel := context.WithTimeout(ctx, gitCloneStepTimeout)
+	defer cancel()
+	clone := exec.CommandContext(cloneCtx, "git", "clone", "--depth", "1",
+		"--branch", git.Branch, gitCloneURL(git.URL, git.Token), repoDir)
+	clone.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if out, err := clone.CombinedOutput(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("git clone: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	// Pack the working tree (the shallow .git included) into a tarball.
+	tarPath := filepath.Join(workDir, "repo.tar")
+	pack := exec.CommandContext(ctx, "tar", "-cf", tarPath, "-C", repoDir, ".")
+	if out, err := pack.CombinedOutput(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("tar repo: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return tarPath, cleanup, nil
 }
 
 // gitCloneURL injects the access token into the URL as userinfo so a
@@ -207,12 +273,6 @@ func gitCloneURL(rawURL, token string) string {
 	}
 	u.User = url.User(token)
 	return u.String()
-}
-
-// shellSingleQuote wraps s in single quotes for safe interpolation into a
-// /bin/sh -c command, escaping any embedded single quotes.
-func shellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // redactGitToken strips the access token out of a string before it is

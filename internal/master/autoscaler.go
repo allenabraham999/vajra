@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -383,7 +384,7 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 		"needs_vcpus", demandVCPU, "needs_memory_mb", demandMem)
 	out, err := a.ec2Client.RunInstances(ctx, in)
 	if err != nil {
-		a.broadcastError(fmt.Errorf("autoscale: run instances: %w", err))
+		a.broadcastError(fmt.Errorf("autoscale: %w", classifyLaunchError(err)))
 		return
 	}
 	if len(out.Instances) == 0 {
@@ -404,6 +405,26 @@ func (a *Autoscaler) scaleUp(ctx context.Context) {
 	}
 	a.logger.Info("autoscale: node registered", "node_id", nodeID, "instance_id", instanceID)
 	a.drainQueue(nodeID)
+}
+
+// classifyLaunchError turns a raw EC2 RunInstances failure into a
+// concise, user-facing reason. AWS quota and capacity rejections
+// otherwise reach the sandbox owner as an unreadable nested SDK error
+// string; collapsing the common ones to a clear sentence makes the
+// resulting sandbox ERROR actionable. Anything unrecognised is wrapped
+// verbatim so no detail is lost.
+func classifyLaunchError(err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "VcpuLimitExceeded"),
+		strings.Contains(msg, "InstanceLimitExceeded"),
+		strings.Contains(msg, "MaxInstanceCountExceeded"):
+		return errors.New("EC2 vCPU/instance quota reached — free idle nodes or raise the account limit")
+	case strings.Contains(msg, "InsufficientInstanceCapacity"):
+		return errors.New("EC2 has no capacity for this instance type right now — retry shortly")
+	default:
+		return fmt.Errorf("run instances: %w", err)
+	}
 }
 
 // waitForRegistration polls the nodes table every 5s for up to 5min
