@@ -84,10 +84,24 @@ func NewAgentClient(node *models.Node, sharedSecret string, logger *slog.Logger)
 		nodeID:  id,
 		baseURL: fmt.Sprintf("http://%s:%d", ip, DefaultAgentPort),
 		secret:  sharedSecret,
-		http:    &http.Client{Timeout: agentRequestTimeout},
+		http:    &http.Client{Timeout: agentRequestTimeout, Transport: agentTransport()},
 		retry:   DefaultRetryPolicy(),
 		logger:  logger.With("node_id", id),
 	}
+}
+
+// agentTransport builds the HTTP transport for an AgentClient. The create
+// poller hits GetSandbox every 20ms (see createPollInterval); without
+// connection reuse every poll would pay a fresh TCP handshake. We clone
+// DefaultTransport to keep its sane dial/TLS timeouts and only raise the
+// idle-connection limits so concurrent creates against one node keep
+// their sockets warm.
+func agentTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 50
+	t.IdleConnTimeout = 90 * time.Second
+	return t
 }
 
 // NodeID returns the node this client targets. Useful for logging.

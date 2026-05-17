@@ -36,7 +36,11 @@ const dispatchReconcileTimeout = 5 * time.Second
 // master spawns after dispatching a create. The agent's CreateSandbox is
 // async and returns 202 immediately with state=CREATING; the poller
 // drives the DB row to RUNNING (or ERROR) when the agent's goroutine
-// finishes. 1s ticks keep the user-visible latency low; the 60s ceiling
+// finishes. A pool-hit create finishes on the agent in ~20-30ms, so we
+// tick every 20ms: at a 1s interval an instantly-ready VM still waited
+// up to a full second for the next tick. GetSandbox is a cheap in-memory
+// lookup on the agent and master reuses keep-alive connections (see
+// agentTransport), so polling this fast costs little. The 60s ceiling
 // matches the pessimistic restore time on a warm node.
 //
 // autoscaleCreatePollTimeout is the longer ceiling we use after the
@@ -50,7 +54,7 @@ const dispatchReconcileTimeout = 5 * time.Second
 // reconcilerRecoverRunningSandbox in the reconciler to defend against
 // any remaining races.
 const (
-	createPollInterval         = 1 * time.Second
+	createPollInterval         = 20 * time.Millisecond
 	createPollTimeout          = 60 * time.Second
 	autoscaleCreatePollTimeout = 5 * time.Minute
 )
