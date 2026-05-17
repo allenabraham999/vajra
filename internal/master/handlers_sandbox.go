@@ -156,7 +156,8 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 	schedReq := SchedRequest{
 		AccountID: accountID,
 		VCPUs:     body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
-		Region: body.Region,
+		Region:       body.Region,
+		TemplateHash: templateHash,
 	}
 	cluster, node, err := h.Scheduler.Schedule(r.Context(), schedReq)
 	if err != nil && errors.Is(err, ErrNoCapacity) {
@@ -410,7 +411,8 @@ func (h *Handlers) driveAsyncCreate(
 	schedReq := SchedRequest{
 		AccountID: accountID,
 		VCPUs:     body.VCPUs, MemoryMB: body.MemoryMB, DiskGB: body.DiskGB,
-		Region: body.Region,
+		Region:       body.Region,
+		TemplateHash: templateHash,
 	}
 	cluster, node, err := h.Scheduler.Schedule(ctx, schedReq)
 	if err != nil {

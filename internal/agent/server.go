@@ -318,20 +318,26 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, _ *http.Request) {
 // ok=false is returned — never propagate a half-baked pool sandbox to
 // the API surface.
 func (s *Server) tryAssignFromPool(ctx context.Context, body CreateRequestBody) (*Sandbox, bool) {
-	if body.TemplateHash != "" {
-		stats := s.pool.Stats()
-		if stats.Template != "" && stats.Template != body.TemplateHash {
-			return nil, false
-		}
+	stats := s.pool.Stats()
+	s.logger.Info("pool_assign: trying",
+		"template", body.TemplateHash,
+		"vcpu", body.Config.VCPUs, "mem", body.Config.MemoryMB,
+		"pool_template", stats.Template, "available", stats.Available)
+	if body.TemplateHash != "" && stats.Template != "" && stats.Template != body.TemplateHash {
+		s.logger.Info("pool_assign: skip",
+			"reason", "template_mismatch",
+			"pool_template", stats.Template, "want", body.TemplateHash)
+		return nil, false
 	}
 	ps, err := s.pool.AssignFromPool()
 	if err != nil {
+		s.logger.Info("pool_assign: skip", "reason", "pool_empty", "err", err.Error())
 		return nil, false
 	}
 	resumeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := s.sandboxes.VMM().ResumeVM(resumeCtx, ps.APISocket); err != nil {
-		s.logger.Warn("pool resume failed; destroying pool member", "id", ps.ID, "err", err)
+		s.logger.Warn("pool_assign: skip", "reason", "resume_failed", "id", ps.ID, "err", err)
 		// Best-effort cleanup: bring the host back to a known state. The
 		// pool will replenish itself on the next tick.
 		_ = s.sandboxes.VMM().DestroyVM(context.WithoutCancel(ctx), ps.APISocket)
@@ -346,6 +352,7 @@ func (s *Server) tryAssignFromPool(ctx context.Context, body CreateRequestBody) 
 		sb.Config = cfg
 	}
 	s.sandboxes.AdoptSandbox(sb)
+	s.logger.Info("pool_assign: hit", "sandbox_id", sb.ID, "pool_member", ps.ID)
 	return sb, true
 }
 

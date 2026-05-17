@@ -23,15 +23,30 @@ import (
 // 30s in production, so 90s tolerates two missed beats.
 const heartbeatStaleAfter = 90 * time.Second
 
+// poolProbeTimeout bounds the per-node pre-warm-pool probe PickNode runs
+// when a request carries a template hash. Probes fire concurrently, so
+// this is the worst-case wall time even if one agent is unreachable.
+const poolProbeTimeout = 1 * time.Second
+
 // SchedRequest is what handlers pass to the scheduler. Region is optional;
-// the empty string means "any active cluster".
+// the empty string means "any active cluster". TemplateHash, when set,
+// lets PickNode steer the create onto a node with a matching warm
+// pre-warm pool so the create can be served as an instant pool hit.
 type SchedRequest struct {
-	AccountID string
-	VCPUs     int
-	MemoryMB  int
-	DiskGB    int
-	Region    string
+	AccountID    string
+	VCPUs        int
+	MemoryMB     int
+	DiskGB       int
+	Region       string
+	TemplateHash string
 }
+
+// NodePoolProber reports a node's warm pre-warm pool: the template hash
+// the node pre-warms and how many members are ready to hand out. PickNode
+// uses it to prefer a node that can serve a template-matched create as a
+// pool hit. ok=false (probe failed, or the node runs no pool) means the
+// node simply gets no pool affinity.
+type NodePoolProber func(ctx context.Context, node *models.Node) (template string, available int, ok bool)
 
 // Quota is a per-account ceiling enforced before scheduling. Values are
 // hard caps; CheckQuota rejects a request that would push the account to
@@ -79,6 +94,9 @@ type dbScheduler struct {
 	quota QuotaProvider
 	cache cache.Cache
 	log   *slog.Logger
+	// poolProbe, when set, lets PickNode check each node's pre-warm pool.
+	// nil leaves scheduling purely resource-fit.
+	poolProbe NodePoolProber
 	// now is overridable so tests can pin a deterministic clock for the
 	// stale-heartbeat check. Production uses time.Now.
 	now func() time.Time
@@ -105,6 +123,15 @@ func (d *dbScheduler) WithLogger(l *slog.Logger) *dbScheduler {
 	if l != nil {
 		d.log = l
 	}
+	return d
+}
+
+// WithPoolProber wires a per-node pre-warm-pool probe into the scheduler
+// so PickNode can prefer a node holding a warm member that matches the
+// request's template. nil leaves scheduling purely resource-fit. Returns
+// the receiver for chaining.
+func (d *dbScheduler) WithPoolProber(p NodePoolProber) *dbScheduler {
+	d.poolProbe = p
 	return d
 }
 
@@ -195,6 +222,11 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 		score int
 	}
 	candidates := make([]scored, 0, len(nodes))
+	// fresh collects every ACTIVE, heartbeat-fresh node regardless of
+	// free capacity — the pool-affinity pass below considers it, because
+	// a pool hit reuses an already-running warm VM rather than claiming
+	// fresh capacity.
+	fresh := make([]*models.Node, 0, len(nodes))
 	for _, n := range nodes {
 		if n.State != models.NodeStateActive {
 			continue
@@ -225,6 +257,7 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 		if hb.Before(cutoff) {
 			continue
 		}
+		fresh = append(fresh, n)
 		freeCPU := n.Capacity.TotalCPU - usedCPU
 		freeMemMB := n.Capacity.TotalMemoryMB - usedMemMB
 		freeDiskGB := n.Capacity.TotalDiskGB - usedDiskGB
@@ -239,6 +272,13 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 			(freeDiskGB - req.DiskGB)
 		candidates = append(candidates, scored{node: n, score: score})
 	}
+	// Pool affinity: if the request names a template and a heartbeat-fresh
+	// node holds a warm pre-warm member for it, place there even if that
+	// node would fail the resource-fit filter above — serving from the
+	// pool consumes a VM that is already running, not fresh capacity.
+	if node := d.pickPoolNode(ctx, fresh, req); node != nil {
+		return node, nil
+	}
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
 	}
@@ -250,6 +290,54 @@ func (d *dbScheduler) PickNode(ctx context.Context, cluster *models.Cluster, req
 		return candidates[i].node.ID < candidates[j].node.ID
 	})
 	return candidates[0].node, nil
+}
+
+// pickPoolNode returns the heartbeat-fresh node best placed to serve req
+// as a pre-warm pool hit: one whose pool pre-warms req.TemplateHash and
+// reports at least one warm member ready. Probes run concurrently under
+// poolProbeTimeout so a slow or dead agent can't stall scheduling.
+// Returns nil — and the caller falls back to plain resource-fit — when
+// the request carries no template, no prober is wired, or no node has a
+// matching warm member. Among matches the node with the most warm
+// members wins (best odds the create still hits warm), tie-broken by ID.
+func (d *dbScheduler) pickPoolNode(ctx context.Context, fresh []*models.Node, req SchedRequest) *models.Node {
+	if req.TemplateHash == "" || d.poolProbe == nil || len(fresh) == 0 {
+		return nil
+	}
+	type probed struct {
+		node      *models.Node
+		available int
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, poolProbeTimeout)
+	defer cancel()
+	results := make(chan probed, len(fresh))
+	for _, n := range fresh {
+		go func(n *models.Node) {
+			tmpl, avail, ok := d.poolProbe(probeCtx, n)
+			if !ok || avail <= 0 || tmpl != req.TemplateHash {
+				results <- probed{}
+				return
+			}
+			results <- probed{node: n, available: avail}
+		}(n)
+	}
+	var best probed
+	for range fresh {
+		p := <-results
+		if p.node == nil {
+			continue
+		}
+		if best.node == nil || p.available > best.available ||
+			(p.available == best.available && p.node.ID < best.node.ID) {
+			best = p
+		}
+	}
+	if best.node != nil {
+		d.log.Info("scheduler: pool-affinity placement",
+			"node", best.node.ID, "template", req.TemplateHash,
+			"available", best.available)
+	}
+	return best.node
 }
 
 // CheckQuota enforces both interpretations of "quota": a count of active

@@ -25,6 +25,7 @@ import (
 	"github.com/allenabraham999/vajra/internal/cache"
 	"github.com/allenabraham999/vajra/internal/events"
 	"github.com/allenabraham999/vajra/internal/master"
+	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
 )
 
@@ -139,6 +140,21 @@ func loadConfig() (*config, error) {
 		AgentSecret:   cfg.AgentSharedSecret,
 		ClusterID:     getenvDefault("VAJRA_AUTOSCALE_CLUSTER_ID", "cluster-1"),
 		S3Bucket:      os.Getenv("VAJRA_AUTOSCALE_S3_BUCKET"),
+		// Carry the pre-warm pool config onto autoscaler-launched nodes so
+		// they warm their own pool — otherwise new nodes serve only cold
+		// boots. Reuses the agent's own VAJRA_AGENT_POOL_* env, which the
+		// master process already sees (master + agent share one .env).
+		PoolTemplate: os.Getenv("VAJRA_AGENT_POOL_TEMPLATE"),
+	}
+	if v := os.Getenv("VAJRA_AGENT_POOL_MIN_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.PoolMinSize = n
+		}
+	}
+	if v := os.Getenv("VAJRA_AGENT_POOL_MAX_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Autoscale.PoolMaxSize = n
+		}
 	}
 	if v := os.Getenv("VAJRA_AUTOSCALE_MIN_NODES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -301,7 +317,17 @@ func main() {
 
 	signer := master.NewJWTSigner([]byte(cfg.JWTSecret))
 	pool := master.NewAgentPool(cfg.AgentSharedSecret, logger)
-	scheduler := master.NewScheduler(st, nil).WithCache(c).WithLogger(logger)
+	// Pool-affinity probe: lets PickNode steer template-matched creates
+	// onto a node that already holds a warm pre-warm member, so the
+	// create lands as an instant pool hit instead of a cold boot.
+	poolProber := func(ctx context.Context, node *models.Node) (string, int, bool) {
+		ps, err := pool.ClientFor(node).PoolStats(ctx)
+		if err != nil || ps == nil {
+			return "", 0, false
+		}
+		return ps.Template, ps.Available, true
+	}
+	scheduler := master.NewScheduler(st, nil).WithCache(c).WithLogger(logger).WithPoolProber(poolProber)
 	tracker := master.NewOperationTracker(st)
 	handlers := master.NewHandlers(st, signer, scheduler, pool, tracker)
 	handlers.Logger = logger

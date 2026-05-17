@@ -168,6 +168,9 @@ func (p *PoolManager) Start(ctx context.Context) {
 	if p.stopped.Load() {
 		return
 	}
+	p.logger.Info("pool: warming",
+		"target", p.targetSize, "min", p.minSize, "max", p.maxSize,
+		"template", p.templateHash)
 	p.wg.Add(1)
 	go p.replenishLoop(ctx)
 	p.wg.Add(1)

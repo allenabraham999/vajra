@@ -68,6 +68,16 @@ type AutoscaleConfig struct {
 	// cloud-init's growpart module, which Ubuntu cloud images enable by
 	// default.
 	RootVolumeGB int
+	// PoolTemplate, PoolMinSize, PoolMaxSize propagate the pre-warm pool
+	// config onto autoscaler-launched nodes via cloud-init. Without these
+	// a new node runs pool-less, so every create that lands on it is a
+	// cold boot — and since PickNode's resource-fit heuristic favours the
+	// freshest (emptiest) node, almost every create lands on the new one.
+	// An empty PoolTemplate disables the pool on new nodes (legacy
+	// behaviour). buildUserData applies sane size defaults.
+	PoolTemplate string
+	PoolMinSize  int
+	PoolMaxSize  int
 }
 
 // withDefaults fills in unset numeric knobs so callers don't have to
@@ -724,13 +734,36 @@ Environment=VAJRA_AGENT_CLUSTER_ID=%[3]s
 Environment=VAJRA_AGENT_TOTAL_CPU=${CPU}
 Environment=VAJRA_AGENT_TOTAL_MEMORY_MB=${MEM}
 Environment=VAJRA_AGENT_TOTAL_DISK_GB=${DISK}
-Restart=always
+%[4]sRestart=always
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 systemctl daemon-reload
 systemctl enable --now vajra-agent
-`, a.Config.MasterURL, a.Config.AgentSecret, a.Config.ClusterID)
+`, a.Config.MasterURL, a.Config.AgentSecret, a.Config.ClusterID, a.poolUserDataEnv())
+}
+
+// poolUserDataEnv renders the systemd Environment= lines that turn on a
+// pre-warm pool on an autoscaler-launched node. Empty when no pool
+// template is configured. Sizes fall back to 5/15 (the documented
+// production defaults) when the operator left them unset, so a new node
+// warms a useful pool rather than a zero-size one.
+func (a *Autoscaler) poolUserDataEnv() string {
+	if a.Config.PoolTemplate == "" {
+		return ""
+	}
+	minSize, maxSize := a.Config.PoolMinSize, a.Config.PoolMaxSize
+	if minSize <= 0 {
+		minSize = 5
+	}
+	if maxSize < minSize {
+		maxSize = 15
+	}
+	return fmt.Sprintf(
+		"Environment=VAJRA_AGENT_POOL_TEMPLATE=%s\n"+
+			"Environment=VAJRA_AGENT_POOL_MIN_SIZE=%d\n"+
+			"Environment=VAJRA_AGENT_POOL_MAX_SIZE=%d\n",
+		a.Config.PoolTemplate, minSize, maxSize)
 }
 
 // AutoscaleStatus is the body of GET /v1/admin/autoscale.
