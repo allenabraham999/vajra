@@ -47,6 +47,7 @@ type Store interface {
 	Usage() UsageStore
 	Builds() BuildStore
 	Webhooks() WebhookStore
+	Transactions() TransactionStore
 
 	// Ping verifies a working database connection.
 	Ping(ctx context.Context) error
@@ -70,7 +71,33 @@ type AccountStore interface {
 	GetByEmail(ctx context.Context, email string) (*models.Account, error)
 	List(ctx context.Context, opts ListOpts) ([]*models.Account, error)
 	Delete(ctx context.Context, id string) error
+	// DecrementCredits subtracts amount (USD) from credits_remaining in a
+	// single atomic UPDATE. The balance is floored at -CreditOverdraftUSD
+	// so a meter that keeps ticking past zero cannot run a tenant
+	// arbitrarily far into the red.
+	DecrementCredits(ctx context.Context, accountID string, amount float64) error
+	// IncrementCredits adds amount (USD) to credits_remaining. Used by the
+	// Stripe webhook when a payment clears and by the admin panel's manual
+	// "add credits" action.
+	IncrementCredits(ctx context.Context, accountID string, amount float64) error
+	// SetAdmin flips the is_admin flag. Used by the admin panel's
+	// promote/demote action and back-filled by the login handler for
+	// accounts whose email is in the VAJRA_ADMIN_EMAIL allowlist.
+	SetAdmin(ctx context.Context, id string, isAdmin bool) error
+	// SetSuspended flips the suspended flag from the admin panel.
+	SetSuspended(ctx context.Context, id string, suspended bool) error
+	// UpdateLastLogin stamps last_login. Called best-effort by the login
+	// handler so operators can spot dormant accounts.
+	UpdateLastLogin(ctx context.Context, id string, ts time.Time) error
+	// UpdatePassword replaces the stored bcrypt hash. Used by the admin
+	// password-reset action.
+	UpdatePassword(ctx context.Context, id, passwordHash string) error
 }
+
+// CreditOverdraftUSD is the floor DecrementCredits clamps to: a running
+// sandbox may push a tenant slightly negative between top-ups, but never
+// past this limit.
+const CreditOverdraftUSD = 5.0
 
 // APIKeyStore manages API key records. GetByHash is the auth hot path —
 // implementations should keep a tight, indexed lookup on key_hash.
@@ -125,10 +152,18 @@ type SandboxStore interface {
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Sandbox, error)
 	ListByNode(ctx context.Context, nodeID string, opts ListOpts) ([]*models.Sandbox, error)
 	ListByState(ctx context.Context, state models.SandboxState, opts ListOpts) ([]*models.Sandbox, error)
+	// ListAll returns sandboxes across every account, newest first. It is
+	// the admin panel's "all sandboxes" view and is never reachable from a
+	// tenant request — the /v1/admin/* surface gates it.
+	ListAll(ctx context.Context, opts ListOpts) ([]*models.Sandbox, error)
 	UpdateState(ctx context.Context, accountID, id string, state models.SandboxState) error
 	// RecordBootMetrics stamps time_to_running_ms + pool_hit, called once
 	// when a sandbox first reaches RUNNING. Account-scoped.
 	RecordBootMetrics(ctx context.Context, accountID, id string, timeToRunningMs int64, poolHit bool) error
+	// UpdateGitClone records the post-create git auto-clone status (and
+	// error message, when the clone failed) on the sandbox row. Driven by
+	// the git-clone hook; account-scoped.
+	UpdateGitClone(ctx context.Context, accountID, id, status, errMsg string) error
 	UpdatePlacement(ctx context.Context, id string, clusterID, nodeID string) error
 	// UpdateLastActivity stamps the activity column without touching
 	// updated_at — driven by exec / file upload / terminal connect
@@ -219,4 +254,20 @@ type WebhookStore interface {
 	ListByAccount(ctx context.Context, accountID string, opts ListOpts) ([]*models.Webhook, error)
 	ListActiveByEvent(ctx context.Context, accountID, event string) ([]*models.Webhook, error)
 	Delete(ctx context.Context, accountID, id string) error
+}
+
+// TransactionStore is the ledger of Stripe credit purchases. A purchase
+// is Created in 'pending' and resolved by MarkCompleted when the signed
+// webhook confirms payment.
+type TransactionStore interface {
+	Create(ctx context.Context, t *models.Transaction) error
+	// MarkCompleted flips the pending row for stripeSessionID to
+	// 'completed'. It reports whether a row actually transitioned: a
+	// false return means the session was unknown or already completed,
+	// which lets the webhook handler stay idempotent against Stripe's
+	// at-least-once delivery and never double-credit an account.
+	MarkCompleted(ctx context.Context, stripeSessionID string) (bool, error)
+	// ListByAccount returns an account's transactions, most recent first,
+	// capped at limit rows.
+	ListByAccount(ctx context.Context, accountID string, limit int) ([]*models.Transaction, error)
 }

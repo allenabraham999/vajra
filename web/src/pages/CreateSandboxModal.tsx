@@ -53,11 +53,19 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
   const [diskGB, setDiskGB] = useState(3)
   const [autoStop, setAutoStop] = useState(15)
   const [autoArchive, setAutoArchive] = useState(1440)
+  const [gitUrl, setGitUrl] = useState('')
+  const [gitBranch, setGitBranch] = useState('main')
+  const [gitToken, setGitToken] = useState('')
+  const [showToken, setShowToken] = useState(false)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     if (!open) return
     setName(prefillSnapshot ? `${prefillSnapshot.sandbox_name}-restored` : '')
+    setGitUrl('')
+    setGitBranch('main')
+    setGitToken('')
+    setShowToken(false)
     api.templates.list().then((ts) => {
       setTemplates(ts)
       if (ts.length > 0 && !templateId) setTemplateId(ts[0].id)
@@ -103,6 +111,10 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
         disk_gb: diskGB,
         auto_stop_minutes: autoStop,
         auto_archive_minutes: autoArchive,
+        git_url: gitUrl.trim() || undefined,
+        git_branch: gitUrl.trim() ? gitBranch.trim() || 'main' : undefined,
+        git_token:
+          gitUrl.trim() && gitToken.trim() ? gitToken.trim() : undefined,
       })
       toast.success(`Sandbox "${sb.name}" created`)
       onCreated(sb)
@@ -241,6 +253,55 @@ export default function CreateSandboxModal({ open, onClose, onCreated, prefillSn
               ))}
             </select>
           </Field>
+        </div>
+
+        <div className="space-y-3 border-t border-zinc-800 pt-3">
+          <p className="text-xs text-zinc-400">
+            Git repository <span className="text-zinc-600">(optional)</span>
+          </p>
+          <Field label="Repository URL">
+            <input
+              value={gitUrl}
+              onChange={(e) => setGitUrl(e.target.value)}
+              placeholder="https://github.com/user/repo"
+              className={inputCls}
+            />
+          </Field>
+          {gitUrl.trim() && (
+            <>
+              <Field label="Branch">
+                <input
+                  value={gitBranch}
+                  onChange={(e) => setGitBranch(e.target.value)}
+                  placeholder="main"
+                  className={inputCls}
+                />
+              </Field>
+              <button
+                type="button"
+                onClick={() => setShowToken((v) => !v)}
+                className="text-[11px] text-teal-400 hover:text-teal-300"
+              >
+                {showToken ? '− Hide token' : '+ Private repo? Add GitHub token'}
+              </button>
+              {showToken && (
+                <Field label="GitHub token">
+                  <input
+                    type="password"
+                    value={gitToken}
+                    onChange={(e) => setGitToken(e.target.value)}
+                    placeholder="ghp_…"
+                    autoComplete="off"
+                    className={inputCls}
+                  />
+                </Field>
+              )}
+              <p className="text-[11px] text-zinc-500">
+                Cloned into <span className="font-mono">/workspace</span> once
+                the sandbox is running.
+              </p>
+            </>
+          )}
         </div>
 
         <div className="flex items-center justify-end gap-2 pt-2 border-t border-zinc-800">

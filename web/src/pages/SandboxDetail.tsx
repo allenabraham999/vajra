@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Play, Square, Trash2, Camera, Upload, Download, Copy } from 'lucide-react'
-import api, { ApiError, getAuthToken } from '../api/client'
+import { ArrowLeft, Play, Square, Trash2, Camera, Upload, Download, Copy, Pause, Eraser } from 'lucide-react'
+import api, { ApiError, getAuthToken, type LogEntry, type LogSource } from '../api/client'
 import type { ExecResult, FileEntry, Sandbox, Snapshot } from '../api/types'
 import StateBadge from '../components/StateBadge'
 import Spinner from '../components/Spinner'
@@ -11,7 +11,7 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 
-type Tab = 'terminal' | 'exec' | 'files' | 'snapshots'
+type Tab = 'terminal' | 'exec' | 'files' | 'snapshots' | 'logs'
 
 export default function SandboxDetailPage() {
   const { id = '' } = useParams()
@@ -115,11 +115,12 @@ export default function SandboxDetailPage() {
             />
           </div>
         </div>
+        <GitCloneBanner sandbox={sandbox} />
       </div>
 
       <div className="border-b border-zinc-900 px-4">
         <div className="flex gap-1">
-          {(['terminal', 'exec', 'files', 'snapshots'] as Tab[]).map((t) => (
+          {(['terminal', 'exec', 'files', 'snapshots', 'logs'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -140,6 +141,7 @@ export default function SandboxDetailPage() {
         {tab === 'exec' && <ExecTab sandboxId={id} />}
         {tab === 'files' && <FilesTab sandboxId={id} />}
         {tab === 'snapshots' && <SnapshotsTab sandboxId={id} sandboxName={sandbox.name} />}
+        {tab === 'logs' && <LogsTab sandboxId={id} />}
       </div>
     </>
   )
@@ -171,6 +173,42 @@ function Btn({
       {busy ? <Spinner size={12} /> : icon}
       {label}
     </button>
+  )
+}
+
+// GitCloneBanner surfaces the post-create git auto-clone hook: a spinner
+// while the repo is cloning, a warning when it failed, a subtle
+// confirmation once it finished. Renders nothing when no repo was
+// requested at create time.
+function GitCloneBanner({ sandbox }: { sandbox: Sandbox }) {
+  if (!sandbox.git_url) return null
+  const repo = <span className="font-mono text-zinc-200">{sandbox.git_url}</span>
+
+  if (sandbox.git_clone_status === 'failed') {
+    return (
+      <div className="mt-3 rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+        <span className="font-medium">Git clone failed:</span>{' '}
+        <span className="font-mono break-all">
+          {sandbox.git_clone_error || 'unknown error'}
+        </span>
+      </div>
+    )
+  }
+  if (sandbox.git_clone_status === 'done') {
+    return (
+      <div className="mt-3 rounded-md border border-teal-900/60 bg-teal-950/20 px-3 py-2 text-xs text-teal-300">
+        Cloned {repo} into <span className="font-mono">/workspace</span>
+      </div>
+    )
+  }
+  // '' | 'pending' | 'cloning' — the clone is still in flight.
+  return (
+    <div className="mt-3 flex items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-300">
+      <Spinner size={12} />
+      <span>
+        Cloning {repo} into <span className="font-mono">/workspace</span>…
+      </span>
+    </div>
   )
 }
 
@@ -692,5 +730,235 @@ function SnapshotsTab({ sandboxId, sandboxName }: { sandboxId: string; sandboxNa
         )}
       </div>
     </div>
+  )
+}
+
+// --- LOGS ---
+
+type LogFilter = LogSource | 'all'
+
+// SOURCE_META drives the per-source badge in the log viewer: a single
+// letter (M/A/G) tinted to tell master, agent, and guest lines apart.
+const SOURCE_META: Record<LogSource, { badge: string; cls: string }> = {
+  master: { badge: 'M', cls: 'bg-teal-500/15 text-teal-300' },
+  agent: { badge: 'A', cls: 'bg-sky-500/15 text-sky-300' },
+  guest: { badge: 'G', cls: 'bg-violet-500/15 text-violet-300' },
+}
+
+// levelClass colours a line by severity: INFO zinc, WARN amber, ERROR red.
+function levelClass(level: string): string {
+  if (level === 'ERROR') return 'text-red-300'
+  if (level === 'WARN') return 'text-amber-300'
+  return 'text-zinc-300'
+}
+
+// logKey is the dedupe identity of an entry — the same key the master
+// stream handler uses — so the REST backlog and the live socket can
+// overlap without producing visible duplicates.
+function logKey(e: LogEntry): string {
+  return `${e.source}|${e.timestamp}|${e.message}`
+}
+
+function LogsTab({ sandboxId }: { sandboxId: string }) {
+  const toast = useToast()
+  const [entries, setEntries] = useState<LogEntry[]>([])
+  const [filter, setFilter] = useState<LogFilter>('all')
+  const [paused, setPaused] = useState(false)
+  const [connected, setConnected] = useState(false)
+
+  // allRef accumulates every entry regardless of pause state; entries
+  // (the rendered list) is only refreshed from it while not paused.
+  const allRef = useRef<LogEntry[]>([])
+  const seenRef = useRef<Set<string>>(new Set())
+  const pausedRef = useRef(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    pausedRef.current = paused
+  }, [paused])
+
+  // ingest merges new entries, dedupes, keeps chronological order, and
+  // (unless paused) flushes the result to the rendered list.
+  function ingest(incoming: LogEntry[]) {
+    let changed = false
+    for (const e of incoming) {
+      const k = logKey(e)
+      if (seenRef.current.has(k)) continue
+      seenRef.current.add(k)
+      allRef.current.push(e)
+      changed = true
+    }
+    if (!changed) return
+    allRef.current.sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    )
+    if (!pausedRef.current) setEntries([...allRef.current])
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    // Initial backlog over plain HTTP, then a live tail over WebSocket.
+    api.sandboxes
+      .logs(sandboxId, 'all', 500)
+      .then((r) => {
+        if (!cancelled) ingest(r.entries ?? [])
+      })
+      .catch(() => {})
+
+    // The stream route sits outside the Authorization-header middleware
+    // (a browser WebSocket can't set headers), so the JWT rides in the
+    // query string — same pattern as the terminal.
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const token = getAuthToken() ?? ''
+    const url =
+      `${proto}://${window.location.host}/v1/sandboxes/${sandboxId}/logs/stream` +
+      `?token=${encodeURIComponent(token)}`
+    const ws = new WebSocket(url)
+    ws.onopen = () => setConnected(true)
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return
+      try {
+        ingest(JSON.parse(ev.data) as LogEntry[])
+      } catch {
+        /* ignore a malformed frame */
+      }
+    }
+    ws.onerror = () => setConnected(false)
+    ws.onclose = () => setConnected(false)
+
+    return () => {
+      cancelled = true
+      ws.close()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sandboxId])
+
+  // Auto-scroll to the newest line as the list grows, unless paused.
+  useEffect(() => {
+    if (paused) return
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [entries, paused])
+
+  function resume() {
+    setEntries([...allRef.current])
+    setPaused(false)
+  }
+
+  function clear() {
+    allRef.current = []
+    seenRef.current = new Set()
+    setEntries([])
+  }
+
+  function download() {
+    const text = allRef.current
+      .map((e) => `${e.timestamp} [${e.source.toUpperCase()}] ${e.level} ${e.message}`)
+      .join('\n')
+    const blob = new Blob([text + '\n'], { type: 'text/plain' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `sandbox-${sandboxId.slice(0, 12)}-logs.log`
+    a.click()
+    URL.revokeObjectURL(a.href)
+    toast.success('Logs downloaded')
+  }
+
+  const shown = entries.filter((e) => filter === 'all' || e.source === filter)
+  const buffered = allRef.current.length - entries.length
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1">
+          {(['all', 'master', 'agent', 'guest'] as LogFilter[]).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`rounded px-2 py-1 text-[11px] uppercase tracking-wider font-mono transition-colors ${
+                filter === f
+                  ? 'bg-teal-500/15 text-teal-300'
+                  : 'text-zinc-500 hover:text-zinc-200'
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono">
+            {connected ? (
+              <span className="text-teal-400">● live</span>
+            ) : (
+              <span className="text-zinc-500">○ offline</span>
+            )}
+          </span>
+          <LogBtn
+            onClick={() => (paused ? resume() : setPaused(true))}
+            icon={paused ? <Play size={12} /> : <Pause size={12} />}
+            label={paused ? 'Resume' : 'Pause'}
+          />
+          <LogBtn onClick={clear} icon={<Eraser size={12} />} label="Clear" />
+          <LogBtn onClick={download} icon={<Download size={12} />} label="Download" />
+        </div>
+      </div>
+
+      <div
+        ref={scrollRef}
+        className="h-[60vh] overflow-y-auto rounded-lg border border-zinc-900 bg-zinc-950 p-3 font-mono text-xs leading-relaxed"
+      >
+        {shown.length === 0 ? (
+          <div className="grid h-full place-items-center text-zinc-600">
+            No log entries{filter !== 'all' ? ` for ${filter}` : ''} yet.
+          </div>
+        ) : (
+          shown.map((e, i) => {
+            const meta = SOURCE_META[e.source] ?? SOURCE_META.agent
+            return (
+              <div key={i} className="flex gap-2 py-0.5 hover:bg-zinc-900/40">
+                <span className="shrink-0 text-zinc-600">
+                  {new Date(e.timestamp).toLocaleTimeString()}
+                </span>
+                <span
+                  className={`shrink-0 rounded px-1 font-bold ${meta.cls}`}
+                  title={e.source}
+                >
+                  {meta.badge}
+                </span>
+                <span className={`whitespace-pre-wrap break-all ${levelClass(e.level)}`}>
+                  {e.message}
+                </span>
+              </div>
+            )
+          })
+        )}
+      </div>
+      {paused && (
+        <div className="text-[11px] font-mono text-amber-400">
+          paused — {buffered > 0 ? `${buffered} new line(s) buffered` : 'no new lines'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// LogBtn is the small bordered action button shared by the logs toolbar.
+function LogBtn({
+  onClick,
+  icon,
+  label,
+}: {
+  onClick: () => void
+  icon: React.ReactNode
+  label: string
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="inline-flex items-center gap-1 rounded border border-zinc-800 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800 transition-colors"
+    >
+      {icon}
+      {label}
+    </button>
   )
 }

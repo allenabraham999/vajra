@@ -27,6 +27,9 @@ type ServerConfig struct {
 	Logger         *slog.Logger
 	InternalSecret string
 	AdminAccountID string
+	// AdminEmails is the VAJRA_ADMIN_EMAIL allowlist (lowercased): any
+	// account with a matching email reaches the /v1/admin/* surface.
+	AdminEmails []string
 	// RateLimitRPS is the per-account ceiling for the authed surface; 0
 	// falls back to DefaultRateLimitRPS. Anonymous traffic (login,
 	// register) shares a single bucket at the same rate.
@@ -53,6 +56,7 @@ func NewServer(cfg ServerConfig, h *Handlers) *Server {
 		cfg.Addr = ":8080"
 	}
 	h.AdminAccountID = cfg.AdminAccountID
+	h.AdminEmails = cfg.AdminEmails
 	if h.Logger == nil {
 		h.Logger = cfg.Logger
 	}
@@ -76,6 +80,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /version", h.getVersion)
 	mux.HandleFunc("GET /v1/docs", h.docsSwaggerUI)
 	mux.HandleFunc("GET /v1/docs/openapi.yaml", h.docsOpenAPISpec)
+	// Billing config probe (safe to expose) and the Stripe webhook. The
+	// webhook carries no account auth by design — its Stripe-Signature
+	// header is verified against the signing secret inside the handler.
+	mux.HandleFunc("GET /v1/billing/config", h.getBillingConfig)
+	mux.HandleFunc("POST /v1/billing/webhook", h.stripeWebhook)
 	// Rate-limit auth endpoints under the shared "anonymous" bucket so a
 	// brute-force login loop can't outpace a single tenant's quota.
 	mux.Handle("POST /v1/auth/register", s.limiter.Middleware(http.HandlerFunc(h.register)))
@@ -92,6 +101,9 @@ func (s *Server) Routes() http.Handler {
 	// Authorization header; terminalSandbox authenticates from the
 	// ?token= query parameter instead.
 	mux.HandleFunc("GET /v1/sandboxes/{id}/terminal", h.terminalSandbox)
+	// Per-sandbox live log stream — also a WebSocket, also authenticated
+	// from the ?token= query parameter for the same header-less reason.
+	mux.HandleFunc("GET /v1/sandboxes/{id}/logs/stream", h.streamSandboxLogs)
 
 	// Authed routes — wrap each with AuthMiddleware + the per-account
 	// rate limiter. The limiter is applied AFTER auth so the bucket is
@@ -137,6 +149,7 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"DELETE /v1/sandboxes/{id}":             h.destroySandbox,
 		"POST /v1/sandboxes/{id}/snapshot":      h.snapshotSandbox,
 		"GET /v1/sandboxes/{id}/snapshots":      h.listSandboxSnapshots,
+		"GET /v1/sandboxes/{id}/logs":           h.listSandboxLogs,
 		"POST /v1/sandboxes/{id}/archive":       h.archiveSandbox,
 		"POST /v1/sandboxes/{id}/rehydrate":     h.rehydrateSandbox,
 		"POST /v1/sandboxes/{id}/migrate":       h.migrateSandbox,
@@ -181,8 +194,31 @@ func (s *Server) authedRoutes() map[string]http.HandlerFunc {
 		"GET /v1/admin/autoscale":          h.getAutoscaleStatus,
 		"POST /v1/admin/autoscale/trigger": h.triggerAutoscale,
 
+		// Admin panel — operator-only cluster console. Every handler is
+		// gated by requireAdmin (is_admin column / VAJRA_ADMIN_EMAIL).
+		"GET /v1/admin/cluster/overview":           h.adminClusterOverview,
+		"GET /v1/admin/nodes":                      h.adminListNodes,
+		"POST /v1/admin/nodes/{id}/drain":          h.adminDrainNode,
+		"POST /v1/admin/nodes/{id}/cordon":         h.adminCordonNode,
+		"POST /v1/admin/nodes/{id}/uncordon":       h.adminUncordonNode,
+		"POST /v1/admin/nodes/{id}/terminate":      h.adminTerminateNode,
+		"GET /v1/admin/sandboxes":                  h.adminListSandboxes,
+		"POST /v1/admin/sandboxes/{id}/stop":       h.adminStopSandbox,
+		"DELETE /v1/admin/sandboxes/{id}":          h.adminDestroySandbox,
+		"GET /v1/admin/accounts":                   h.adminListAccounts,
+		"POST /v1/admin/accounts/{id}/credits":     h.adminAddCredits,
+		"POST /v1/admin/accounts/{id}/suspend":     h.adminSuspendAccount,
+		"POST /v1/admin/accounts/{id}/promote":     h.adminPromoteAccount,
+		"POST /v1/admin/accounts/{id}/reset-password": h.adminResetPassword,
+		"GET /v1/admin/logs":                       h.adminLogs,
+
 		// Usage
-		"GET /v1/usage": h.getUsage,
+		"GET /v1/usage":         h.getUsage,
+		"GET /v1/usage/summary": h.getUsageSummary,
+
+		// Billing — Stripe credit purchases.
+		"POST /v1/billing/checkout":     h.createCheckout,
+		"GET /v1/billing/transactions":  h.listTransactions,
 
 		// Pre-warm pool
 		"GET /v1/pool/stats": h.getPoolStats,

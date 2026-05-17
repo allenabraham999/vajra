@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 
@@ -10,13 +11,66 @@ import (
 
 type pgAccountStore struct{ ext sqlx.ExtContext }
 
-const accountColumns = `id, email, password_hash, created_at`
+// accountColumns is the SELECT projection. credits_remaining, is_admin,
+// suspended and last_login are read here but never written by Create —
+// new rows inherit the column DEFAULTs (demo credit grant, non-admin,
+// not suspended, NULL last_login).
+const accountColumns = `id, email, password_hash, created_at, credits_remaining, is_admin, suspended, last_login`
 
 func (s *pgAccountStore) Create(ctx context.Context, a *models.Account) error {
-	const q = `INSERT INTO accounts (` + accountColumns + `)
+	const q = `INSERT INTO accounts (id, email, password_hash, created_at)
 	           VALUES (:id, :email, :password_hash, :created_at)`
 	_, err := sqlx.NamedExecContext(ctx, s.ext, q, a)
 	return translate(err)
+}
+
+// SetAdmin flips the is_admin flag for one account.
+func (s *pgAccountStore) SetAdmin(ctx context.Context, id string, isAdmin bool) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts SET is_admin = $2 WHERE id = $1`, id, isAdmin)
+	return expectAffected(res, err)
+}
+
+// SetSuspended flips the suspended flag for one account.
+func (s *pgAccountStore) SetSuspended(ctx context.Context, id string, suspended bool) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts SET suspended = $2 WHERE id = $1`, id, suspended)
+	return expectAffected(res, err)
+}
+
+// UpdateLastLogin stamps last_login for one account.
+func (s *pgAccountStore) UpdateLastLogin(ctx context.Context, id string, ts time.Time) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts SET last_login = $2 WHERE id = $1`, id, ts.UTC())
+	return expectAffected(res, err)
+}
+
+// UpdatePassword replaces the stored bcrypt hash for one account.
+func (s *pgAccountStore) UpdatePassword(ctx context.Context, id, passwordHash string) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts SET password_hash = $2 WHERE id = $1`, id, passwordHash)
+	return expectAffected(res, err)
+}
+
+// DecrementCredits subtracts amount from credits_remaining, flooring the
+// balance at -CreditOverdraftUSD so a meter that keeps charging a tenant
+// past zero cannot drive the balance arbitrarily negative.
+func (s *pgAccountStore) DecrementCredits(ctx context.Context, accountID string, amount float64) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts
+		    SET credits_remaining = GREATEST(credits_remaining - $2, $3)
+		  WHERE id = $1`,
+		accountID, amount, -CreditOverdraftUSD)
+	return expectAffected(res, err)
+}
+
+// IncrementCredits adds amount to credits_remaining. Called when a Stripe
+// payment clears.
+func (s *pgAccountStore) IncrementCredits(ctx context.Context, accountID string, amount float64) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE accounts SET credits_remaining = credits_remaining + $2 WHERE id = $1`,
+		accountID, amount)
+	return expectAffected(res, err)
 }
 
 func (s *pgAccountStore) GetByID(ctx context.Context, id string) (*models.Account, error) {

@@ -55,7 +55,11 @@ type config struct {
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// LogTap tees every sandbox-tagged log record into an in-memory ring
+	// buffer so the dashboard's per-sandbox logs viewer can replay agent
+	// events; records still pass through to the normal JSON stdout sink.
+	logBuf := agent.NewLogBuffer()
+	logger := slog.New(agent.NewLogTap(slog.NewJSONHandler(os.Stdout, nil), logBuf))
 	slog.SetDefault(logger)
 
 	cfg, err := loadConfig()
@@ -76,14 +80,14 @@ func main() {
 		"capacity_disk_gb", cfg.totalDiskGB,
 	)
 
-	if err := run(ctx, cfg, logger); err != nil {
+	if err := run(ctx, cfg, logger, logBuf); err != nil {
 		slog.Error("vajra-agent failed", "err", err)
 		os.Exit(1)
 	}
 	slog.Info("vajra-agent shutting down cleanly")
 }
 
-func run(ctx context.Context, cfg config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg config, logger *slog.Logger, logBuf *agent.LogBuffer) error {
 	vm := vmm.NewVMManager(logger).
 		WithBinary(cfg.chBinary).
 		WithSocketDir(cfg.socketDir)
@@ -160,6 +164,7 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 
 	srv := agent.NewServer(cfg.listenAddr, sandboxes, pool, logger)
 	srv.SetArchiveManager(archives)
+	srv.SetLogBuffer(logBuf)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		return fmt.Errorf("http server: %w", err)
 	}

@@ -188,6 +188,10 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 // writeBinary sends payload as a binary data frame.
 func (c *wsConn) writeBinary(p []byte) error { return c.writeFrame(wsOpcodeBinary, p) }
 
+// writeText sends payload as a text data frame. The logs stream uses
+// this to push JSON entry batches to the browser.
+func (c *wsConn) writeText(p []byte) error { return c.writeFrame(wsOpcodeText, p) }
+
 // writePong replies to a client ping; the payload must echo the ping's.
 func (c *wsConn) writePong(p []byte) error { return c.writeFrame(wsOpcodePong, p) }
 

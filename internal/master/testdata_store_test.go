@@ -69,6 +69,7 @@ func (f *fakeStore) ShareLinks() store.ShareLinkStore { return nil }
 func (f *fakeStore) Usage() store.UsageStore          { return nil }
 func (f *fakeStore) Builds() store.BuildStore         { return nil }
 func (f *fakeStore) Webhooks() store.WebhookStore     { return nil }
+func (f *fakeStore) Transactions() store.TransactionStore { return nil }
 func (f *fakeStore) Ping(context.Context) error       { return nil }
 func (f *fakeStore) WithTx(context.Context, func(store.Store) error) error {
 	return errUnimplemented
@@ -182,6 +183,16 @@ func (f *fakeSandboxStore) ListByNode(_ context.Context, nodeID string, _ store.
 func (f *fakeSandboxStore) ListByState(context.Context, models.SandboxState, store.ListOpts) ([]*models.Sandbox, error) {
 	return nil, errUnimplemented
 }
+func (f *fakeSandboxStore) ListAll(context.Context, store.ListOpts) ([]*models.Sandbox, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := []*models.Sandbox{}
+	for _, sb := range f.byID {
+		out = append(out, sb)
+	}
+	return out, nil
+}
 func (f *fakeSandboxStore) UpdateState(_ context.Context, accountID, id string, state models.SandboxState) error {
 	f.updateStateCalls = append(f.updateStateCalls, sandboxStateUpdate{
 		AccountID: accountID, ID: id, State: state,
@@ -198,6 +209,13 @@ func (f *fakeSandboxStore) RecordBootMetrics(_ context.Context, _, id string, ms
 	if sb, ok := f.byID[id]; ok {
 		sb.TimeToRunningMS = &ms
 		sb.PoolHit = &poolHit
+	}
+	return nil
+}
+func (f *fakeSandboxStore) UpdateGitClone(_ context.Context, _, id, status, errMsg string) error {
+	if sb, ok := f.byID[id]; ok {
+		sb.GitCloneStatus = status
+		sb.GitCloneError = errMsg
 	}
 	return nil
 }

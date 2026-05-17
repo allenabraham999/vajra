@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/allenabraham999/vajra/internal/cache"
@@ -76,6 +77,13 @@ type createSandboxRequest struct {
 	Region             string `json:"region,omitempty"`
 	AutoStopMinutes    *int   `json:"auto_stop_minutes,omitempty"`
 	AutoArchiveMinutes *int   `json:"auto_archive_minutes,omitempty"`
+	// Git auto-clone (all optional). When GitURL is set, master clones the
+	// repository into /workspace once the sandbox reaches RUNNING. GitBranch
+	// defaults to "main". GitToken authenticates private-repo clones; it is
+	// used transiently and never persisted.
+	GitURL    string `json:"git_url,omitempty"`
+	GitBranch string `json:"git_branch,omitempty"`
+	GitToken  string `json:"git_token,omitempty"`
 }
 
 // validate returns a user-facing error for malformed input.
@@ -97,6 +105,12 @@ func (req *createSandboxRequest) validate() error {
 	}
 	if req.VCPUs <= 0 || req.MemoryMB <= 0 || req.DiskGB <= 0 {
 		return fmt.Errorf("vcpus, memory_mb, disk_gb must be positive")
+	}
+	if req.GitURL != "" {
+		u, err := url.Parse(req.GitURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("git_url must be an http(s) URL")
+		}
 	}
 	return nil
 }
@@ -218,6 +232,7 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 			autoArchive = 0
 		}
 	}
+	gs := body.gitSpec()
 	sb := &models.Sandbox{
 		ID: sandboxID, Name: body.Name, AccountID: accountID,
 		NodeID: &node.ID, ClusterID: &cluster.ID,
@@ -230,6 +245,9 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		AutoArchiveMinutes: autoArchive,
 		LastActivity:       now,
 		CreatedAt:          now, UpdatedAt: now,
+		GitURL:         gs.URL,
+		GitBranch:      gs.Branch,
+		GitCloneStatus: gs.initialStatus(),
 	}
 	if err := h.Store.Sandboxes().Create(r.Context(), sb); err != nil {
 		h.log().Error("createSandbox: insert", "err", err)
@@ -276,6 +294,14 @@ func (h *Handlers) executeCreate(w http.ResponseWriter, r *http.Request, account
 		go h.pollAgentCreate(accountID, sandboxID, opID, agent, createPollTimeout, fromPool)
 	}
 
+	// Post-create hook: clone the requested repo into /workspace once the
+	// sandbox reaches RUNNING. Best-effort and fully decoupled — the hook
+	// watches the DB row, so it covers the happy, reconcile, and autoscale
+	// paths alike. Skipped entirely when no git_url was provided.
+	if gs.enabled() {
+		go h.runGitCloneHook(accountID, sandboxID, gs)
+	}
+
 	out, err := h.Store.Sandboxes().GetByID(r.Context(), accountID, sandboxID)
 	if err != nil {
 		h.log().Error("createSandbox: refetch", "err", err)
@@ -318,6 +344,7 @@ func (h *Handlers) startAsyncCreate(
 			autoArchive = 0
 		}
 	}
+	gs := body.gitSpec()
 	sb := &models.Sandbox{
 		ID: sandboxID, Name: body.Name, AccountID: accountID,
 		TemplateID: templateID,
@@ -329,6 +356,9 @@ func (h *Handlers) startAsyncCreate(
 		AutoArchiveMinutes: autoArchive,
 		LastActivity:       now,
 		CreatedAt:          now, UpdatedAt: now,
+		GitURL:         gs.URL,
+		GitBranch:      gs.Branch,
+		GitCloneStatus: gs.initialStatus(),
 	}
 	if err := h.Store.Sandboxes().Create(r.Context(), sb); err != nil {
 		h.log().Error("createSandbox: async insert", "err", err)
@@ -344,6 +374,9 @@ func (h *Handlers) startAsyncCreate(
 		"vcpus", body.VCPUs, "memory_mb", body.MemoryMB)
 
 	go h.driveAsyncCreate(accountID, sandboxID, opID, *body, templateHash)
+	if gs.enabled() {
+		go h.runGitCloneHook(accountID, sandboxID, gs)
+	}
 
 	writeJSON(w, http.StatusCreated, sandboxWithOp{Sandbox: sb, OperationID: opID})
 }

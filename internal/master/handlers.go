@@ -21,6 +21,7 @@ import (
 
 	"github.com/allenabraham999/vajra/internal/cache"
 	"github.com/allenabraham999/vajra/internal/events"
+	"github.com/allenabraham999/vajra/internal/models"
 	"github.com/allenabraham999/vajra/internal/store"
 )
 
@@ -59,11 +60,21 @@ type Handlers struct {
 	// surfaces directly as a 503.
 	Autoscaler *Autoscaler
 
-	// AdminAccountID is the placeholder admin gate: an account whose ID
-	// matches this string is treated as administrator. Until accounts
-	// grow a role column, this is the simplest mechanism for the
-	// /v1/clusters, /v1/nodes, and /v1/nodes/*/drain surface.
+	// AdminAccountID is the legacy admin gate: an account whose ID matches
+	// this string is treated as administrator. Superseded by the is_admin
+	// column and AdminEmails allowlist (see requireAdmin) but kept as a
+	// third fallback so an existing ADMIN_ACCOUNT_ID env keeps working.
 	AdminAccountID string
+
+	// AdminEmails is the VAJRA_ADMIN_EMAIL allowlist (lowercased). An
+	// account whose email is in this list reaches the /v1/admin/* surface
+	// even if its is_admin column was never set; the login handler
+	// back-fills is_admin for these accounts on their next sign-in.
+	AdminEmails []string
+
+	// LogBuffer is the in-process ring of recent log records served by
+	// GET /v1/admin/logs. Nil → the endpoint returns an empty stream.
+	LogBuffer *LogBuffer
 
 	// AgentSharedSecret is the Bearer token vajra-proxy and the agents
 	// expect on internal calls. Master returns it to the proxy as part
@@ -116,6 +127,20 @@ type Handlers struct {
 	// /v1/auth/google* endpoints. Zero value → endpoints respond 404
 	// and GET /v1/auth/config reports google_oauth_enabled=false.
 	GoogleOAuth GoogleOAuthConfig
+
+	// Stripe is the billing gateway used by the checkout and webhook
+	// endpoints. Nil when billing is disabled — both endpoints then 503.
+	Stripe StripeGateway
+
+	// StripeCfg carries the publishable key + enabled flag surfaced by the
+	// public GET /v1/billing/config probe.
+	StripeCfg StripeConfig
+
+	// VCPUHourlyUSD / MemoryGBHourlyUSD mirror the billing meter's rates so
+	// GET /v1/usage/summary can report live hourly burn. Zero values fall
+	// back to the meter defaults.
+	VCPUHourlyUSD     float64
+	MemoryGBHourlyUSD float64
 
 	// Now is overridable in tests so JWT expiry and operation timestamps
 	// are deterministic. Production wires this to time.Now.
@@ -288,22 +313,76 @@ func pathID(r *http.Request) string {
 	return strings.TrimSpace(r.PathValue("id"))
 }
 
-// requireAdmin enforces the placeholder admin gate. The check is a
-// straightforward equality against Handlers.AdminAccountID; if that
-// field is empty no account can be admin (admin endpoints are then
-// fully locked down). Returns the resolved account ID on success.
-//
-// TODO: replace with a real role column on accounts once we have one.
+// requireAdmin enforces the admin gate for the /v1/admin/* surface. An
+// authenticated account passes when it satisfies isAdmin — its is_admin
+// column is set, its email is in the VAJRA_ADMIN_EMAIL allowlist, or it
+// matches the legacy AdminAccountID. Returns the account ID on success;
+// on failure it has already written the 401/403/500 response.
 func (h *Handlers) requireAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
-	accountID, ok := RequireAccount(w, r)
+	acct, ok := h.requireAdminAccount(w, r)
 	if !ok {
 		return "", false
 	}
-	if h.AdminAccountID == "" || accountID != h.AdminAccountID {
-		writeErr(w, http.StatusForbidden, "admin access required")
-		return "", false
+	return acct.ID, true
+}
+
+// requireAdminAccount is requireAdmin's account-returning form, for the
+// few admin handlers that need the caller's own row. Most handlers want
+// only the pass/fail and call requireAdmin.
+func (h *Handlers) requireAdminAccount(w http.ResponseWriter, r *http.Request) (*models.Account, bool) {
+	accountID, ok := RequireAccount(w, r)
+	if !ok {
+		return nil, false
 	}
-	return accountID, true
+	acct, err := h.Store.Accounts().GetByID(r.Context(), accountID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusForbidden, "admin access required")
+			return nil, false
+		}
+		h.log().Error("requireAdmin: account lookup", "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return nil, false
+	}
+	if !h.isAdmin(acct) {
+		writeErr(w, http.StatusForbidden, "admin access required")
+		return nil, false
+	}
+	return acct, true
+}
+
+// isAdmin reports whether acct may use the /v1/admin/* surface: either
+// the is_admin column is set, the account's email is in the
+// VAJRA_ADMIN_EMAIL allowlist, or it matches the legacy AdminAccountID.
+func (h *Handlers) isAdmin(acct *models.Account) bool {
+	if acct == nil {
+		return false
+	}
+	if acct.IsAdmin {
+		return true
+	}
+	if h.AdminAccountID != "" && acct.ID == h.AdminAccountID {
+		return true
+	}
+	email := strings.ToLower(strings.TrimSpace(acct.Email))
+	for _, e := range h.AdminEmails {
+		if email == e {
+			return true
+		}
+	}
+	return false
+}
+
+// emailIsAdmin reports whether email is in the VAJRA_ADMIN_EMAIL
+// allowlist. The login handler uses it to back-fill the is_admin column.
+func (h *Handlers) emailIsAdmin(email string) bool {
+	email = strings.ToLower(strings.TrimSpace(email))
+	for _, e := range h.AdminEmails {
+		if email == e {
+			return true
+		}
+	}
+	return false
 }
 
 // requestIDFromContext pulls the request ID out of the context — used

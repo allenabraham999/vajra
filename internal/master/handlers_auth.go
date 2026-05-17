@@ -138,6 +138,18 @@ func (h *Handlers) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Best-effort: stamp last_login for the admin panel's dormancy view,
+	// and back-fill is_admin for VAJRA_ADMIN_EMAIL operators so the
+	// Accounts tab reflects reality. Neither write blocks a valid login.
+	if err := h.Store.Accounts().UpdateLastLogin(r.Context(), account.ID, h.now().UTC()); err != nil {
+		h.log().Warn("login: update last_login", "err", err)
+	}
+	if h.emailIsAdmin(account.Email) && !account.IsAdmin {
+		if err := h.Store.Accounts().SetAdmin(r.Context(), account.ID, true); err != nil {
+			h.log().Warn("login: backfill is_admin", "err", err)
+		}
+	}
+
 	token, err := h.Signer.Sign(account.ID)
 	if err != nil {
 		h.log().Error("login: sign jwt", "err", err)

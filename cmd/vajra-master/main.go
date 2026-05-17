@@ -41,6 +41,7 @@ type config struct {
 	MigrationsDir     string
 	ReconcileInterval time.Duration
 	AdminAccountID    string
+	AdminEmails       []string
 	PublicBaseDomain  string
 	RateLimitRPS      int
 	Version           master.VersionInfo
@@ -48,6 +49,7 @@ type config struct {
 	NATSURL           string
 	Autoscale         master.AutoscaleConfig
 	GoogleOAuth       master.GoogleOAuthConfig
+	Billing           master.BillingConfig
 }
 
 // loadConfig reads the runtime config from process env. Required vars
@@ -63,6 +65,13 @@ func loadConfig() (*config, error) {
 		AdminAccountID:    os.Getenv("ADMIN_ACCOUNT_ID"),
 		PublicBaseDomain:  os.Getenv("PUBLIC_BASE_DOMAIN"),
 		Version: master.BuildInfo(),
+	}
+	// VAJRA_ADMIN_EMAIL is a comma-separated allowlist of operator emails
+	// that reach the admin panel regardless of the is_admin column.
+	for _, e := range strings.Split(os.Getenv("VAJRA_ADMIN_EMAIL"), ",") {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			cfg.AdminEmails = append(cfg.AdminEmails, e)
+		}
 	}
 	// Allow env-var overrides on top of the ldflags-stamped values so
 	// dev builds can spoof the version triple without rebuilding.
@@ -151,6 +160,43 @@ func loadConfig() (*config, error) {
 			cfg.Autoscale.RootVolumeGB = n
 		}
 	}
+
+	// Billing: the usage meter + Stripe credit purchases. Disabled unless
+	// VAJRA_BILLING_ENABLED=true (the safe default — no meter, no charges).
+	// Rates and cadence fall back to the brief's defaults; only a valid
+	// override replaces them.
+	cfg.Billing = master.BillingConfig{
+		Enabled:           os.Getenv("VAJRA_BILLING_ENABLED") == "true",
+		Interval:          10 * time.Second,
+		VCPUHourlyUSD:     0.06,
+		MemoryGBHourlyUSD: 0.01,
+		Stripe: master.StripeConfig{
+			SecretKey:      os.Getenv("VAJRA_STRIPE_SECRET_KEY"),
+			PublishableKey: os.Getenv("VAJRA_STRIPE_PUBLISHABLE_KEY"),
+			WebhookSecret:  os.Getenv("VAJRA_STRIPE_WEBHOOK_SECRET"),
+			SuccessURL:     os.Getenv("VAJRA_STRIPE_SUCCESS_URL"),
+			CancelURL:      os.Getenv("VAJRA_STRIPE_CANCEL_URL"),
+		},
+	}
+	if v := os.Getenv("VAJRA_BILLING_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Billing.Interval = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("VAJRA_VCPU_HOURLY_USD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			cfg.Billing.VCPUHourlyUSD = f
+		}
+	}
+	if v := os.Getenv("VAJRA_MEMORY_GB_HOURLY_USD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			cfg.Billing.MemoryGBHourlyUSD = f
+		}
+	}
+	// Stripe checkout is live only when billing is on AND a secret key is
+	// present; the checkout/webhook endpoints respond 503 otherwise.
+	cfg.Billing.Stripe.Enabled = cfg.Billing.Enabled && cfg.Billing.Stripe.SecretKey != ""
+
 	return cfg, nil
 }
 
@@ -195,7 +241,10 @@ func getenvDefault(key, fallback string) string {
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Tee structured logs into an in-process ring buffer so the admin
+	// panel's Logs tab can read recent master output back over HTTP.
+	logBuffer := master.NewLogBuffer(0)
+	logger := slog.New(master.NewLogBufferHandler(slog.NewJSONHandler(os.Stdout, nil), logBuffer))
 	slog.SetDefault(logger)
 
 	cfg, err := loadConfig()
@@ -256,6 +305,7 @@ func main() {
 	tracker := master.NewOperationTracker(st)
 	handlers := master.NewHandlers(st, signer, scheduler, pool, tracker)
 	handlers.Logger = logger
+	handlers.LogBuffer = logBuffer
 	handlers.Version = cfg.Version
 	handlers.AgentSharedSecret = cfg.AgentSharedSecret
 	handlers.PublicBaseDomain = cfg.PublicBaseDomain
@@ -304,11 +354,29 @@ func main() {
 	handlers.Lifecycle = master.NewLifecycleManager(st, pool, c, handlers, logger)
 	go handlers.Lifecycle.Run(ctx)
 
+	// Billing: usage meter + Stripe credit purchases. Both stay off unless
+	// VAJRA_BILLING_ENABLED=true, so a deployment that has not configured
+	// Stripe never starts charging.
+	handlers.StripeCfg = cfg.Billing.Stripe
+	handlers.VCPUHourlyUSD = cfg.Billing.VCPUHourlyUSD
+	handlers.MemoryGBHourlyUSD = cfg.Billing.MemoryGBHourlyUSD
+	if cfg.Billing.Stripe.Enabled {
+		handlers.Stripe = master.NewLiveStripeGateway(cfg.Billing.Stripe)
+		logger.Info("stripe billing enabled")
+	}
+	if cfg.Billing.Enabled {
+		meter := master.NewBillingMeter(st, cfg.Billing.Interval,
+			cfg.Billing.VCPUHourlyUSD, cfg.Billing.MemoryGBHourlyUSD).WithLogger(logger)
+		go meter.Run(ctx)
+		logger.Info("billing meter started", "interval", cfg.Billing.Interval.String())
+	}
+
 	srv := master.NewServer(master.ServerConfig{
 		Addr:           cfg.ListenAddr,
 		Logger:         logger,
 		InternalSecret: cfg.AgentSharedSecret,
 		AdminAccountID: cfg.AdminAccountID,
+		AdminEmails:    cfg.AdminEmails,
 		RateLimitRPS:   cfg.RateLimitRPS,
 	}, handlers)
 

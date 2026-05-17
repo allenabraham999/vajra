@@ -57,6 +57,24 @@ type UsageStore interface {
 	SumByAccount(ctx context.Context, accountID string, from, to time.Time) (UsageRollup, error)
 	// PerSandbox returns a per-sandbox breakdown over the same window.
 	PerSandbox(ctx context.Context, accountID string, from, to time.Time) ([]UsageRow, error)
+	// Accumulate adds one billing-meter tick of usage to the per-account,
+	// per-day rollup row (usage_daily), creating it on first write. day is
+	// truncated to a calendar date. This is an append, not the interval
+	// ledger above — the meter owns it and it backs the spend dashboard.
+	Accumulate(ctx context.Context, accountID string, day time.Time, vcpuHours, memoryGBHours, costUSD float64) error
+	// DailySummary returns the per-day rollup rows for accountID whose day
+	// falls within the inclusive [from, to] range, oldest first.
+	DailySummary(ctx context.Context, accountID string, from, to time.Time) ([]UsageDaily, error)
+}
+
+// UsageDaily is one account's metered usage for a single calendar day —
+// the unit the billing meter accumulates into and the dashboard's spend
+// chart reads back.
+type UsageDaily struct {
+	Day           time.Time `db:"day" json:"date"`
+	VCPUHours     float64   `db:"vcpu_hours" json:"vcpu_hours"`
+	MemoryGBHours float64   `db:"memory_gb_hours" json:"memory_gb_hours"`
+	CostUSD       float64   `db:"cost_usd" json:"cost_usd"`
 }
 
 // UsageRollup is the account-level total returned by SumByAccount.
@@ -270,6 +288,39 @@ ORDER BY sandbox_id`
 	}
 	for i := range out {
 		out[i].Cost = CalculateCost(out[i].VCPUSeconds, out[i].MemoryMBSeconds, out[i].DiskGBSeconds)
+	}
+	return out, nil
+}
+
+// Accumulate upserts a tick's worth of usage into the (account_id, day)
+// rollup. Repeated calls in the same day sum, so the billing meter can
+// call it every 10s without tracking prior state.
+func (s *pgUsageStore) Accumulate(ctx context.Context, accountID string, day time.Time, vcpuHours, memoryGBHours, costUSD float64) error {
+	const q = `
+INSERT INTO usage_daily (account_id, day, vcpu_hours, memory_gb_hours, cost_usd, updated_at)
+VALUES ($1, $2::date, $3, $4, $5, NOW())
+ON CONFLICT (account_id, day) DO UPDATE SET
+    vcpu_hours      = usage_daily.vcpu_hours      + EXCLUDED.vcpu_hours,
+    memory_gb_hours = usage_daily.memory_gb_hours + EXCLUDED.memory_gb_hours,
+    cost_usd        = usage_daily.cost_usd        + EXCLUDED.cost_usd,
+    updated_at      = NOW()`
+	_, err := s.ext.ExecContext(ctx, q, accountID, day.UTC(), vcpuHours, memoryGBHours, costUSD)
+	return translate(err)
+}
+
+// DailySummary returns the per-day rollup rows in the inclusive window,
+// oldest first. Days with no usage are simply absent — callers that need
+// a zero-filled series fill the gaps themselves.
+func (s *pgUsageStore) DailySummary(ctx context.Context, accountID string, from, to time.Time) ([]UsageDaily, error) {
+	out := []UsageDaily{}
+	err := sqlx.SelectContext(ctx, s.ext, &out,
+		`SELECT day, vcpu_hours, memory_gb_hours, cost_usd
+		   FROM usage_daily
+		  WHERE account_id = $1 AND day >= $2::date AND day <= $3::date
+		  ORDER BY day ASC`,
+		accountID, from.UTC(), to.UTC())
+	if err != nil {
+		return nil, translate(err)
 	}
 	return out, nil
 }

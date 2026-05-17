@@ -20,6 +20,7 @@ export type NodeState =
   | 'REGISTERING'
   | 'ACTIVE'
   | 'DRAINING'
+  | 'CORDONED'
   | 'QUARANTINED'
   | 'OFFLINE'
   | 'DECOMMISSIONED'
@@ -64,6 +65,13 @@ export interface Sandbox {
   created_at: string
   updated_at: string
   operation_id?: string
+  // Git auto-clone. git_url/git_branch echo the create request; the
+  // git_clone_status field tracks the post-create clone hook
+  // ('' | pending | cloning | done | failed).
+  git_url?: string
+  git_branch?: string
+  git_clone_status?: '' | 'pending' | 'cloning' | 'done' | 'failed'
+  git_clone_error?: string
 }
 
 export type BuildStatus = 'PENDING' | 'BUILDING' | 'COMPLETED' | 'FAILED'
@@ -251,4 +259,118 @@ export interface BootTime {
   created_at: string
   time_to_running_ms: number
   pool_hit: boolean
+}
+
+// DailySpendPoint is one bar of the 30-day spend chart.
+export interface DailySpendPoint {
+  date: string
+  amount: number
+}
+
+// SandboxCost is one row of the per-sandbox cost table.
+export interface SandboxCost {
+  name: string
+  vcpu_hours: number
+  cost: number
+}
+
+// UsageSummary is GET /v1/usage/summary — the billing dashboard payload.
+export interface UsageSummary {
+  credits_remaining: number
+  total_spend_30d: number
+  vcpu_hours_30d: number
+  memory_gb_hours_30d: number
+  current_hourly_burn: number
+  daily_spend: DailySpendPoint[]
+  per_sandbox: SandboxCost[]
+}
+
+// TransactionResponse is one credit purchase from GET /v1/billing/transactions.
+export interface TransactionResponse {
+  id: string
+  account_id: string
+  amount_usd: number
+  stripe_session_id: string
+  status: string
+  created_at: string
+}
+
+// BillingConfigResponse is the public GET /v1/billing/config probe.
+export interface BillingConfigResponse {
+  stripe_enabled: boolean
+  publishable_key: string
+}
+
+// ---- Admin panel (/v1/admin/*) ----
+
+export interface AdminAlert {
+  level: 'warning' | 'critical'
+  kind: string
+  message: string
+}
+
+export interface AdminResourceTotals {
+  vcpu: number
+  memory_mb: number
+  disk_gb: number
+}
+
+// AdminOverview is GET /v1/admin/cluster/overview.
+export interface AdminOverview {
+  total_nodes: number
+  active_nodes: number
+  total_sandboxes: number
+  running_sandboxes: number
+  total_accounts: number
+  spend_today: number
+  capacity: AdminResourceTotals
+  used: AdminResourceTotals
+  alerts: AdminAlert[]
+}
+
+// AdminNode is one row of GET /v1/admin/nodes — a Node plus derived fields.
+export interface AdminNode extends Node {
+  sandbox_count: number
+  healthy: boolean
+}
+
+// AdminSandbox is one row of GET /v1/admin/sandboxes — a Sandbox joined to
+// its owner email and node hostname.
+export interface AdminSandbox extends Sandbox {
+  account_email: string
+  node_hostname?: string
+  age_seconds: number
+}
+
+export interface AdminSandboxesResponse {
+  sandboxes: AdminSandbox[]
+  total: number
+  limit: number
+  offset: number
+}
+
+// AdminAccount is one row of GET /v1/admin/accounts.
+export interface AdminAccount {
+  id: string
+  email: string
+  credits: number
+  is_admin: boolean
+  suspended: boolean
+  last_login?: string | null
+  created_at: string
+  total_sandboxes: number
+}
+
+// AdminLogEntry is one line from GET /v1/admin/logs.
+export interface AdminLogEntry {
+  time: string
+  level: string
+  msg: string
+  attrs?: Record<string, string>
+}
+
+export interface AdminLogsResponse {
+  source: string
+  count: number
+  entries: AdminLogEntry[]
 }

@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -290,6 +291,35 @@ func (c *AgentClient) ExecCommand(ctx context.Context, id, cmd string, timeout t
 		return nil, fmt.Errorf("agent ExecCommand(%s): %w", id, err)
 	}
 	return out, nil
+}
+
+// AgentLogEntry mirrors one entry from the agent's GET /sandbox/{id}/logs
+// response — an agent-emitted event or a captured guest console line.
+type AgentLogEntry struct {
+	Timestamp time.Time `json:"timestamp"`
+	Source    string    `json:"source"`
+	Level     string    `json:"level"`
+	Message   string    `json:"message"`
+}
+
+// agentLogsResponse is the JSON body of the agent's logs endpoint.
+type agentLogsResponse struct {
+	Entries []AgentLogEntry `json:"entries"`
+}
+
+// SandboxLogs issues GET /sandbox/{id}/logs?tail=N and returns the
+// agent's recent log tail for the sandbox: its own lifecycle events plus
+// any best-effort guest console output.
+func (c *AgentClient) SandboxLogs(ctx context.Context, id string, tail int) ([]AgentLogEntry, error) {
+	path := "/sandbox/" + id + "/logs"
+	if tail > 0 {
+		path += "?tail=" + strconv.Itoa(tail)
+	}
+	out := &agentLogsResponse{}
+	if err := c.do(ctx, http.MethodGet, path, nil, out); err != nil {
+		return nil, fmt.Errorf("agent SandboxLogs(%s): %w", id, err)
+	}
+	return out.Entries, nil
 }
 
 // SnapshotSandbox issues POST /sandbox/{id}/snapshot.

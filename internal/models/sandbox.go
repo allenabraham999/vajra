@@ -108,6 +108,16 @@ type Sandbox struct {
 	// pool member rather than a cold snapshot restore. Nil until the
 	// sandbox reaches RUNNING.
 	PoolHit *bool `db:"pool_hit" json:"pool_hit,omitempty"`
+	// Git auto-clone fields. GitURL / GitBranch echo the create request
+	// when it asked for a repository to be cloned into /workspace.
+	// GitCloneStatus tracks the post-create clone hook — one of "",
+	// "pending", "cloning", "done", "failed" — and GitCloneError carries
+	// the failure reason when it is "failed". The access token used for
+	// private repos is never persisted.
+	GitURL         string `db:"git_url" json:"git_url,omitempty"`
+	GitBranch      string `db:"git_branch" json:"git_branch,omitempty"`
+	GitCloneStatus string `db:"git_clone_status" json:"git_clone_status,omitempty"`
+	GitCloneError  string `db:"git_clone_error" json:"git_clone_error,omitempty"`
 }
 
 // validSandboxTransitions defines the allowed forward transitions. The

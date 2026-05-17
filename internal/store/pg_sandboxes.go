@@ -11,11 +11,11 @@ import (
 
 type pgSandboxStore struct{ ext sqlx.ExtContext }
 
-const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, auto_stop_minutes, auto_archive_minutes, last_activity, created_at, updated_at, time_to_running_ms, pool_hit`
+const sandboxColumns = `id, name, account_id, node_id, cluster_id, template_id, state, config, auto_stop_minutes, auto_archive_minutes, last_activity, created_at, updated_at, time_to_running_ms, pool_hit, git_url, git_branch, git_clone_status, git_clone_error`
 
 func (s *pgSandboxStore) Create(ctx context.Context, sb *models.Sandbox) error {
 	const q = `INSERT INTO sandboxes (` + sandboxColumns + `)
-	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :auto_stop_minutes, :auto_archive_minutes, :last_activity, :created_at, :updated_at, :time_to_running_ms, :pool_hit)`
+	           VALUES (:id, :name, :account_id, :node_id, :cluster_id, :template_id, :state, :config, :auto_stop_minutes, :auto_archive_minutes, :last_activity, :created_at, :updated_at, :time_to_running_ms, :pool_hit, :git_url, :git_branch, :git_clone_status, :git_clone_error)`
 	_, err := sqlx.NamedExecContext(ctx, s.ext, q, sb)
 	return translate(err)
 }
@@ -50,6 +50,20 @@ func (s *pgSandboxStore) ListByAccount(ctx context.Context, accountID string, op
 	err := sqlx.SelectContext(ctx, s.ext, &out,
 		`SELECT `+sandboxColumns+` FROM sandboxes WHERE account_id = $1
 		 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, accountID, limit, offset)
+	if err != nil {
+		return nil, translate(err)
+	}
+	return out, nil
+}
+
+// ListAll returns sandboxes across every account, newest first. Only the
+// admin panel calls it; tenant requests never reach this method.
+func (s *pgSandboxStore) ListAll(ctx context.Context, opts ListOpts) ([]*models.Sandbox, error) {
+	limit, offset := applyListDefaults(opts)
+	out := []*models.Sandbox{}
+	err := sqlx.SelectContext(ctx, s.ext, &out,
+		`SELECT `+sandboxColumns+` FROM sandboxes
+		 ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, translate(err)
 	}
@@ -95,6 +109,17 @@ func (s *pgSandboxStore) RecordBootMetrics(ctx context.Context, accountID, id st
 		`UPDATE sandboxes SET time_to_running_ms = $1, pool_hit = $2
 		 WHERE account_id = $3 AND id = $4`,
 		timeToRunningMs, poolHit, accountID, id)
+	return expectAffected(res, err)
+}
+
+// UpdateGitClone records the post-create git auto-clone status (and
+// failure reason, if any) on the sandbox row. Account-scoped; called by
+// the git-clone hook as it moves through cloning → done/failed.
+func (s *pgSandboxStore) UpdateGitClone(ctx context.Context, accountID, id, status, errMsg string) error {
+	res, err := s.ext.ExecContext(ctx,
+		`UPDATE sandboxes SET git_clone_status = $1, git_clone_error = $2, updated_at = NOW()
+		 WHERE account_id = $3 AND id = $4`,
+		status, errMsg, accountID, id)
 	return expectAffected(res, err)
 }
 

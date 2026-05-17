@@ -37,7 +37,10 @@ func (s *opTestStore) Operations() store.OperationStore {
 func (s *opTestStore) Usage() store.UsageStore      { panic("opTestStore: Usage not implemented") }
 func (s *opTestStore) Builds() store.BuildStore     { panic("opTestStore: Builds not implemented") }
 func (s *opTestStore) Webhooks() store.WebhookStore { panic("opTestStore: Webhooks not implemented") }
-func (s *opTestStore) Ping(context.Context) error   { return nil }
+func (s *opTestStore) Transactions() store.TransactionStore {
+	panic("opTestStore: Transactions not implemented")
+}
+func (s *opTestStore) Ping(context.Context) error { return nil }
 func (s *opTestStore) WithTx(context.Context, func(store.Store) error) error {
 	return errors.New("WithTx not implemented")
 }

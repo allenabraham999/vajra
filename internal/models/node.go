@@ -15,6 +15,7 @@ const (
 	NodeStateRegistering    NodeState = "REGISTERING"
 	NodeStateActive         NodeState = "ACTIVE"
 	NodeStateDraining       NodeState = "DRAINING"
+	NodeStateCordoned       NodeState = "CORDONED"
 	NodeStateQuarantined    NodeState = "QUARANTINED"
 	NodeStateOffline        NodeState = "OFFLINE"
 	NodeStateDecommissioned NodeState = "DECOMMISSIONED"
@@ -24,11 +25,17 @@ const (
 func (s NodeState) Valid() bool {
 	switch s {
 	case NodeStateRegistering, NodeStateActive, NodeStateDraining,
-		NodeStateQuarantined, NodeStateOffline, NodeStateDecommissioned:
+		NodeStateCordoned, NodeStateQuarantined, NodeStateOffline,
+		NodeStateDecommissioned:
 		return true
 	}
 	return false
 }
+
+// Schedulable reports whether the scheduler may place new sandboxes on a
+// node in this state. Only ACTIVE nodes accept new work; DRAINING and
+// CORDONED nodes keep their existing sandboxes running but take no more.
+func (s NodeState) Schedulable() bool { return s == NodeStateActive }
 
 // NodeCapacity is the total physical resources a node has reported.
 // Persisted as a JSONB column.

@@ -95,6 +95,9 @@ func (p *Postgres) Operations() OperationStore { return &pgOperationStore{ext: p
 func (p *Postgres) ShareLinks() ShareLinkStore { return &pgShareLinkStore{ext: p.ext} }
 func (p *Postgres) Builds() BuildStore         { return &pgBuildStore{ext: p.ext} }
 func (p *Postgres) Webhooks() WebhookStore     { return &pgWebhookStore{ext: p.ext} }
+func (p *Postgres) Transactions() TransactionStore {
+	return &pgTransactionStore{ext: p.ext}
+}
 
 // Ping verifies a working database connection. Errors on a tx-bound store.
 func (p *Postgres) Ping(ctx context.Context) error {

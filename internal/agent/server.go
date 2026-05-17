@@ -25,6 +25,7 @@ type Server struct {
 	sandboxes *SandboxManager
 	pool      *PoolManager
 	archives  *ArchiveManager
+	logs      *LogBuffer
 	logger    *slog.Logger
 	http      *http.Server
 
@@ -58,6 +59,11 @@ func NewServer(addr string, sandboxes *SandboxManager, pool *PoolManager, logger
 // /sandbox/{id}/archive and /sandbox/{id}/rehydrate handlers. Wired from
 // main so the server constructor remains stable for tests.
 func (s *Server) SetArchiveManager(a *ArchiveManager) { s.archives = a }
+
+// SetLogBuffer wires the in-memory per-sandbox log buffer that backs the
+// GET /sandbox/{id}/logs handler. Wired from main alongside the LogTap
+// slog handler so the server constructor stays stable for tests.
+func (s *Server) SetLogBuffer(b *LogBuffer) { s.logs = b }
 
 // ListenAndServe binds the configured address and serves until ctx is
 // cancelled. It returns the first non-shutdown error from http.Server.
@@ -110,6 +116,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sandbox/{id}/files", s.handleFileDelete)
 	mux.HandleFunc("POST /sandbox/{id}/forward/{port}", s.handleForward)
 	mux.HandleFunc("GET /sandbox/{id}/terminal", s.handleTerminal)
+	mux.HandleFunc("GET /sandbox/{id}/logs", s.handleLogs)
 	mux.HandleFunc("GET /pool/stats", s.handlePoolStats)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -287,6 +294,11 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		s.pool.Release(cid)
 	}
 	s.destroyedTotal.Add(1)
+	// Free the sandbox's retained log tail; master keeps the durable
+	// operations audit, so nothing observable is lost.
+	if s.logs != nil {
+		s.logs.Drop(id)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

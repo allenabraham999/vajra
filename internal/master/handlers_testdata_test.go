@@ -2,6 +2,8 @@ package master
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,8 @@ type handlerStore struct {
 	tokenIdx    map[string]string // token_hash → share id
 	builds      map[string]*models.Build
 	webhooks    map[string]*models.Webhook
+	transactions map[string]*models.Transaction
+	usageDaily   map[string]*store.UsageDaily // key: accountID|YYYY-MM-DD
 
 	pingErr error
 }
@@ -55,6 +59,8 @@ func newHandlerStore() *handlerStore {
 		tokenIdx:   map[string]string{},
 		builds:     map[string]*models.Build{},
 		webhooks:   map[string]*models.Webhook{},
+		transactions: map[string]*models.Transaction{},
+		usageDaily:   map[string]*store.UsageDaily{},
 	}
 }
 
@@ -70,6 +76,7 @@ func (h *handlerStore) ShareLinks() store.ShareLinkStore { return &hsShareLink{h
 func (h *handlerStore) Usage() store.UsageStore          { return &hsUsage{h: h} }
 func (h *handlerStore) Builds() store.BuildStore         { return &hsBuild{h: h} }
 func (h *handlerStore) Webhooks() store.WebhookStore     { return &hsWebhook{h: h} }
+func (h *handlerStore) Transactions() store.TransactionStore { return &hsTransaction{h: h} }
 func (h *handlerStore) Ping(context.Context) error       { return h.pingErr }
 func (h *handlerStore) Close() error                     { return nil }
 
@@ -91,6 +98,84 @@ func (u *hsUsage) SumByAccount(_ context.Context, _ string, from, to time.Time) 
 }
 func (u *hsUsage) PerSandbox(_ context.Context, _ string, _, _ time.Time) ([]store.UsageRow, error) {
 	return nil, nil
+}
+func (u *hsUsage) Accumulate(_ context.Context, accountID string, day time.Time, vcpuHours, memoryGBHours, costUSD float64) error {
+	u.h.mu.Lock()
+	defer u.h.mu.Unlock()
+	dayKey := day.UTC().Format("2006-01-02")
+	key := accountID + "|" + dayKey
+	row, ok := u.h.usageDaily[key]
+	if !ok {
+		d, _ := time.Parse("2006-01-02", dayKey)
+		row = &store.UsageDaily{Day: d}
+		u.h.usageDaily[key] = row
+	}
+	row.VCPUHours += vcpuHours
+	row.MemoryGBHours += memoryGBHours
+	row.CostUSD += costUSD
+	return nil
+}
+func (u *hsUsage) DailySummary(_ context.Context, accountID string, from, to time.Time) ([]store.UsageDaily, error) {
+	u.h.mu.Lock()
+	defer u.h.mu.Unlock()
+	fromDay := from.UTC().Truncate(24 * time.Hour)
+	out := []store.UsageDaily{}
+	for key, row := range u.h.usageDaily {
+		if !strings.HasPrefix(key, accountID+"|") {
+			continue
+		}
+		if row.Day.Before(fromDay) || row.Day.After(to.UTC()) {
+			continue
+		}
+		out = append(out, *row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Day.Before(out[j].Day) })
+	return out, nil
+}
+
+type hsTransaction struct{ h *handlerStore }
+
+func (s *hsTransaction) Create(_ context.Context, t *models.Transaction) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	for _, ex := range s.h.transactions {
+		if ex.StripeSessionID != "" && ex.StripeSessionID == t.StripeSessionID {
+			return store.ErrConflict
+		}
+	}
+	cp := *t
+	s.h.transactions[t.ID] = &cp
+	return nil
+}
+func (s *hsTransaction) MarkCompleted(_ context.Context, stripeSessionID string) (bool, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	for _, t := range s.h.transactions {
+		if t.StripeSessionID == stripeSessionID && t.Status == models.TransactionPending {
+			t.Status = models.TransactionCompleted
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (s *hsTransaction) ListByAccount(_ context.Context, accountID string, limit int) ([]*models.Transaction, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	out := []*models.Transaction{}
+	for _, t := range s.h.transactions {
+		if t.AccountID == accountID {
+			cp := *t
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // WithTx in the fake just runs fn against the same store — there is no
@@ -132,11 +217,84 @@ func (s *hsAccount) GetByEmail(_ context.Context, email string) (*models.Account
 	cp := *a
 	return &cp, nil
 }
-func (s *hsAccount) List(context.Context, store.ListOpts) ([]*models.Account, error) { return nil, nil }
+func (s *hsAccount) List(context.Context, store.ListOpts) ([]*models.Account, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Account{}
+	for _, a := range s.h.accounts {
+		cp := *a
+		out = append(out, &cp)
+	}
+	return out, nil
+}
 func (s *hsAccount) Delete(_ context.Context, id string) error {
 	s.h.mu.Lock()
 	defer s.h.mu.Unlock()
 	delete(s.h.accounts, id)
+	return nil
+}
+func (s *hsAccount) DecrementCredits(_ context.Context, accountID string, amount float64) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[accountID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.CreditsRemaining -= amount
+	if a.CreditsRemaining < -store.CreditOverdraftUSD {
+		a.CreditsRemaining = -store.CreditOverdraftUSD
+	}
+	return nil
+}
+func (s *hsAccount) IncrementCredits(_ context.Context, accountID string, amount float64) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[accountID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.CreditsRemaining += amount
+	return nil
+}
+func (s *hsAccount) SetAdmin(_ context.Context, id string, isAdmin bool) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.IsAdmin = isAdmin
+	return nil
+}
+func (s *hsAccount) SetSuspended(_ context.Context, id string, suspended bool) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.Suspended = suspended
+	return nil
+}
+func (s *hsAccount) UpdateLastLogin(_ context.Context, id string, ts time.Time) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	t := ts
+	a.LastLogin = &t
+	return nil
+}
+func (s *hsAccount) UpdatePassword(_ context.Context, id, passwordHash string) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	a, ok := s.h.accounts[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	a.PasswordHash = passwordHash
 	return nil
 }
 
@@ -367,8 +525,27 @@ func (s *hsSandbox) ListByNode(_ context.Context, nodeID string, _ store.ListOpt
 	}
 	return out, nil
 }
-func (s *hsSandbox) ListByState(context.Context, models.SandboxState, store.ListOpts) ([]*models.Sandbox, error) {
-	return nil, nil
+func (s *hsSandbox) ListByState(_ context.Context, state models.SandboxState, _ store.ListOpts) ([]*models.Sandbox, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Sandbox{}
+	for _, sb := range s.h.sandboxes {
+		if sb.State == state {
+			cp := *sb
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+func (s *hsSandbox) ListAll(_ context.Context, _ store.ListOpts) ([]*models.Sandbox, error) {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	out := []*models.Sandbox{}
+	for _, sb := range s.h.sandboxes {
+		cp := *sb
+		out = append(out, &cp)
+	}
+	return out, nil
 }
 func (s *hsSandbox) UpdateState(_ context.Context, accountID, id string, state models.SandboxState) error {
 	s.h.mu.Lock()
@@ -386,6 +563,17 @@ func (s *hsSandbox) RecordBootMetrics(_ context.Context, accountID, id string, m
 	if sb, ok := s.h.sandboxes[id]; ok && sb.AccountID == accountID {
 		sb.TimeToRunningMS = &ms
 		sb.PoolHit = &poolHit
+		return nil
+	}
+	return store.ErrNotFound
+}
+func (s *hsSandbox) UpdateGitClone(_ context.Context, accountID, id, status, errMsg string) error {
+	s.h.mu.Lock()
+	defer s.h.mu.Unlock()
+	if sb, ok := s.h.sandboxes[id]; ok && sb.AccountID == accountID {
+		sb.GitCloneStatus = status
+		sb.GitCloneError = errMsg
+		sb.UpdatedAt = time.Now().UTC()
 		return nil
 	}
 	return store.ErrNotFound

@@ -7,11 +7,23 @@ import (
 )
 
 // Account is a customer of the platform. PasswordHash is never serialized.
+// CreditsRemaining is the prepaid USD balance the billing meter decrements
+// every tick; new accounts start with the demo grant (DB column default).
+//
+// IsAdmin, Suspended and LastLogin back the cluster admin panel. IsAdmin is
+// one of two ways an account reaches the /v1/admin/* surface — the other is
+// having its email in the VAJRA_ADMIN_EMAIL list — and the login handler
+// back-fills this column for env-listed admins so the Accounts tab is
+// accurate. LastLogin is nil for an account that has never logged in.
 type Account struct {
-	ID           string    `db:"id" json:"id"`
-	Email        string    `db:"email" json:"email"`
-	PasswordHash string    `db:"password_hash" json:"-"`
-	CreatedAt    time.Time `db:"created_at" json:"created_at"`
+	ID               string     `db:"id" json:"id"`
+	Email            string     `db:"email" json:"email"`
+	PasswordHash     string     `db:"password_hash" json:"-"`
+	CreatedAt        time.Time  `db:"created_at" json:"created_at"`
+	CreditsRemaining float64    `db:"credits_remaining" json:"credits_remaining"`
+	IsAdmin          bool       `db:"is_admin" json:"is_admin"`
+	Suspended        bool       `db:"suspended" json:"suspended"`
+	LastLogin        *time.Time `db:"last_login" json:"last_login,omitempty"`
 }
 
 // Permissions is a list of permission strings granted to an APIKey.

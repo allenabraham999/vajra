@@ -1,10 +1,16 @@
 import axios, { AxiosError } from 'axios'
 import type { AxiosInstance, AxiosRequestConfig } from 'axios'
 import type {
+  AdminAccount,
+  AdminLogsResponse,
+  AdminNode,
+  AdminOverview,
+  AdminSandboxesResponse,
   APIKey,
   AuthConfigResponse,
   AuthLoginResponse,
   AuthRegisterResponse,
+  BillingConfigResponse,
   BootTime,
   Build,
   Cluster,
@@ -17,10 +23,25 @@ import type {
   Sandbox,
   Snapshot,
   Template,
+  TransactionResponse,
   UsageResponse,
+  UsageSummary,
   Webhook,
   WebhookEventName,
 } from './types'
+
+// LogSource is the origin of a sandbox log line, also the ?source=
+// filter accepted by the logs endpoints.
+export type LogSource = 'master' | 'agent' | 'guest'
+
+// LogEntry is one line in a sandbox's merged log stream, as returned by
+// GET /v1/sandboxes/{id}/logs and pushed over the /logs/stream socket.
+export interface LogEntry {
+  timestamp: string
+  source: LogSource
+  level: 'INFO' | 'WARN' | 'ERROR'
+  message: string
+}
 
 // JWT lives in module-private memory. Reload = logout, by design.
 let inMemoryToken: string | null = null
@@ -163,6 +184,9 @@ export const sandboxes = {
     region?: string
     auto_stop_minutes?: number
     auto_archive_minutes?: number
+    git_url?: string
+    git_branch?: string
+    git_token?: string
   }) =>
     request<Sandbox>({ method: 'POST', url: '/v1/sandboxes', data: body }),
   exec: (id: string, command: string, timeout_ms = 30_000) =>
@@ -186,6 +210,12 @@ export const sandboxes = {
     request<Snapshot[]>({
       method: 'GET',
       url: `/v1/sandboxes/${id}/snapshots`,
+    }),
+  logs: (id: string, source: LogSource | 'all' = 'all', tail = 500) =>
+    request<{ entries: LogEntry[] }>({
+      method: 'GET',
+      url: `/v1/sandboxes/${id}/logs`,
+      params: { source, tail },
     }),
   // The master wraps the listing in {"entries": [...]}; unwrap it here
   // so callers get a plain array.
@@ -310,11 +340,92 @@ export const apiKeys = {
 export const usage = {
   get: (params?: { from?: string; to?: string }) =>
     request<UsageResponse>({ method: 'GET', url: '/v1/usage', params }),
+  summary: () =>
+    request<UsageSummary>({ method: 'GET', url: '/v1/usage/summary' }),
+}
+
+// --- Billing (Stripe credit purchases) ---
+export const billing = {
+  config: () =>
+    request<BillingConfigResponse>({ method: 'GET', url: '/v1/billing/config' }),
+  checkout: (amount_usd: number) =>
+    request<{ url: string }>({
+      method: 'POST',
+      url: '/v1/billing/checkout',
+      data: { amount_usd },
+    }),
+  transactions: () =>
+    request<{ transactions: TransactionResponse[] }>({
+      method: 'GET',
+      url: '/v1/billing/transactions',
+    }),
 }
 
 // --- Pre-warm pool ---
 export const pool = {
   stats: () => request<PoolStats>({ method: 'GET', url: '/v1/pool/stats' }),
+}
+
+// --- Admin panel (operator-only; every endpoint is gated by requireAdmin) ---
+export const admin = {
+  overview: () =>
+    request<AdminOverview>({ method: 'GET', url: '/v1/admin/cluster/overview' }),
+  nodes: () => request<AdminNode[]>({ method: 'GET', url: '/v1/admin/nodes' }),
+  drainNode: (id: string) =>
+    request<void>({ method: 'POST', url: `/v1/admin/nodes/${id}/drain` }),
+  cordonNode: (id: string) =>
+    request<void>({ method: 'POST', url: `/v1/admin/nodes/${id}/cordon` }),
+  uncordonNode: (id: string) =>
+    request<void>({ method: 'POST', url: `/v1/admin/nodes/${id}/uncordon` }),
+  terminateNode: (id: string) =>
+    request<void>({ method: 'POST', url: `/v1/admin/nodes/${id}/terminate` }),
+  sandboxes: (params?: {
+    state?: string
+    account?: string
+    node?: string
+    limit?: number
+    offset?: number
+  }) =>
+    request<AdminSandboxesResponse>({
+      method: 'GET',
+      url: '/v1/admin/sandboxes',
+      params,
+    }),
+  stopSandbox: (id: string) =>
+    request<void>({ method: 'POST', url: `/v1/admin/sandboxes/${id}/stop` }),
+  destroySandbox: (id: string) =>
+    request<void>({ method: 'DELETE', url: `/v1/admin/sandboxes/${id}` }),
+  accounts: () =>
+    request<AdminAccount[]>({ method: 'GET', url: '/v1/admin/accounts' }),
+  addCredits: (id: string, amount: number) =>
+    request<{ account_id: string; added: number; credits: number }>({
+      method: 'POST',
+      url: `/v1/admin/accounts/${id}/credits`,
+      data: { amount },
+    }),
+  suspendAccount: (id: string, suspended?: boolean) =>
+    request<{ account_id: string; suspended: boolean }>({
+      method: 'POST',
+      url: `/v1/admin/accounts/${id}/suspend`,
+      data: suspended === undefined ? {} : { suspended },
+    }),
+  promoteAccount: (id: string, isAdmin?: boolean) =>
+    request<{ account_id: string; is_admin: boolean }>({
+      method: 'POST',
+      url: `/v1/admin/accounts/${id}/promote`,
+      data: isAdmin === undefined ? {} : { is_admin: isAdmin },
+    }),
+  resetPassword: (id: string) =>
+    request<{ account_id: string; temporary_password: string }>({
+      method: 'POST',
+      url: `/v1/admin/accounts/${id}/reset-password`,
+    }),
+  logs: (params?: {
+    source?: 'master' | 'agent'
+    tail?: number
+    level?: string
+    sandbox_id?: string
+  }) => request<AdminLogsResponse>({ method: 'GET', url: '/v1/admin/logs', params }),
 }
 
 // --- Operations (synthesised from sandbox responses; no direct list endpoint
@@ -331,5 +442,7 @@ export default {
   nodes,
   apiKeys,
   usage,
+  billing,
+  admin,
   pool,
 }

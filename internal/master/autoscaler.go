@@ -609,6 +609,42 @@ func (a *Autoscaler) listManagedInstances(ctx context.Context) (map[string]strin
 	return result, nil
 }
 
+// TerminateNode terminates the EC2 instance backing nodeID and deletes
+// the node row. It is the admin panel's manual counterpart to the
+// background scaleDown sweep. Only nodes the autoscaler launched (tagged
+// vajra:managed=true) can be terminated this way; a node with no matching
+// managed instance — a hand-provisioned bare-metal host — returns an
+// error so the operator decommissions it deliberately instead.
+func (a *Autoscaler) TerminateNode(ctx context.Context, nodeID string) error {
+	node, err := a.store.Nodes().GetByID(ctx, nodeID)
+	if err != nil {
+		return fmt.Errorf("terminate: load node: %w", err)
+	}
+	managed, err := a.listManagedInstances(ctx)
+	if err != nil {
+		return fmt.Errorf("terminate: list managed instances: %w", err)
+	}
+	instID, ok := managed[node.IP]
+	if !ok {
+		return fmt.Errorf("node %s (%s) is not an autoscaled EC2 instance", nodeID, node.IP)
+	}
+	// Drain first so the scheduler stops placing work while EC2 tears the
+	// instance down.
+	if err := a.store.Nodes().UpdateState(ctx, nodeID, models.NodeStateDraining); err != nil {
+		a.logger.Error("terminate: drain", "node_id", nodeID, "err", err)
+	}
+	if _, err := a.ec2Client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+		InstanceIds: []string{instID},
+	}); err != nil {
+		return fmt.Errorf("terminate instance %s: %w", instID, err)
+	}
+	if err := a.store.Nodes().Delete(ctx, nodeID); err != nil {
+		a.logger.Error("terminate: delete node row", "node_id", nodeID, "err", err)
+	}
+	a.logger.Info("admin: node terminated", "node_id", nodeID, "instance_id", instID)
+	return nil
+}
+
 // hasActiveSandbox reports whether any sandbox on this node is still
 // occupying capacity. DESTROYED and ERROR don't count.
 func hasActiveSandbox(sandboxes []*models.Sandbox) bool {

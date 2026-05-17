@@ -27,6 +27,7 @@ const styles: Record<string, BadgeStyle> = {
   REGISTERING: { cls: 'bg-amber-500/10 text-amber-300 ring-amber-500/30', pulse: true, dot: 'bg-amber-400' },
   ACTIVE: { cls: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/30', dot: 'bg-emerald-400' },
   DRAINING: { cls: 'bg-amber-500/10 text-amber-300 ring-amber-500/30', pulse: true, dot: 'bg-amber-400' },
+  CORDONED: { cls: 'bg-red-500/10 text-red-300 ring-red-500/40', dot: 'bg-red-400' },
   QUARANTINED: { cls: 'bg-red-500/10 text-red-300 ring-red-500/40', dot: 'bg-red-400' },
   OFFLINE: { cls: 'bg-zinc-700/30 text-zinc-400 ring-zinc-600/40', dot: 'bg-zinc-500' },
   DECOMMISSIONED: { cls: 'bg-zinc-700/30 text-zinc-400 ring-zinc-600/40', dot: 'bg-zinc-500' },
