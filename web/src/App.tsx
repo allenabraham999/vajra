@@ -16,6 +16,7 @@ import MetricsPage from './pages/Metrics'
 import WebhooksPage from './pages/Webhooks'
 import SnapshotsPage from './pages/Snapshots'
 import SettingsPage from './pages/Settings'
+import DocsPage from './pages/Docs'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { token } = useAuth()
@@ -55,6 +56,7 @@ function AppRoutes() {
         <Route path="usage" element={<UsagePage />} />
         <Route path="metrics" element={<MetricsPage />} />
         <Route path="settings" element={<SettingsPage />} />
+        <Route path="docs" element={<DocsPage />} />
         <Route path="admin" element={<AdminPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

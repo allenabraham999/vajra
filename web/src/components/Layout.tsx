@@ -39,7 +39,7 @@ const sections: NavItem[][] = [
     { to: '/metrics', label: 'Metrics', icon: Activity },
   ],
   [
-    { to: '/v1/docs', label: 'Docs', icon: BookOpen, external: true },
+    { to: '/docs', label: 'Docs', icon: BookOpen },
     { to: '/admin', label: 'Admin', icon: ShieldCheck, admin: true },
   ],
 ]
