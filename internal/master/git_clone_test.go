@@ -221,7 +221,7 @@ func TestGitCloneInSandbox(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	joined := strings.Join(cmds, "\n")
-	for _, want := range []string{"tar -xf", "-C /workspace", "chown -R user:user /workspace"} {
+	for _, want := range []string{"-xmf", "-C /workspace", "chown -R user:user /workspace"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("extract command missing %q; got:\n%s", want, joined)
 		}
