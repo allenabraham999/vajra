@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import { ToastProvider } from './components/Toast'
 import Layout from './components/Layout'
+import Landing from './pages/Landing'
 import LoginPage from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import SandboxesPage from './pages/Sandboxes'
@@ -20,19 +21,28 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+// RootRoute resolves "/": the marketing landing page for visitors, or a
+// bounce into the app for anyone with an active session.
+function RootRoute() {
+  const { token } = useAuth()
+  if (token) return <Navigate to="/sandboxes" replace />
+  return <Landing />
+}
+
 function AppRoutes() {
   return (
     <Routes>
+      <Route path="/" element={<RootRoute />} />
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/signup" element={<LoginPage initialMode="register" />} />
       <Route
-        path="/"
         element={
           <RequireAuth>
             <Layout />
           </RequireAuth>
         }
       >
-        <Route index element={<Dashboard />} />
+        <Route path="dashboard" element={<Dashboard />} />
         <Route path="sandboxes" element={<SandboxesPage />} />
         <Route path="sandboxes/:id" element={<SandboxDetailPage />} />
         <Route path="templates" element={<TemplatesPage />} />

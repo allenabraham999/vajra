@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
 import { useToast } from '../components/Toast'
 import Spinner from '../components/Spinner'
@@ -9,12 +9,12 @@ import { apiBase, auth as authApi } from '../api/client'
 
 type Mode = 'login' | 'register'
 
-export default function LoginPage() {
+export default function LoginPage({ initialMode = 'login' }: { initialMode?: Mode }) {
   const { login, register } = useAuth()
   const toast = useToast()
   const nav = useNavigate()
 
-  const [mode, setMode] = useState<Mode>('login')
+  const [mode, setMode] = useState<Mode>(initialMode)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -98,17 +98,17 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen grid place-items-center bg-zinc-950 px-4 relative overflow-hidden">
       <BackgroundGlow />
-      <div className="w-full max-w-md animate-fade-in relative">
-        <div className="flex flex-col items-center gap-3 mb-8">
-          <div className="animate-bolt-glow">
-            <Bolt size={56} glow={false} />
-          </div>
-          <div className="text-2xl font-mono font-semibold tracking-[0.22em] text-zinc-100">
-            VAJRA
-          </div>
-          <p className="text-xs text-zinc-500 tracking-wide">
-            Sandbox Cloud for AI Agents
-          </p>
+      <div className="w-full max-w-sm animate-fade-in relative">
+        <div className="flex justify-center mb-7">
+          <Link
+            to="/"
+            className="flex items-center gap-2.5 transition-opacity hover:opacity-80"
+          >
+            <Bolt size={28} />
+            <span className="text-lg font-mono font-semibold tracking-[0.22em] text-zinc-100">
+              VAJRA
+            </span>
+          </Link>
         </div>
 
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/70 backdrop-blur p-6 shadow-2xl animate-slide-up">
