@@ -79,6 +79,12 @@ make test         # Run unit tests
 make benchmark    # Run vmm benchmarks
 ```
 
+## Examples
+
+- **[examples/coding-agent/](examples/coding-agent/)** — an autonomous AI
+  coding agent built on Claude + Vajra in under 250 lines of Python. The
+  canonical pattern for AI agents that run code in isolated environments.
+
 ## Status
 
 Day 1 — Cloud Hypervisor validation complete (see `bible.md`).
