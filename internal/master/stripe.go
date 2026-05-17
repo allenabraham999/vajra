@@ -114,8 +114,14 @@ func (g *LiveStripeGateway) CreateCheckoutSession(_ context.Context, accountID s
 // VerifyWebhook validates the Stripe-Signature header against the signing
 // secret, then decodes the event. An invalid signature surfaces as an
 // error so the handler returns 400 and the payload is never trusted.
+//
+// IgnoreAPIVersionMismatch is set because the Stripe account emits events
+// on a newer API version than stripe-go v76 pins. The signature is still
+// fully verified — only the advisory version check is skipped — and the
+// CheckoutSession fields we read (amount_total, metadata) are stable.
 func (g *LiveStripeGateway) VerifyWebhook(payload []byte, signatureHeader string) (StripeWebhookEvent, error) {
-	event, err := webhook.ConstructEvent(payload, signatureHeader, g.cfg.WebhookSecret)
+	event, err := webhook.ConstructEventWithOptions(payload, signatureHeader, g.cfg.WebhookSecret,
+		webhook.ConstructEventOptions{IgnoreAPIVersionMismatch: true})
 	if err != nil {
 		return StripeWebhookEvent{}, fmt.Errorf("stripe: webhook signature: %w", err)
 	}
